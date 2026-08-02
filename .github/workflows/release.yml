@@ -1,0 +1,159 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "증가시킬 버전 단위 (major / minor / patch)"
+        type: choice
+        required: true
+        default: patch
+        options:
+          - major
+          - minor
+          - patch
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Compute next version
+        id: version
+        shell: pwsh
+        run: |
+          $conf = Get-Content -Raw -Path "src-tauri/tauri.conf.json" | ConvertFrom-Json
+          $current = $conf.version
+          if ($current -notmatch '^\d+\.\d+\.\d+$') {
+            Write-Error "Unexpected version format in tauri.conf.json: '$current'"
+            exit 1
+          }
+          $parts = $current.Split('.')
+          $major = [int]$parts[0]
+          $minor = [int]$parts[1]
+          $patch = [int]$parts[2]
+          switch ("${{ inputs.bump }}") {
+            "major" { $major++; $minor = 0; $patch = 0 }
+            "minor" { $minor++; $patch = 0 }
+            "patch" { $patch++ }
+            default { Write-Error "Unknown bump: ${{ inputs.bump }}"; exit 1 }
+          }
+          $new = "$major.$minor.$patch"
+          Write-Host "Bumping $current -> $new ($env:GITHUB_ACTOR chose '${{ inputs.bump }}')"
+          "current_version=$current" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "new_version=$new"         | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "tag=v$new"                | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Apply new version to config files
+        shell: pwsh
+        env:
+          NEW_VERSION: ${{ steps.version.outputs.new_version }}
+          OLD_VERSION: ${{ steps.version.outputs.current_version }}
+        run: |
+          # tauri.conf.json — top-level "version"
+          $tauriPath = "src-tauri/tauri.conf.json"
+          $tauri = Get-Content -Raw -Path $tauriPath
+          $tauri = $tauri -replace '("version"\s*:\s*")' + [regex]::Escape($env:OLD_VERSION) + '(")', ('${1}' + $env:NEW_VERSION + '${2}')
+          Set-Content -Path $tauriPath -Value $tauri -NoNewline
+
+          # package.json — top-level "version"
+          $pkgPath = "package.json"
+          $pkg = Get-Content -Raw -Path $pkgPath
+          $pkg = $pkg -replace '("version"\s*:\s*")' + [regex]::Escape($env:OLD_VERSION) + '(")', ('${1}' + $env:NEW_VERSION + '${2}')
+          Set-Content -Path $pkgPath -Value $pkg -NoNewline
+
+          # Cargo.toml — [package] version = "..."
+          $cargoPath = "src-tauri/Cargo.toml"
+          $cargo = Get-Content -Raw -Path $cargoPath
+          $cargo = $cargo -replace '(?m)^(version\s*=\s*")' + [regex]::Escape($env:OLD_VERSION) + '(")', ('${1}' + $env:NEW_VERSION + '${2}')
+          Set-Content -Path $cargoPath -Value $cargo -NoNewline
+
+          Write-Host "tauri.conf.json / package.json / Cargo.toml updated to $env:NEW_VERSION"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build standalone executable
+        run: npm run tauri build -- --no-bundle
+
+      - name: Prepare executable asset
+        id: asset
+        shell: pwsh
+        env:
+          NEW_VERSION: ${{ steps.version.outputs.new_version }}
+        run: |
+          $src = "src-tauri/target/release/fabrix-proxy.exe"
+          if (-not (Test-Path $src)) {
+            Write-Error "Built executable not found at $src"
+            exit 1
+          }
+          $out = "FabriX-Proxy-$env:NEW_VERSION-x64.exe"
+          Copy-Item -Path $src -Destination $out -Force
+          "path=$out" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Create GitHub Release and upload executable
+        id: publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          ASSET: ${{ steps.asset.outputs.path }}
+        run: |
+          gh release create "$env:TAG" "$env:ASSET" --title "$env:TAG" --generate-notes
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "gh release create failed"
+            exit 1
+          }
+
+      - name: Commit version bump to main
+        if: steps.publish.outcome == 'success'
+        shell: pwsh
+        env:
+          NEW_VERSION: ${{ steps.version.outputs.new_version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src-tauri/tauri.conf.json package.json src-tauri/Cargo.toml src-tauri/Cargo.lock
+          if (git diff --cached --quiet) {
+            Write-Host "No version changes to commit."
+            exit 0
+          }
+          git commit -m "chore(release): v$env:NEW_VERSION"
+
+          $delays = @(0, 2, 4, 8, 16)
+          for ($i = 0; $i -lt $delays.Length; $i++) {
+            if ($delays[$i] -gt 0) { Start-Sleep -Seconds $delays[$i] }
+            git push origin HEAD:main
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "Pushed version bump to main."
+              exit 0
+            }
+            Write-Host "Push attempt $($i + 1) failed; retrying..."
+            git fetch origin main
+            git rebase origin/main
+          }
+          Write-Error "Failed to push version bump to main after retries."
+          exit 1
