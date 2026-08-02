@@ -1,0 +1,64 @@
+/* 목업 "사내 AI 프록시 — Hi-fi 목업 v2 (OpenAI 단일)" 에서 그대로 뽑은 팔레트.
+   값을 임의로 바꾸지 마세요 — 화면 대조의 기준입니다. */
+
+:root {
+  /* 서피스 */
+  --canvas: #e9e7e1;
+  --surface: #ffffff;
+  --surface-1: #fbfaf8;
+  --surface-2: #faf9f6;
+  --surface-3: #f8f7f4;
+  --surface-4: #f6f4f0;
+  --surface-5: #f2f0ec;
+
+  /* 보더 */
+  --border: #dddbd5;
+  --border-soft: #e6e4de;
+  --border-faint: #ebe9e3;
+  --border-strong: #cbc8c0;
+
+  /* 텍스트 — 진한 순서 */
+  --ink: #1c1f24;
+  --ink-2: #343a42;
+  --ink-3: #4b525c;
+  --ink-4: #5e6773;
+  --ink-5: #6b7280;
+  --ink-6: #8b929b;
+  --ink-off: #a5a9ae;
+  --ink-mono: #6c747e;
+
+  /* 강조 */
+  --accent: #1f6feb;
+  --accent-hover: #1a5fd0;
+  --accent-soft: #e9f1fd;
+  --accent-line: rgba(31, 111, 235, 0.26);
+  --accent-tint: rgba(31, 111, 235, 0.08);
+  --accent-border: #c3d6f5;
+
+  /* 상태 */
+  --run: #178f59;
+  --run-tint: rgba(23, 143, 89, 0.06);
+  --run-tint-2: rgba(23, 143, 89, 0.1);
+  --run-tint-3: rgba(23, 143, 89, 0.12);
+  --run-line: rgba(23, 143, 89, 0.24);
+  --run-glow: rgba(23, 143, 89, 0.16);
+
+  --warn: #b5761a;
+  --warn-ink: #8f5f16;
+  --warn-tint: rgba(181, 118, 26, 0.07);
+  --warn-line: rgba(181, 118, 26, 0.32);
+
+  --error: #bf3524;
+
+  --off: #b3afa6;
+  --off-2: #c9c6be;
+  --off-3: #dfdcd5;
+
+  /* 폰트 — 사내망/오프라인을 위해 CDN 대신 번들에 포함합니다. */
+  --font-sans: 'IBM Plex Sans KR', 'Malgun Gothic', system-ui, -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', Consolas, 'Courier New', ui-monospace, monospace;
+
+  /* 그림자 */
+  --shadow-window: 0 18px 44px rgba(28, 31, 36, 0.13);
+  --shadow-card: 0 14px 34px rgba(28, 31, 36, 0.16);
+}

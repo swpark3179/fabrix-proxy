@@ -1,0 +1,396 @@
+/* 로그 창 900×620 — 목업 L1 / L2 */
+
+.logapp {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background: var(--surface);
+}
+
+/* ── 필터 바 ─────────────────────────────────────────────────── */
+
+.filters {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--surface-1);
+  flex: none;
+}
+
+.chip {
+  font: 500 11.5px var(--font-sans);
+  color: var(--ink-2);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  padding: 6px 12px;
+  white-space: nowrap;
+  flex: none;
+  background: transparent;
+}
+
+.chip--mono {
+  font-family: var(--font-mono);
+}
+
+.chip:hover:not(.chip--active) {
+  background: var(--surface-5);
+}
+
+.chip--active {
+  color: #fff;
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.filters__meta {
+  font: 400 11px var(--font-sans);
+  color: var(--ink-5);
+  white-space: nowrap;
+}
+
+.filters__clear {
+  font: 500 11.5px var(--font-sans);
+  color: var(--ink-4);
+  white-space: nowrap;
+  flex: none;
+}
+
+.filters__clear:hover {
+  color: var(--error);
+}
+
+/* ── 본문 2단 ────────────────────────────────────────────────── */
+
+.logbody {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.loglist {
+  width: 268px;
+  border-right: 1px solid var(--border-soft);
+  display: flex;
+  flex-direction: column;
+  flex: none;
+}
+
+.loglist__head {
+  display: flex;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--surface-1);
+  border-bottom: 1px solid var(--border-faint);
+  font: 400 10.5px var(--font-sans);
+  color: var(--ink-5);
+  flex: none;
+}
+
+.loglist__scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.loglist__row {
+  display: flex;
+  gap: 8px;
+  padding: 10px 12px;
+  font: 400 11px var(--font-mono);
+  width: 100%;
+  text-align: left;
+  border-left: 2px solid transparent;
+  background: var(--surface);
+}
+
+.loglist__row + .loglist__row {
+  border-top: 1px solid var(--border-faint);
+}
+
+.loglist__row:hover:not(.loglist__row--active) {
+  background: var(--surface-1);
+}
+
+.loglist__row--active {
+  background: var(--accent-soft);
+  border-left-color: var(--accent);
+}
+
+.col-time {
+  width: 36px;
+  flex: none;
+  color: var(--ink-5);
+}
+
+.col-code {
+  width: 28px;
+  flex: none;
+}
+
+.col-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.col-latency {
+  width: 34px;
+  flex: none;
+  text-align: right;
+  color: var(--ink-5);
+}
+
+.loglist__path {
+  color: var(--ink-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.loglist__row--active .loglist__path {
+  color: var(--ink);
+}
+
+.loglist__sub {
+  font-size: 10px;
+  color: var(--ink-6);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.loglist__row--active .loglist__sub {
+  color: var(--ink-mono);
+}
+
+.loglist__foot {
+  padding: 9px 12px;
+  border-top: 1px solid var(--border-faint);
+  background: var(--surface-1);
+  font: 400 10.5px var(--font-sans);
+  color: var(--ink-6);
+  flex: none;
+}
+
+.loglist__empty {
+  padding: 28px 16px;
+  text-align: center;
+  font: 400 11.5px/1.7 var(--font-sans);
+  color: var(--ink-6);
+}
+
+/* ── 상세 ────────────────────────────────────────────────────── */
+
+.detail {
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+  padding: 16px 18px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+  background: var(--surface);
+}
+
+.detail__head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.detail__route {
+  font: 600 14px var(--font-mono);
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+.detail__badge {
+  font: 400 10.5px var(--font-mono);
+  border-radius: 4px;
+  padding: 3px 7px;
+  white-space: nowrap;
+  flex: none;
+}
+
+.detail__badge--ok {
+  color: var(--run);
+  background: var(--run-tint-2);
+}
+
+.detail__badge--warn {
+  color: var(--warn-ink);
+  background: var(--warn-tint);
+}
+
+.detail__badge--error {
+  color: var(--error);
+  background: rgba(191, 53, 36, 0.1);
+}
+
+.btn-mini {
+  font: 500 11.5px var(--font-sans);
+  color: var(--ink-2);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  padding: 5px 11px;
+  white-space: nowrap;
+  flex: none;
+  background: var(--surface);
+}
+
+.btn-mini:hover {
+  background: var(--surface-5);
+}
+
+.step {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.step__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.step__num {
+  width: 17px;
+  height: 17px;
+  border-radius: 50%;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font: 600 10px var(--font-mono);
+  flex: none;
+}
+
+.step__num--1 {
+  background: var(--ink-4);
+}
+
+.step__num--2 {
+  background: var(--accent);
+}
+
+.step__num--3 {
+  background: var(--run);
+}
+
+.step__title {
+  font: 600 12.5px var(--font-sans);
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+.step__hint {
+  font: 400 11px var(--font-sans);
+  color: var(--ink-5);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.code {
+  background: var(--surface-4);
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  padding: 11px 13px;
+  font: 400 11px/1.8 var(--font-mono);
+  color: var(--ink-3);
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: auto;
+  user-select: text;
+  cursor: text;
+  margin: 0;
+}
+
+.code--sent {
+  border-color: var(--accent-border);
+}
+
+.code--reply {
+  background: var(--run-tint);
+  border-color: var(--run-line);
+}
+
+.code--error {
+  background: rgba(191, 53, 36, 0.05);
+  border-color: rgba(191, 53, 36, 0.26);
+  color: #a12c1e;
+}
+
+/* 답변 본문은 코드가 아니라 글이므로 본문 폰트로 읽힙니다. */
+.code--prose {
+  font-family: var(--font-sans);
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--ink-2);
+}
+
+.code__headers {
+  color: var(--ink-5);
+  display: block;
+  margin-bottom: 6px;
+}
+
+.tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.tag {
+  font: 400 10.5px var(--font-mono);
+  color: var(--accent-hover);
+  background: var(--accent-tint);
+  border: 1px solid var(--accent-line);
+  border-radius: 4px;
+  padding: 3px 7px;
+}
+
+.tag--muted {
+  color: var(--ink-mono);
+  background: var(--surface-4);
+  border-color: var(--border-soft);
+}
+
+/* `<pre>` 안이라 block 을 지정하지 않으면 본문 끝에 붙어 버립니다. */
+.meta-line {
+  display: block;
+  font: 400 10.5px var(--font-mono);
+  color: var(--ink-mono);
+  margin-top: 10px;
+}
+
+.footnote {
+  margin-top: 2px;
+  padding: 11px 13px;
+  background: var(--surface-3);
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  font: 400 11.5px/1.65 var(--font-sans);
+  color: var(--ink-4);
+}
+
+.footnote code {
+  font: 400 11px var(--font-mono);
+  color: var(--ink-3);
+}
+
+.detail__placeholder {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font: 400 12px/1.7 var(--font-sans);
+  color: var(--ink-6);
+  text-align: center;
+}

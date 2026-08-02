@@ -1,0 +1,31 @@
+{
+  "name": "fabrix-proxy",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "gen:fonts": "node scripts/gen-fonts-css.mjs",
+    "preview": "vite preview",
+    "mock": "node mock-fabrix/server.mjs",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@fontsource/ibm-plex-sans-kr": "^5.2.5",
+    "@fontsource/jetbrains-mono": "^5.2.5",
+    "@tauri-apps/api": "^2.9.0",
+    "@tauri-apps/plugin-clipboard-manager": "^2.3.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.9.1",
+    "@types/node": "^24.10.1",
+    "@types/react": "^19.2.2",
+    "@types/react-dom": "^19.2.2",
+    "@vitejs/plugin-react": "^5.0.4",
+    "typescript": "^5.9.3",
+    "vite": "^7.1.9"
+  }
+}

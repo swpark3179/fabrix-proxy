@@ -1,0 +1,43 @@
+[package]
+name = "fabrix-proxy"
+version = "0.1.0"
+description = "사내 FabriX AI를 OpenAI 호환 API로 중계하는 로컬 프록시"
+authors = ["fabrix-proxy"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "fabrix_proxy_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-clipboard-manager = "2"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net", "macros", "io-util"] }
+axum = { version = "0.8", features = ["json"] }
+tower-http = { version = "0.6", features = ["cors"] }
+
+# native-tls => schannel on Windows, so a corporate root CA already installed in the
+# Windows certificate store is trusted without extra configuration.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "native-tls", "charset", "http2"] }
+
+futures-util = "0.3"
+async-stream = "0.3"
+bytes = "1"
+chrono = "0.4"
+dirs = "6"
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

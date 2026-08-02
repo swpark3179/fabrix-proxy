@@ -1,0 +1,192 @@
+@import './fonts.css';
+@import './tokens.css';
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  color: var(--ink);
+  background: var(--surface);
+  -webkit-font-smoothing: antialiased;
+  /* 데스크탑 앱 — 텍스트 드래그 선택은 코드 블록에서만 허용합니다. */
+  user-select: none;
+  cursor: default;
+  overflow: hidden;
+}
+
+/* 번들에 700 은 없습니다 — 합성 볼드 대신 실제로 있는 600 을 씁니다. */
+strong,
+b {
+  font-weight: 600;
+}
+
+button {
+  font-family: inherit;
+  border: none;
+  background: none;
+  padding: 0;
+  cursor: pointer;
+  color: inherit;
+}
+
+button:disabled {
+  cursor: default;
+}
+
+input {
+  font-family: inherit;
+  color: inherit;
+}
+
+input:focus-visible,
+button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* ── 커스텀 타이틀바 (decorations: false) ───────────────────── */
+
+.titlebar {
+  display: flex;
+  align-items: center;
+  height: 38px;
+  padding-left: 14px;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border-soft);
+  flex: none;
+}
+
+/* 앱 아이콘. 그림이 라운드 코너와 투명 배경을 이미 갖고 있어
+   배경색이나 border-radius 를 덧씌우지 않습니다. */
+.titlebar__badge {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  display: block;
+  object-fit: contain;
+}
+
+.titlebar__badge--off {
+  filter: grayscale(1);
+  opacity: 0.72;
+}
+
+.titlebar__title {
+  font: 500 12.5px var(--font-sans);
+  color: var(--ink-2);
+  margin-left: 9px;
+  white-space: nowrap;
+}
+
+.titlebar__spacer {
+  flex: 1;
+  align-self: stretch;
+}
+
+.titlebar__btn {
+  width: 44px;
+  height: 38px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font: 400 12px var(--font-sans);
+  color: var(--ink-4);
+  flex: none;
+}
+
+.titlebar__btn:hover {
+  background: var(--surface-5);
+}
+
+.titlebar__btn--close:hover {
+  background: var(--error);
+  color: #fff;
+}
+
+.titlebar__btn--maximize {
+  font-size: 10px;
+}
+
+.titlebar__action {
+  height: 24px;
+  padding: 0 10px;
+  margin-right: 6px;
+  border-radius: 6px;
+  border: 1px solid var(--border-strong);
+  font: 500 11px var(--font-sans);
+  color: var(--ink-3);
+  flex: none;
+}
+
+.titlebar__action:hover {
+  background: var(--surface-5);
+}
+
+/* ── 공용 조각 ──────────────────────────────────────────────── */
+
+.dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.dot--on {
+  background: var(--run);
+  box-shadow: 0 0 0 4px var(--run-glow);
+}
+
+.dot--off {
+  background: var(--off);
+}
+
+.spacer {
+  flex: 1;
+}
+
+.divider {
+  height: 1px;
+  background: var(--border-soft);
+}
+
+.mono {
+  font-family: var(--font-mono);
+}
+
+.selectable {
+  user-select: text;
+  cursor: text;
+}
+
+/* 스크롤바 — 목업의 종이 같은 톤에 맞춥니다. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #d6d3cc;
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #bfbcb4;
+  background-clip: content-box;
+}

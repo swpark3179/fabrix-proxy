@@ -1,0 +1,868 @@
+//! FabriX 스키마와 그 위의 얇은 HTTP 클라이언트.
+//!
+//! 스펙 문서에 SSE 프레임 형식이 없어서 파싱은 전부 방어적으로 갑니다 —
+//! camelCase/snake_case 양쪽, `data:` 접두 유무 양쪽, 누적/증분 양쪽.
+
+use std::collections::HashSet;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::openai::ChatRequest;
+
+pub const MODELS_PATH: &str = "/openapi/chat/v1/models";
+pub const MESSAGES_PATH: &str = "/openapi/chat/v1/messages";
+
+/// 목업의 502 행이 30s 인 것과 맞춥니다. 스트리밍에는 적용하지 않습니다
+/// (긴 응답이 정상적으로 30초를 넘길 수 있으므로 청크 간 read_timeout 으로 대신).
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub const READ_TIMEOUT: Duration = Duration::from_secs(90);
+
+// ─────────────────────────── 모델 목록 ───────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LocalizedText {
+    #[serde(default, alias = "languageCode")]
+    pub language_code: Option<String>,
+    #[serde(default)]
+    pub content: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FabrixModel {
+    #[serde(alias = "modelId", alias = "id")]
+    pub model_id: String,
+    #[serde(default)]
+    pub name: Vec<LocalizedText>,
+    #[serde(default)]
+    pub description: Vec<LocalizedText>,
+}
+
+/// alias 를 부여한 모델. `/v1/models` 응답과 모델 해석에 모두 쓰입니다.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedModel {
+    /// 클라이언트에 노출하는 이름 (예: `fabrix-chat-4`).
+    pub alias: String,
+    /// FabriX 가 기대하는 UUID.
+    pub model_id: String,
+    /// 사람이 읽는 이름 (예: `챗 4`).
+    pub label: String,
+    pub description: Option<String>,
+}
+
+fn pick(list: &[LocalizedText], lang: &str) -> Option<String> {
+    list.iter()
+        .find(|t| t.language_code.as_deref().is_some_and(|l| l.eq_ignore_ascii_case(lang)))
+        .and_then(|t| t.content.clone())
+        .filter(|s| !s.trim().is_empty())
+}
+
+fn first_content(list: &[LocalizedText]) -> Option<String> {
+    list.iter().find_map(|t| t.content.clone()).filter(|s| !s.trim().is_empty())
+}
+
+/// ASCII 슬러그. 한글만 있는 이름은 빈 문자열이 되어 UUID 기반 alias 로 넘어갑니다.
+fn slugify(input: &str) -> String {
+    let mut out = String::new();
+    let mut prev_dash = true; // 선행 '-' 방지
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out.chars().take(40).collect()
+}
+
+/// 목업의 `fabrix-chat-4` / `fabrix-chat-lite` 형태를 만듭니다.
+///
+/// 이름이 한글뿐이면 슬러그가 비므로 UUID 앞 8자리로 대체합니다 — 클라이언트가
+/// 모델 이름을 하드코딩해도 서버 순서에 흔들리지 않게 하기 위함입니다.
+pub fn build_aliases(models: &[FabrixModel]) -> Vec<ResolvedModel> {
+    let mut used: HashSet<String> = HashSet::new();
+    let mut out = Vec::with_capacity(models.len());
+
+    for m in models {
+        let en = pick(&m.name, "en");
+        let ko = pick(&m.name, "ko");
+        let any = first_content(&m.name);
+
+        let label = ko.clone().or_else(|| en.clone()).or_else(|| any.clone()).unwrap_or_else(|| m.model_id.clone());
+
+        let slug_src = en.or(any).unwrap_or_default();
+        let mut slug = slugify(&slug_src);
+        if slug.is_empty() {
+            slug = m.model_id.chars().filter(|c| c.is_ascii_alphanumeric()).take(8).collect();
+        }
+        if slug.is_empty() {
+            slug = "model".into();
+        }
+
+        let mut alias = format!("fabrix-{slug}");
+        let mut n = 2;
+        while used.contains(&alias) {
+            alias = format!("fabrix-{slug}-{n}");
+            n += 1;
+        }
+        used.insert(alias.clone());
+
+        out.push(ResolvedModel {
+            alias,
+            model_id: m.model_id.clone(),
+            label,
+            description: pick(&m.description, "ko").or_else(|| first_content(&m.description)),
+        });
+    }
+    out
+}
+
+/// UUID 직매치 → alias 완전일치 → 대소문자 무시 → 기본 모델 폴백.
+pub fn resolve_model<'a>(
+    models: &'a [ResolvedModel],
+    requested: Option<&str>,
+    default_alias: &str,
+) -> Option<&'a ResolvedModel> {
+    if let Some(req) = requested.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(hit) = models.iter().find(|m| m.model_id == req) {
+            return Some(hit);
+        }
+        if let Some(hit) = models.iter().find(|m| m.alias == req) {
+            return Some(hit);
+        }
+        if let Some(hit) = models.iter().find(|m| m.alias.eq_ignore_ascii_case(req)) {
+            return Some(hit);
+        }
+    }
+    models
+        .iter()
+        .find(|m| m.alias == default_alias)
+        .or_else(|| models.first())
+}
+
+// ─────────────────────────── 요청 번역 ───────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessagesRequest {
+    pub model_ids: Vec<String>,
+    pub contents: Vec<String>,
+    pub is_stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm_config: Option<LlmConfig>,
+}
+
+/// ⚠️ `repetion_penalty` 와 `tok_k` 는 **스펙 문서의 철자 그대로**입니다.
+/// 오타로 보이지만 서버가 기대하는 키일 가능성이 높아 그대로 보냅니다.
+/// 실서버 검증에서 다르면 이 두 `rename` 만 고치면 됩니다.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct LlmConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    #[serde(rename = "repetion_penalty", skip_serializing_if = "Option::is_none")]
+    pub repetition_penalty: Option<f64>,
+    #[serde(rename = "tok_k", skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_new_tokens: Option<u32>,
+}
+
+impl LlmConfig {
+    pub fn from_request(req: &ChatRequest) -> Option<Self> {
+        let cfg = Self {
+            temperature: req.temperature,
+            top_p: req.top_p,
+            repetition_penalty: req.frequency_penalty,
+            top_k: req.top_k,
+            seed: req.seed,
+            max_new_tokens: req.max_new_tokens(),
+        };
+        let empty = cfg.temperature.is_none()
+            && cfg.top_p.is_none()
+            && cfg.repetition_penalty.is_none()
+            && cfg.top_k.is_none()
+            && cfg.seed.is_none()
+            && cfg.max_new_tokens.is_none();
+        if empty {
+            None
+        } else {
+            Some(cfg)
+        }
+    }
+}
+
+fn role_label(role: &str) -> &str {
+    match role {
+        "assistant" => "Assistant",
+        "tool" | "function" => "Tool",
+        "user" => "User",
+        other => other,
+    }
+}
+
+/// OpenAI `messages` → FabriX `systemPrompt` + `contents`.
+///
+/// FabriX 에는 롤 구조가 없어 멀티턴은 한 덩어리 트랜스크립트로 평탄화됩니다.
+/// 손실적이지만 대안이 없고, 로그 ② 칸에 변환 결과가 그대로 보이므로 사용자가
+/// 무엇이 어떻게 접혔는지 확인할 수 있습니다.
+pub fn fold_messages(messages: &[crate::openai::Message]) -> (Option<String>, Vec<String>) {
+    let mut system: Vec<String> = Vec::new();
+    let mut turns: Vec<(String, String)> = Vec::new();
+
+    for m in messages {
+        let text = m.text();
+        if text.trim().is_empty() {
+            continue;
+        }
+        match m.role.as_str() {
+            "system" | "developer" => system.push(text),
+            role => turns.push((role.to_string(), text)),
+        }
+    }
+
+    let system_prompt = if system.is_empty() { None } else { Some(system.join("\n\n")) };
+
+    let content = match turns.len() {
+        0 => String::new(),
+        1 if turns[0].0 == "user" => turns.remove(0).1,
+        _ => turns
+            .iter()
+            .map(|(role, text)| format!("{}: {}", role_label(role), text))
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+    };
+
+    if content.is_empty() {
+        (system_prompt, Vec::new())
+    } else {
+        (system_prompt, vec![content])
+    }
+}
+
+// ─────────────────────────── 응답 파싱 ───────────────────────────
+
+/// FabriX 응답 한 조각. 필드명은 스트리밍이면 snake_case, 아니면 camelCase 로
+/// 온다고 문서에 적혀 있어 양쪽을 모두 받습니다.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct FabrixChunk {
+    #[serde(default, alias = "modelType")]
+    pub model_type: Option<String>,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub truncated: Option<bool>,
+    #[serde(default, alias = "finishReason")]
+    pub finish_reason: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default, alias = "responseCode")]
+    pub response_code: Option<String>,
+    #[serde(default, alias = "eventStatus")]
+    pub event_status: Option<String>,
+    #[serde(default, alias = "eventData")]
+    pub event_data: Option<String>,
+    #[serde(default, alias = "reasoningContent")]
+    pub reasoning_content: Option<String>,
+    /// 오류 응답에서 흔히 쓰이는 필드들 — 메시지 추출용.
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default, alias = "errorMessage")]
+    pub error_message: Option<String>,
+}
+
+impl FabrixChunk {
+    pub fn looks_like_error(&self) -> bool {
+        let bad = |s: &Option<String>| {
+            s.as_deref().is_some_and(|v| {
+                let v = v.to_ascii_uppercase();
+                v.contains("ERROR") || v.contains("FAIL")
+            })
+        };
+        bad(&self.status) || bad(&self.event_status)
+    }
+
+    pub fn error_text(&self) -> String {
+        self.error_message
+            .clone()
+            .or_else(|| self.message.clone())
+            .or_else(|| self.event_data.clone())
+            .or_else(|| self.content.clone())
+            .unwrap_or_else(|| "사내 서버가 오류를 반환했습니다".into())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum StreamEvent {
+    Delta(String),
+    Reasoning(String),
+    Finish(String),
+    Error(String),
+    Done,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum DeltaMode {
+    #[default]
+    Unknown,
+    /// 매 프레임이 지금까지의 **전체** 텍스트.
+    Cumulative,
+    /// 매 프레임이 **증분**.
+    Incremental,
+}
+
+/// 바이트 스트림 → OpenAI 델타.
+///
+/// 줄 단위로만 잘라 쓰기 때문에 청크 경계에서 UTF-8 문자가 쪼개져도 안전합니다
+/// (개행은 항상 단일 바이트라 멀티바이트 문자 중간에 걸리지 않습니다).
+#[derive(Debug, Default)]
+pub struct StreamDecoder {
+    buf: Vec<u8>,
+    acc: String,
+    reasoning: String,
+    mode: DeltaMode,
+    pub finish_reason: Option<String>,
+    pub model_type: Option<String>,
+    pub done: bool,
+}
+
+impl StreamDecoder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 지금까지 합쳐진 전체 답변.
+    pub fn text(&self) -> &str {
+        &self.acc
+    }
+
+    pub fn reasoning(&self) -> &str {
+        &self.reasoning
+    }
+
+    pub fn push(&mut self, chunk: &[u8]) -> Vec<StreamEvent> {
+        self.buf.extend_from_slice(chunk);
+        let mut events = Vec::new();
+        while let Some(pos) = self.buf.iter().position(|b| *b == b'\n') {
+            let line: Vec<u8> = self.buf.drain(..=pos).collect();
+            let line = String::from_utf8_lossy(&line[..line.len() - 1]).into_owned();
+            self.handle_line(&line, &mut events);
+        }
+        events
+    }
+
+    /// 스트림이 끝났을 때 개행 없이 남은 마지막 조각을 처리합니다.
+    pub fn finish(&mut self) -> Vec<StreamEvent> {
+        let mut events = Vec::new();
+        if !self.buf.is_empty() {
+            let line = String::from_utf8_lossy(&self.buf).into_owned();
+            self.buf.clear();
+            self.handle_line(&line, &mut events);
+        }
+        events
+    }
+
+    fn handle_line(&mut self, raw: &str, out: &mut Vec<StreamEvent>) {
+        let line = raw.trim_end_matches('\r').trim();
+        if line.is_empty() || line.starts_with(':') {
+            return; // 프레임 구분자 또는 SSE 주석
+        }
+
+        let payload = if let Some(rest) = line.strip_prefix("data:") {
+            rest.trim()
+        } else if line.starts_with("event:") || line.starts_with("id:") || line.starts_with("retry:") {
+            return;
+        } else {
+            // `data:` 없이 개행 구분 JSON 을 흘리는 서버도 받아들입니다.
+            line
+        };
+
+        if payload.is_empty() {
+            return;
+        }
+        if payload == "[DONE]" {
+            self.done = true;
+            out.push(StreamEvent::Done);
+            return;
+        }
+
+        match serde_json::from_str::<Value>(payload) {
+            Ok(Value::Array(items)) => {
+                for item in items {
+                    self.handle_value(item, out);
+                }
+            }
+            Ok(value) => self.handle_value(value, out),
+            // JSON 이 아닌 줄은 무시합니다 (프록시 배너, 빈 keep-alive 등).
+            Err(_) => {}
+        }
+    }
+
+    fn handle_value(&mut self, value: Value, out: &mut Vec<StreamEvent>) {
+        let Ok(chunk) = serde_json::from_value::<FabrixChunk>(value) else {
+            return;
+        };
+
+        if chunk.looks_like_error() {
+            out.push(StreamEvent::Error(chunk.error_text()));
+            return;
+        }
+        if let Some(mt) = chunk.model_type.clone() {
+            self.model_type.get_or_insert(mt);
+        }
+        if let Some(reasoning) = chunk.reasoning_content.as_deref() {
+            if !reasoning.is_empty() {
+                self.reasoning.push_str(reasoning);
+                out.push(StreamEvent::Reasoning(reasoning.to_string()));
+            }
+        }
+        if let Some(content) = chunk.content.as_deref() {
+            if let Some(delta) = self.absorb(content) {
+                out.push(StreamEvent::Delta(delta));
+            }
+        }
+        if let Some(reason) = chunk.finish_reason.as_deref().filter(|r| !r.is_empty()) {
+            self.finish_reason = Some(reason.to_string());
+            out.push(StreamEvent::Finish(reason.to_string()));
+        }
+    }
+
+    /// 누적/증분 판별. 두 번째 프레임에서 모드를 확정하고 이후로는 고정합니다 —
+    /// 매 프레임 접두사 검사를 하면 "안" 다음에 증분 "안녕"이 왔을 때 오판합니다.
+    fn absorb(&mut self, content: &str) -> Option<String> {
+        if content.is_empty() {
+            return None;
+        }
+        if self.acc.is_empty() {
+            self.acc.push_str(content);
+            return Some(content.to_string());
+        }
+
+        match self.mode {
+            DeltaMode::Unknown => {
+                if content == self.acc {
+                    self.mode = DeltaMode::Cumulative;
+                    None
+                } else if content.len() > self.acc.len() && content.starts_with(self.acc.as_str()) {
+                    self.mode = DeltaMode::Cumulative;
+                    let delta = content[self.acc.len()..].to_string();
+                    self.acc = content.to_string();
+                    Some(delta)
+                } else {
+                    self.mode = DeltaMode::Incremental;
+                    self.acc.push_str(content);
+                    Some(content.to_string())
+                }
+            }
+            DeltaMode::Cumulative => {
+                if content == self.acc {
+                    None
+                } else if content.len() > self.acc.len() && content.starts_with(self.acc.as_str()) {
+                    let delta = content[self.acc.len()..].to_string();
+                    self.acc = content.to_string();
+                    Some(delta)
+                } else {
+                    // 서버가 답변을 다시 쓴 경우 — 통째로 교체합니다.
+                    self.acc = content.to_string();
+                    Some(content.to_string())
+                }
+            }
+            DeltaMode::Incremental => {
+                self.acc.push_str(content);
+                Some(content.to_string())
+            }
+        }
+    }
+}
+
+// ─────────────────────────── 오류 ───────────────────────────
+
+#[derive(Debug, Clone)]
+pub enum FabrixError {
+    NotConfigured,
+    /// 연결 실패 · 타임아웃 → 502 `사내 응답 없음`
+    Unreachable(String),
+    /// FabriX 429 → `사내 쿼터 초과`
+    Quota(String),
+    Upstream { status: u16, message: String },
+    BadPayload(String),
+}
+
+impl FabrixError {
+    pub fn status(&self) -> u16 {
+        match self {
+            FabrixError::NotConfigured => 503,
+            FabrixError::Unreachable(_) => 502,
+            FabrixError::Quota(_) => 429,
+            FabrixError::Upstream { status, .. } => *status,
+            FabrixError::BadPayload(_) => 502,
+        }
+    }
+
+    /// 로그 목록 두 번째 줄에 뜨는 짧은 설명 — 목업 문구와 일치시킵니다.
+    pub fn note(&self) -> String {
+        match self {
+            FabrixError::NotConfigured => "사내 연결 설정이 필요합니다".into(),
+            FabrixError::Unreachable(_) => "사내 응답 없음".into(),
+            FabrixError::Quota(_) => "사내 쿼터 초과".into(),
+            FabrixError::Upstream { status, .. } => format!("사내 오류 {status}"),
+            FabrixError::BadPayload(_) => "응답을 해석하지 못했습니다".into(),
+        }
+    }
+
+    pub fn message(&self) -> String {
+        match self {
+            FabrixError::NotConfigured => {
+                "사내 연결 정보가 설정되지 않았습니다. 트레이 메뉴 → 창 열기에서 설정하세요.".into()
+            }
+            FabrixError::Unreachable(detail) => format!("사내 AI 서버에 연결하지 못했습니다: {detail}"),
+            FabrixError::Quota(detail) => format!("사내 쿼터를 초과했습니다: {detail}"),
+            FabrixError::Upstream { status, message } => format!("사내 서버 오류 {status}: {message}"),
+            FabrixError::BadPayload(detail) => format!("사내 응답을 해석하지 못했습니다: {detail}"),
+        }
+    }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            FabrixError::Quota(_) => "rate_limit_error",
+            FabrixError::NotConfigured => "configuration_error",
+            _ => "upstream_error",
+        }
+    }
+}
+
+impl From<reqwest::Error> for FabrixError {
+    fn from(err: reqwest::Error) -> Self {
+        if err.is_timeout() {
+            FabrixError::Unreachable("응답 시간 초과".into())
+        } else if err.is_connect() {
+            FabrixError::Unreachable("연결할 수 없습니다".into())
+        } else if err.is_decode() {
+            FabrixError::BadPayload(err.to_string())
+        } else {
+            FabrixError::Unreachable(err.to_string())
+        }
+    }
+}
+
+// ─────────────────────────── 클라이언트 ───────────────────────────
+
+pub struct FabrixClient {
+    pub http: reqwest::Client,
+    pub base: String,
+    pub client_key: String,
+    pub token: String,
+}
+
+impl FabrixClient {
+    pub fn models_url(&self) -> String {
+        format!("{}{MODELS_PATH}", self.base)
+    }
+
+    pub fn messages_url(&self) -> String {
+        format!("{}{MESSAGES_PATH}", self.base)
+    }
+
+    fn request(&self, method: reqwest::Method, url: String) -> reqwest::RequestBuilder {
+        self.http
+            .request(method, url)
+            // 스펙: Content-Type 은 application/json 으로 고정.
+            .header("Content-Type", "application/json")
+            .header("x-fabrix-client", &self.client_key)
+            .header("x-openapi-token", &self.token)
+    }
+
+    pub async fn list_models(&self) -> Result<Vec<FabrixModel>, FabrixError> {
+        let res = self
+            .request(reqwest::Method::GET, self.models_url())
+            .header("Accept", "application/json")
+            .timeout(REQUEST_TIMEOUT)
+            .send()
+            .await?;
+
+        let status = res.status();
+        let body = res.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(classify_status(status.as_u16(), &body));
+        }
+
+        let value: Value = serde_json::from_str(&body)
+            .map_err(|e| FabrixError::BadPayload(format!("{e} — 본문 앞부분: {}", head(&body))))?;
+        let array = extract_array(&value)
+            .ok_or_else(|| FabrixError::BadPayload(format!("모델 배열을 찾지 못했습니다: {}", head(&body))))?;
+
+        let mut models = Vec::new();
+        for item in array {
+            match serde_json::from_value::<FabrixModel>(item.clone()) {
+                Ok(m) => models.push(m),
+                // modelId 없는 항목은 조용히 건너뜁니다.
+                Err(_) => continue,
+            }
+        }
+        if models.is_empty() {
+            return Err(FabrixError::BadPayload("모델 목록이 비어 있습니다".into()));
+        }
+        Ok(models)
+    }
+
+    /// 스트리밍이면 `timeout` 을 걸지 않습니다 — 긴 답변이 정상적으로 30초를
+    /// 넘길 수 있고, 청크가 끊기는 것은 클라이언트의 read_timeout 이 잡습니다.
+    pub async fn messages(&self, body: &MessagesRequest) -> Result<reqwest::Response, FabrixError> {
+        let mut req = self
+            .request(reqwest::Method::POST, self.messages_url())
+            .header("Accept", if body.is_stream { "text/event-stream" } else { "application/json" })
+            .json(body);
+
+        if !body.is_stream {
+            req = req.timeout(REQUEST_TIMEOUT);
+        }
+
+        let res = req.send().await?;
+        let status = res.status();
+        if !status.is_success() {
+            let text = res.text().await.unwrap_or_default();
+            return Err(classify_status(status.as_u16(), &text));
+        }
+        Ok(res)
+    }
+}
+
+pub fn build_http_client(insecure: bool) -> reqwest::Client {
+    let builder = reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_TIMEOUT)
+        .user_agent(concat!("fabrix-proxy/", env!("CARGO_PKG_VERSION")));
+
+    let builder = if insecure { builder.danger_accept_invalid_certs(true) } else { builder };
+
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+}
+
+fn classify_status(status: u16, body: &str) -> FabrixError {
+    let message = extract_message(body).unwrap_or_else(|| head(body));
+    match status {
+        429 => FabrixError::Quota(message),
+        502 | 503 | 504 => FabrixError::Unreachable(message),
+        other => FabrixError::Upstream { status: other, message },
+    }
+}
+
+/// 오류 본문에서 사람이 읽을 메시지를 뽑아냅니다.
+fn extract_message(body: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    for key in ["message", "errorMessage", "error_message", "detail", "eventData"] {
+        if let Some(s) = value.get(key).and_then(|v| v.as_str()) {
+            if !s.trim().is_empty() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    if let Some(err) = value.get("error") {
+        if let Some(s) = err.as_str() {
+            return Some(s.to_string());
+        }
+        if let Some(s) = err.get("message").and_then(|v| v.as_str()) {
+            return Some(s.to_string());
+        }
+    }
+    None
+}
+
+fn head(body: &str) -> String {
+    crate::logstore::preview(body, 200)
+}
+
+/// FabriX 응답 봉투 모양을 모르므로 흔한 자리를 순서대로 뒤집니다.
+pub fn extract_array(value: &Value) -> Option<&Vec<Value>> {
+    if let Some(a) = value.as_array() {
+        return Some(a);
+    }
+    const KEYS: [&str; 7] = ["data", "result", "results", "models", "list", "items", "content"];
+    for key in KEYS {
+        if let Some(a) = value.get(key).and_then(Value::as_array) {
+            return Some(a);
+        }
+    }
+    for outer in ["data", "result", "response"] {
+        if let Some(inner) = value.get(outer) {
+            for key in KEYS {
+                if let Some(a) = inner.get(key).and_then(Value::as_array) {
+                    return Some(a);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 비스트리밍 응답에서 실제 답변 객체를 골라냅니다.
+pub fn extract_object(value: &Value) -> Value {
+    if let Some(items) = value.as_array() {
+        return items.first().cloned().unwrap_or(Value::Null);
+    }
+    for key in ["data", "result", "response"] {
+        if let Some(inner) = value.get(key) {
+            if let Some(items) = inner.as_array() {
+                return items.first().cloned().unwrap_or(Value::Null);
+            }
+            if inner.is_object() && (inner.get("content").is_some() || inner.get("finishReason").is_some()) {
+                return inner.clone();
+            }
+        }
+    }
+    value.clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn events(decoder: &mut StreamDecoder, raw: &str) -> Vec<StreamEvent> {
+        decoder.push(raw.as_bytes())
+    }
+
+    #[test]
+    fn parses_sse_with_data_prefix_and_snake_case() {
+        let mut d = StreamDecoder::new();
+        let out = events(
+            &mut d,
+            "data: {\"content\":\"안녕\",\"model_type\":\"llama\"}\n\ndata: {\"content\":\"하세요\"}\n\n",
+        );
+        assert_eq!(
+            out,
+            vec![StreamEvent::Delta("안녕".into()), StreamEvent::Delta("하세요".into())]
+        );
+        assert_eq!(d.text(), "안녕하세요");
+    }
+
+    #[test]
+    fn parses_bare_json_lines_and_camel_case() {
+        let mut d = StreamDecoder::new();
+        let out = events(&mut d, "{\"content\":\"A\"}\n{\"content\":\"B\",\"finishReason\":\"stop\"}\n");
+        assert_eq!(
+            out,
+            vec![
+                StreamEvent::Delta("A".into()),
+                StreamEvent::Delta("B".into()),
+                StreamEvent::Finish("stop".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn cumulative_frames_emit_only_the_new_suffix() {
+        let mut d = StreamDecoder::new();
+        let mut all = events(&mut d, "data: {\"content\":\"안녕\"}\n");
+        all.extend(events(&mut d, "data: {\"content\":\"안녕하세\"}\n"));
+        all.extend(events(&mut d, "data: {\"content\":\"안녕하세요\"}\n"));
+        assert_eq!(
+            all,
+            vec![
+                StreamEvent::Delta("안녕".into()),
+                StreamEvent::Delta("하세".into()),
+                StreamEvent::Delta("요".into())
+            ]
+        );
+        assert_eq!(d.text(), "안녕하세요");
+    }
+
+    #[test]
+    fn multibyte_split_across_chunk_boundaries_is_safe() {
+        let mut d = StreamDecoder::new();
+        let frame = "data: {\"content\":\"한글\"}\n".as_bytes();
+        let (a, b) = frame.split_at(20); // '한' 의 3바이트 중 2바이트만 넘긴 지점
+        assert!(d.push(a).is_empty());
+        assert_eq!(d.push(b), vec![StreamEvent::Delta("한글".into())]);
+    }
+
+    #[test]
+    fn done_sentinel_and_comments() {
+        let mut d = StreamDecoder::new();
+        let out = events(&mut d, ": keep-alive\n\ndata: [DONE]\n\n");
+        assert_eq!(out, vec![StreamEvent::Done]);
+        assert!(d.done);
+    }
+
+    #[test]
+    fn error_status_surfaces_as_error_event() {
+        let mut d = StreamDecoder::new();
+        let out = events(&mut d, "data: {\"status\":\"ERROR\",\"eventData\":\"쿼터 초과\"}\n");
+        assert_eq!(out, vec![StreamEvent::Error("쿼터 초과".into())]);
+    }
+
+    #[test]
+    fn aliases_prefer_english_names_and_fall_back_to_uuid() {
+        let models = vec![
+            FabrixModel {
+                model_id: "0196f1fc-2858-70a9-a232-74dbddb971d0".into(),
+                name: vec![
+                    LocalizedText { language_code: Some("ko".into()), content: Some("챗 4".into()) },
+                    LocalizedText { language_code: Some("en".into()), content: Some("Chat 4".into()) },
+                ],
+                description: vec![],
+            },
+            FabrixModel {
+                model_id: "01970a3b-91d4-7c8e-1111-222233334444".into(),
+                name: vec![LocalizedText { language_code: Some("ko".into()), content: Some("라이트".into()) }],
+                description: vec![],
+            },
+        ];
+        let resolved = build_aliases(&models);
+        assert_eq!(resolved[0].alias, "fabrix-chat-4");
+        assert_eq!(resolved[0].label, "챗 4");
+        // 한글만 있는 이름 → UUID 앞 8자리 (하이픈 제외)
+        assert_eq!(resolved[1].alias, "fabrix-01970a3b");
+        assert_eq!(resolved[1].label, "라이트");
+    }
+
+    #[test]
+    fn unknown_model_falls_back_to_default() {
+        let models = build_aliases(&[FabrixModel {
+            model_id: "uuid-1".into(),
+            name: vec![LocalizedText { language_code: Some("en".into()), content: Some("Chat 4".into()) }],
+            description: vec![],
+        }]);
+        let hit = resolve_model(&models, Some("gpt-4o"), "fabrix-chat-4").unwrap();
+        assert_eq!(hit.model_id, "uuid-1");
+        // UUID 를 직접 보내도 통합니다.
+        assert_eq!(resolve_model(&models, Some("uuid-1"), "").unwrap().alias, "fabrix-chat-4");
+    }
+
+    #[test]
+    fn system_messages_split_into_system_prompt() {
+        use crate::openai::{Content, Message};
+        let msgs = vec![
+            Message { role: "system".into(), content: Some(Content::Text("너는 사내 규정 도우미다.".into())) },
+            Message { role: "user".into(), content: Some(Content::Text("연차 이월 규정 알려줘".into())) },
+        ];
+        let (system, contents) = fold_messages(&msgs);
+        assert_eq!(system.as_deref(), Some("너는 사내 규정 도우미다."));
+        assert_eq!(contents, vec!["연차 이월 규정 알려줘".to_string()]);
+    }
+
+    #[test]
+    fn multi_turn_flattens_into_a_labelled_transcript() {
+        use crate::openai::{Content, Message};
+        let msgs = vec![
+            Message { role: "user".into(), content: Some(Content::Text("안녕".into())) },
+            Message { role: "assistant".into(), content: Some(Content::Text("네".into())) },
+            Message { role: "user".into(), content: Some(Content::Text("규정은?".into())) },
+        ];
+        let (system, contents) = fold_messages(&msgs);
+        assert!(system.is_none());
+        assert_eq!(contents, vec!["User: 안녕\n\nAssistant: 네\n\nUser: 규정은?".to_string()]);
+    }
+}
