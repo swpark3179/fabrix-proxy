@@ -1,10 +1,13 @@
 import { StrictMode, useEffect, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 
+import { installErrorOverlay } from './lib/errorOverlay'
 import { onToast } from './lib/ipc'
 
 import './styles/base.css'
 import './styles/toast.css'
+
+installErrorOverlay()
 
 /**
  * 목업 T3 — 창을 띄우지 않고 복사만 하는 흐름이 이 앱에서 가장 잦습니다.

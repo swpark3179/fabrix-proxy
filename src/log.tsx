@@ -5,6 +5,7 @@ import { FilterBar, type Filter } from './components/log/FilterBar'
 import { LogDetail } from './components/log/LogDetail'
 import { LogList } from './components/log/LogList'
 import { TitleBar } from './components/TitleBar'
+import { installErrorOverlay } from './lib/errorOverlay'
 import { copyText } from './lib/format'
 import {
   clearLogs,
@@ -18,6 +19,8 @@ import type { LogEntry } from './types'
 
 import './styles/base.css'
 import './styles/log.css'
+
+installErrorOverlay()
 
 function matches(entry: LogEntry, filter: Filter): boolean {
   switch (filter) {
@@ -44,11 +47,17 @@ function LogApp() {
     let alive = true
 
     void (async () => {
-      const [logs, snap] = await Promise.all([getLogs(), getSnapshot()])
-      if (!alive) return
-      setEntries(logs)
-      setBaseUrl(snap.baseUrl)
-      setRunning(snap.running)
+      try {
+        const [logs, snap] = await Promise.all([getLogs(), getSnapshot()])
+        if (!alive) return
+        setEntries(logs)
+        setBaseUrl(snap.baseUrl)
+        setRunning(snap.running)
+      } catch (err) {
+        // 창은 그대로 뜨지만 원인을 콘솔·오버레이로 남깁니다.
+        console.error('[log] 초기 로드 실패', err)
+        throw err
+      }
     })()
 
     const unlisteners = [
