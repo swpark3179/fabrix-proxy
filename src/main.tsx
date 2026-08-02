@@ -7,6 +7,7 @@ import { EndpointCards } from './components/EndpointCards'
 import { RecentCalls } from './components/RecentCalls'
 import { StatusPanel } from './components/StatusPanel'
 import { TitleBar } from './components/TitleBar'
+import { installErrorOverlay } from './lib/errorOverlay'
 import {
   checkPort,
   copyEndpoint,
@@ -25,6 +26,8 @@ import type { Config, PortStatus, Snapshot } from './types'
 import './styles/base.css'
 import './styles/main.css'
 
+installErrorOverlay()
+
 const PORT_DEBOUNCE_MS = 300
 
 function App() {
@@ -35,6 +38,8 @@ function App() {
   const [portStatus, setPortStatus] = useState<PortStatus | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
+  // 시작 스냅샷/설정을 못 받아온 경우 — 빈 스켈레톤에 멈추는 대신 이유를 보여줍니다.
+  const [bootError, setBootError] = useState('')
 
   // 사용자가 포트를 만지기 시작하면 서버발 스냅샷이 입력칸을 덮어쓰지 않게 합니다.
   const portTouched = useRef(false)
@@ -43,12 +48,16 @@ function App() {
     let alive = true
 
     void (async () => {
-      const [snap, cfg] = await Promise.all([getSnapshot(), getConfig()])
-      if (!alive) return
-      setSnapshot(snap)
-      setConfig(cfg)
-      setPortDraft(String(snap.port))
-      setPortStatus(snap.portStatus)
+      try {
+        const [snap, cfg] = await Promise.all([getSnapshot(), getConfig()])
+        if (!alive) return
+        setSnapshot(snap)
+        setConfig(cfg)
+        setPortDraft(String(snap.port))
+        setPortStatus(snap.portStatus)
+      } catch (err) {
+        if (alive) setBootError(errText(err))
+      }
     })()
 
     const unlisteners = [
@@ -172,7 +181,9 @@ function App() {
     return (
       <div className="app">
         <TitleBar title="AI 프록시" />
-        <div className="app__body" />
+        <div className="app__body">
+          {bootError && <div className="alert">{bootError}</div>}
+        </div>
       </div>
     )
   }
