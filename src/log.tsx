@@ -22,6 +22,9 @@ import './styles/log.css'
 
 installErrorOverlay()
 
+/** 링버퍼 용량 — 백엔드 `logstore::CAPACITY` 와 같은 값으로 맞춥니다. */
+const LOG_CAPACITY = 50
+
 function matches(entry: LogEntry, filter: Filter): boolean {
   switch (filter) {
     case 'chat':
@@ -62,7 +65,7 @@ function LogApp() {
 
     const unlisteners = [
       // 링버퍼와 같은 순서(최신 우선)를 유지합니다.
-      onLogEntry((entry) => setEntries((prev) => [entry, ...prev].slice(0, 200))),
+      onLogEntry((entry) => setEntries((prev) => [entry, ...prev].slice(0, LOG_CAPACITY))),
       onLogsCleared(() => {
         setEntries([])
         setSelectedId(null)
@@ -97,6 +100,7 @@ function LogApp() {
       <FilterBar
         active={filter}
         total={entries.length}
+        capacity={LOG_CAPACITY}
         onChange={setFilter}
         onClear={() => void clearLogs()}
       />
