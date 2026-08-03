@@ -469,6 +469,23 @@
   overflow-y: auto;
 }
 
+/* ── 전체보기 가상 스크롤 (VirtualText) ─────────────────────────── */
+
+/* 전체 높이만 잡아 두는 자리틀. 보이는 줄만 이 안에 절대 위치로 얹힙니다. */
+.virtual__sizer {
+  width: 100%;
+}
+
+/* 각 줄은 `.code` 의 pre-wrap·줄바꿈·폰트를 물려받고, 빈 줄도 한 줄 높이를 지킵니다. */
+.virtual__row {
+  min-height: 1.8em;
+}
+
+/* 답변 본문(prose)은 줄 높이가 다르므로 그 톤에 맞춰 빈 줄 높이도 맞춥니다. */
+.code--prose .virtual__row {
+  min-height: 1.7em;
+}
+
 .detail__placeholder {
   flex: 1;
   display: flex;

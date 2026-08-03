@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { createPortal } from 'react-dom'
 
 import { copyText } from '../../lib/format'
+import { VirtualText } from './VirtualText'
 
 export interface FullText {
   title: string
@@ -51,9 +52,10 @@ export function FullTextModal({ open, onClose }: Props) {
             ×
           </button>
         </div>
-        <pre className={`code modal__body${open.className ? ` ${open.className}` : ''}`}>
-          {open.text}
-        </pre>
+        <VirtualText
+          className={`code modal__body${open.className ? ` ${open.className}` : ''}`}
+          text={open.text}
+        />
       </div>
     </div>,
     document.body,
