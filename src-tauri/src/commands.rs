@@ -93,6 +93,17 @@ pub async fn test_connection(
     })
 }
 
+/// 설정 화면의 이미지 모델 선택 드롭다운용 — 사내 모델 목록(alias · id · label)을 돌려줍니다.
+/// 60초 캐시를 그대로 활용합니다.
+#[tauri::command]
+pub async fn list_models(app: AppHandle) -> Result<Vec<crate::proxy::fabrix::ResolvedModel>, String> {
+    let state = app.state::<Shared>().inner().clone();
+    crate::proxy::models::ensure_models(&state)
+        .await
+        .map(|(models, _)| models)
+        .map_err(|err| err.message())
+}
+
 #[tauri::command]
 pub async fn save_config(app: AppHandle, mut config: Config) -> Result<Snapshot, String> {
     let state = app.state::<Shared>().inner().clone();

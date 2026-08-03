@@ -1,16 +1,16 @@
 import { writeText } from '@tauri-apps/plugin-clipboard-manager'
 import { useEffect, useState } from 'react'
 
-import { errText, getConfigPath, issueToken, testConnection } from '../lib/ipc'
-import type { Config } from '../types'
+import { errText, getConfigPath, issueToken, listModels, testConnection } from '../lib/ipc'
+import type { Config, ModelInfo } from '../types'
 
-// 사내 이미지/비전 모델 후보. 실제 목록은 파이썬 샘플(이미지 분석/생성) 확정 시 갱신합니다.
-const IMAGE_MODELS = ['flux-2.0', 'flux-1.1-pro', 'flux-dev']
-const VISION_MODELS = ['gemma-4', 'gemma-3']
-
-/** 현재 저장된 값이 후보 목록에 없더라도 드롭다운에서 사라지지 않게 앞에 끼워 줍니다. */
-function withCurrent(list: string[], current: string): string[] {
-  return current && !list.includes(current) ? [current, ...list] : list
+/** 드롭다운 옵션. 저장된 값이 조회 목록에 없으면(오프라인/미조회) 그대로 보이도록 앞에 끼워 줍니다. */
+function modelOptionList(models: ModelInfo[], current: string): { value: string; label: string }[] {
+  const opts = models.map((m) => ({ value: m.modelId, label: `${m.label} · ${m.alias}` }))
+  if (current && !opts.some((o) => o.value === current)) {
+    opts.unshift({ value: current, label: `${current} (저장됨)` })
+  }
+  return opts
 }
 
 interface Props {
@@ -38,10 +38,19 @@ export function ConnectionForm({ initial, variant, busy, onSave, onCancel }: Pro
   const [configPath, setConfigPath] = useState('')
   const [saveError, setSaveError] = useState('')
   const [tokenCopied, setTokenCopied] = useState(false)
+  const [models, setModels] = useState<ModelInfo[]>([])
 
   useEffect(() => {
     void getConfigPath().then(setConfigPath)
   }, [])
+
+  // 설정 화면에서만 이미지 모델 드롭다운용 목록을 불러옵니다(연결이 설정돼 있어야 성공).
+  useEffect(() => {
+    if (variant !== 'settings') return
+    void listModels()
+      .then(setModels)
+      .catch(() => setModels([]))
+  }, [variant])
 
   const set = <K extends keyof Config>(key: K, value: Config[K]) =>
     setDraft((prev) => ({ ...prev, [key]: value }))
@@ -199,39 +208,60 @@ export function ConnectionForm({ initial, variant, busy, onSave, onCancel }: Pro
             </div>
           </div>
 
-          <span className="setup__section-label">이미지 (OpenAI 호환 /v1/images)</span>
+          <span className="setup__section-label">이미지 (OpenAI 호환 /v1/images · messages-with-models)</span>
+          <div className="field">
+            <span className="field__label">텍스트 모델 — 이미지 호출에 함께 전송 (modelIds 첫 번째)</span>
+            <select
+              className="text-input"
+              value={draft.imageTextModel}
+              onChange={(e) => set('imageTextModel', e.target.value)}
+            >
+              <option value="">— 선택 —</option>
+              {modelOptionList(models, draft.imageTextModel).map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+          </div>
           <div className="setup__row">
             <div className="field">
-              <span className="field__label">이미지 생성 모델 · FLUX</span>
+              <span className="field__label">이미지 생성 모델 · FLUX (T2I)</span>
               <select
                 className="text-input"
                 value={draft.imageModel}
                 onChange={(e) => set('imageModel', e.target.value)}
               >
                 <option value="">— 선택 —</option>
-                {withCurrent(IMAGE_MODELS, draft.imageModel).map((m) => (
-                  <option key={m} value={m}>
-                    {m}
+                {modelOptionList(models, draft.imageModel).map((o) => (
+                  <option key={o.value} value={o.value}>
+                    {o.label}
                   </option>
                 ))}
               </select>
             </div>
             <div className="field">
-              <span className="field__label">이미지 인식 모델 · gemma</span>
+              <span className="field__label">이미지 인식 모델 · gemma (I2T)</span>
               <select
                 className="text-input"
                 value={draft.visionModel}
                 onChange={(e) => set('visionModel', e.target.value)}
               >
                 <option value="">— 선택 —</option>
-                {withCurrent(VISION_MODELS, draft.visionModel).map((m) => (
-                  <option key={m} value={m}>
-                    {m}
+                {modelOptionList(models, draft.visionModel).map((o) => (
+                  <option key={o.value} value={o.value}>
+                    {o.label}
                   </option>
                 ))}
               </select>
             </div>
           </div>
+          {models.length === 0 && (
+            <span className="setup__desc">
+              모델 목록이 비어 있습니다 — 위 연결 정보를 저장한 뒤 설정을 다시 열면 사내 모델을 드롭다운으로
+              고를 수 있습니다. (저장된 값은 그대로 유지됩니다.)
+            </span>
+          )}
 
           <label className="check">
             <input

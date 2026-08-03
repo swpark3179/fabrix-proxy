@@ -184,7 +184,7 @@ pub async fn generations(State(state): State<Shared>, headers: HeaderMap, body: 
         },
         req_fabrix: "(요청을 변환하기 전에 실패했습니다)".into(),
         req_fabrix_headers: fabrix_headers_line(&cfg),
-        fabrix_url: format!("{}{}", cfg.normalized_base_url(), image_backend::IMAGE_GEN_PATH),
+        fabrix_url: format!("{}{}", cfg.normalized_base_url(), image_backend::MESSAGES_WITH_MODELS_PATH),
         stub: false,
     };
 
@@ -213,7 +213,7 @@ pub async fn generations(State(state): State<Shared>, headers: HeaderMap, body: 
         .filter(|s| !s.is_empty())
         .unwrap_or(FALLBACK_PROMPT)
         .to_string();
-    let size = image_backend::snap_size(req.size.as_deref().and_then(parse_size));
+    let size = image_backend::size_or_default(req.size.as_deref().and_then(parse_size));
     let n = req.n.unwrap_or(1).clamp(1, image_backend::MAX_N);
 
     let images = match generate_n(&state, &mut ctx, &cfg, &prompt, size, n).await {
@@ -240,13 +240,21 @@ async fn generate_n(
         return Ok((0..n).map(|_| image_backend::placeholder_png()).collect());
     }
 
-    let model = match image_backend::resolve_image_model(cfg) {
+    let text_model = match image_backend::resolve_text_model(cfg) {
         Ok(m) => m,
         Err(err) => return Err(image_err_response(state, ctx, err)),
     };
-    ctx.model_used = Some(model.clone());
+    let gen_model = match image_backend::resolve_image_model(cfg) {
+        Ok(m) => m,
+        Err(err) => return Err(image_err_response(state, ctx, err)),
+    };
+    ctx.model_used = Some(gen_model.clone());
     ctx.req_fabrix = pretty(&serde_json::json!({
-        "generation": { "model": model, "size": format!("{}x{}", size.0, size.1), "prompt": prompt }
+        "endpoint": image_backend::MESSAGES_WITH_MODELS_PATH,
+        "modelIds": [text_model.clone(), gen_model.clone()],
+        "contents": [prompt],
+        "messageConfig": { "width": size.0, "height": size.1 },
+        "isStream": false
     }));
 
     let Some(client) = state.image_client() else {
@@ -255,8 +263,8 @@ async fn generate_n(
 
     let mut out = Vec::with_capacity(n as usize);
     for _ in 0..n {
-        match client.generate(prompt, size, &model).await {
-            Ok(bytes) => out.push(image_backend::fit_output(bytes, size)),
+        match client.generate(&text_model, &gen_model, prompt, size).await {
+            Ok(bytes) => out.push(bytes),
             Err(err) => return Err(image_err_response(state, ctx, err)),
         }
     }
@@ -284,7 +292,7 @@ pub async fn edits(State(state): State<Shared>, headers: HeaderMap, body: Bytes)
         },
         req_fabrix: "(요청을 변환하기 전에 실패했습니다)".into(),
         req_fabrix_headers: fabrix_headers_line(&cfg),
-        fabrix_url: format!("{}{}", cfg.normalized_base_url(), image_backend::VISION_PATH),
+        fabrix_url: format!("{}{}", cfg.normalized_base_url(), image_backend::MESSAGES_WITH_MODELS_PATH),
         stub: false,
     };
 
@@ -331,7 +339,7 @@ pub async fn edits(State(state): State<Shared>, headers: HeaderMap, body: Bytes)
     }
     .to_string();
 
-    let size = image_backend::snap_size(req.size.as_deref().and_then(parse_size));
+    let size = image_backend::size_or_default(req.size.as_deref().and_then(parse_size));
     let n = req.n.unwrap_or(1).clamp(1, image_backend::MAX_N);
 
     let images = match edit_pipeline(&state, &mut ctx, &cfg, &image_bytes, &mime, &prompt, size, n).await {
@@ -362,15 +370,19 @@ async fn edit_pipeline(
         return Ok((0..n).map(|_| image_backend::placeholder_png()).collect());
     }
 
+    let text_model = match image_backend::resolve_text_model(cfg) {
+        Ok(m) => m,
+        Err(err) => return Err(image_err_response(state, ctx, err)),
+    };
     let vision_model = match image_backend::resolve_vision_model(cfg) {
         Ok(m) => m,
         Err(err) => return Err(image_err_response(state, ctx, err)),
     };
-    ctx.vision_model = Some(vision_model.clone());
     let gen_model = match image_backend::resolve_image_model(cfg) {
         Ok(m) => m,
         Err(err) => return Err(image_err_response(state, ctx, err)),
     };
+    ctx.vision_model = Some(vision_model.clone());
     ctx.model_used = Some(gen_model.clone());
 
     let Some(client) = state.image_client() else {
@@ -378,7 +390,10 @@ async fn edit_pipeline(
     };
 
     // 1) gemma 인식 — 참조 이미지를 설명 텍스트로.
-    let description = match client.understand(image, mime, instruction, &vision_model).await {
+    let description = match client
+        .understand(&text_model, &vision_model, image, mime, image_backend::DESCRIBE_INSTRUCTION)
+        .await
+    {
         Ok(desc) => desc,
         Err(err) => return Err(image_err_response(state, ctx, err)),
     };
@@ -386,15 +401,24 @@ async fn edit_pipeline(
     // 2) 설명 + 편집 지시를 FLUX 프롬프트로 합성.
     let composed = image_backend::compose_edit_prompt(&description, instruction);
     ctx.req_fabrix = pretty(&serde_json::json!({
-        "vision": { "model": vision_model, "mime": mime, "bytes": image.len() },
-        "generation": { "model": gen_model, "size": format!("{}x{}", size.0, size.1), "prompt": composed }
+        "vision": {
+            "endpoint": image_backend::MESSAGES_WITH_MODELS_PATH,
+            "modelIds": [text_model.clone(), vision_model.clone()],
+            "mime": mime, "bytes": image.len(), "isStream": true
+        },
+        "generation": {
+            "endpoint": image_backend::MESSAGES_WITH_MODELS_PATH,
+            "modelIds": [text_model.clone(), gen_model.clone()],
+            "messageConfig": { "width": size.0, "height": size.1 },
+            "prompt": composed.clone(), "isStream": false
+        }
     }));
 
     // 3) FLUX 재생성.
     let mut out = Vec::with_capacity(n as usize);
     for _ in 0..n {
-        match client.generate(&composed, size, &gen_model).await {
-            Ok(bytes) => out.push(image_backend::fit_output(bytes, size)),
+        match client.generate(&text_model, &gen_model, &composed, size).await {
+            Ok(bytes) => out.push(bytes),
             Err(err) => return Err(image_err_response(state, ctx, err)),
         }
     }
