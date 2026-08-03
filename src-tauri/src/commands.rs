@@ -94,11 +94,16 @@ pub async fn test_connection(
 }
 
 #[tauri::command]
-pub async fn save_config(app: AppHandle, config: Config) -> Result<Snapshot, String> {
+pub async fn save_config(app: AppHandle, mut config: Config) -> Result<Snapshot, String> {
     let state = app.state::<Shared>().inner().clone();
 
     if config.port == 0 {
         return Err("포트 번호가 올바르지 않습니다.".into());
+    }
+
+    // 토큰 사용 모드를 켰는데 아직 발행된 토큰이 없으면 이 순간 자동 발행합니다.
+    if config.token_mode && config.issued_token.trim().is_empty() {
+        config.issued_token = config::generate_token();
     }
 
     let was_running = state.is_running();
@@ -121,6 +126,14 @@ pub async fn save_config(app: AppHandle, config: Config) -> Result<Snapshot, Str
     tray::refresh(&app);
     state.emit_state();
     Ok(state.snapshot())
+}
+
+/// OpenAI 양식 토큰을 하나 발행해서 돌려줍니다 — 저장은 하지 않습니다.
+/// 설정 폼이 초안(draft)에만 채워 두고, 실제 저장은 다른 값들과 함께 "저장" 시
+/// 일어납니다. (test_connection 이 저장 없이 시험만 하는 것과 같은 규칙.)
+#[tauri::command]
+pub fn issue_token() -> String {
+    config::generate_token()
 }
 
 #[tauri::command]

@@ -15,7 +15,7 @@ use crate::openai::{ErrorEnvelope, ModelCard, ModelList};
 use crate::state::{self, ModelsCache, Shared, MODELS_CACHE_TTL};
 
 use super::fabrix::{build_aliases, FabrixError, ResolvedModel, MODELS_PATH};
-use super::{error_response, fabrix_headers_line};
+use super::{authorize, error_response, fabrix_headers_line, inbound_auth_line};
 
 /// `(모델 목록, 캐시에서 나왔는지)`.
 ///
@@ -49,13 +49,9 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap) -> Response
     let ua = headers.get("user-agent").and_then(|v| v.to_str().ok());
     let client_name = logstore::short_client(ua);
 
-    // 인바운드 Authorization 은 값과 무관하게 통과시킵니다 —
-    // 목업: "API 키 칸에는 아무 값이나 넣어도 됩니다".
-    let auth = if headers.contains_key("authorization") {
-        "Bearer ●●●●(값 무시)"
-    } else {
-        "(없음 · 무시)"
-    };
+    // 인바운드 Authorization: 키발급없이 허용 모드면 아무 값이나 통과,
+    // 토큰 사용 모드면 발행 토큰과 일치할 때만 통과합니다.
+    let auth = inbound_auth_line(&cfg, &headers);
 
     let req_openai = format!(
         "GET /v1/models\nAuthorization: {auth}\nUser-Agent: {}",
@@ -63,6 +59,38 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap) -> Response
     );
     let fabrix_url = format!("{}{MODELS_PATH}", cfg.normalized_base_url());
     let headers_line = fabrix_headers_line(&cfg);
+
+    // 토큰 모드에서 인바운드 토큰이 일치하지 않으면 사내 호출 전에 거부합니다.
+    if let Err((status, envelope)) = authorize(&cfg, &headers) {
+        let latency = started.elapsed().as_millis() as u64;
+        state.record(LogEntry {
+            id: Uuid::new_v4().to_string(),
+            ts: state::now_hm(),
+            ts_full: state::now_iso(),
+            kind: Kind::Models,
+            method: Kind::Models.method(),
+            path: Kind::Models.path(),
+            status,
+            latency_ms: latency,
+            stream: false,
+            cached: false,
+            model_requested: None,
+            model_alias: None,
+            model_id: None,
+            model_label: None,
+            client: client_name,
+            note: Some("토큰 거부".into()),
+            summary: Some("토큰 거부".into()),
+            is_error: true,
+            req_openai,
+            req_fabrix: "(토큰 검증 실패 — 사내 호출을 하지 않았습니다)".into(),
+            req_fabrix_headers: headers_line,
+            fabrix_url,
+            resp_preview: envelope.error.message.clone(),
+            resp_meta: format!("거부 · HTTP {status}"),
+        });
+        return error_response(status, envelope);
+    }
 
     match ensure_models(&state).await {
         Ok((models, cached)) => {

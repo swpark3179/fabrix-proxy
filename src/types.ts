@@ -59,6 +59,8 @@ export interface Snapshot {
   fabrixBaseUrl: string
   defaultModelAlias: string
   insecureSkipVerify: boolean
+  tokenMode: boolean
+  issuedToken: string
   stats: Stats
   recent: LogEntry[]
   portStatus: PortStatus
@@ -73,6 +75,8 @@ export interface Config {
   autoStart: boolean
   defaultModelAlias: string
   insecureSkipVerify: boolean
+  tokenMode: boolean
+  issuedToken: string
 }
 
 export interface TestResult {

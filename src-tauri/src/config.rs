@@ -30,6 +30,11 @@ pub struct Config {
     pub default_model_alias: String,
     /// 사내 루트 CA가 Windows 인증서 저장소에 없을 때의 탈출구.
     pub insecure_skip_verify: bool,
+    /// 로컬 토큰 검증 모드. `false`(기본) = 키발급없이 허용(아무 토큰이나 통과),
+    /// `true` = 토큰 사용 모드(발행된 토큰과 일치할 때만 허용).
+    pub token_mode: bool,
+    /// 토큰 사용 모드에서 발행한 OpenAI 양식 토큰(`sk-…`). 인바운드 Bearer 와 대조합니다.
+    pub issued_token: String,
 }
 
 impl Default for Config {
@@ -42,8 +47,21 @@ impl Default for Config {
             auto_start: true,
             default_model_alias: String::new(),
             insecure_skip_verify: false,
+            token_mode: false,
+            issued_token: String::new(),
         }
     }
+}
+
+/// OpenAI 양식 토큰을 발행합니다 — `sk-` + 영숫자 48자.
+///
+/// 새 크레이트 없이 기존 `uuid` v4 두 개의 hex(각 32자)를 이어 48자를 만듭니다.
+/// OpenAI SDK 는 `sk-` 접두 + 영숫자면 통과하므로 base62 까지는 필요 없습니다.
+pub fn generate_token() -> String {
+    let a = uuid::Uuid::new_v4().simple().to_string();
+    let b = uuid::Uuid::new_v4().simple().to_string();
+    let body: String = format!("{a}{b}").chars().take(48).collect();
+    format!("sk-{body}")
 }
 
 impl Config {
