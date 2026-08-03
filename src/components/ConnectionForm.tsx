@@ -1,6 +1,7 @@
+import { writeText } from '@tauri-apps/plugin-clipboard-manager'
 import { useEffect, useState } from 'react'
 
-import { errText, getConfigPath, testConnection } from '../lib/ipc'
+import { errText, getConfigPath, issueToken, testConnection } from '../lib/ipc'
 import type { Config } from '../types'
 
 interface Props {
@@ -27,6 +28,7 @@ export function ConnectionForm({ initial, variant, busy, onSave, onCancel }: Pro
   const [probe, setProbe] = useState<Probe>({ state: 'idle' })
   const [configPath, setConfigPath] = useState('')
   const [saveError, setSaveError] = useState('')
+  const [tokenCopied, setTokenCopied] = useState(false)
 
   useEffect(() => {
     void getConfigPath().then(setConfigPath)
@@ -62,6 +64,42 @@ export function ConnectionForm({ initial, variant, busy, onSave, onCancel }: Pro
     setSaveError('')
     try {
       await onSave({ ...draft, port: draft.port || 8787 })
+    } catch (err) {
+      setSaveError(errText(err))
+    }
+  }
+
+  /** 토큰 모드를 켤 때 토큰이 아직 없으면 바로 하나 발행해 초안에 채웁니다. */
+  async function toggleTokenMode(checked: boolean) {
+    setTokenCopied(false)
+    if (checked && draft.issuedToken.trim() === '') {
+      try {
+        const token = await issueToken()
+        setDraft((prev) => ({ ...prev, tokenMode: true, issuedToken: token }))
+        return
+      } catch {
+        // 발행에 실패해도 저장 시 백엔드가 자동 발행하므로 모드만 켭니다.
+      }
+    }
+    set('tokenMode', checked)
+  }
+
+  /** 토큰 재발급 — 이전 토큰은 저장 후 무효가 됩니다. */
+  async function regenerateToken() {
+    try {
+      const token = await issueToken()
+      set('issuedToken', token)
+      setTokenCopied(false)
+    } catch (err) {
+      setSaveError(errText(err))
+    }
+  }
+
+  async function copyToken() {
+    try {
+      await writeText(draft.issuedToken)
+      setTokenCopied(true)
+      setTimeout(() => setTokenCopied(false), 1500)
     } catch (err) {
       setSaveError(errText(err))
     }
@@ -169,6 +207,46 @@ export function ConnectionForm({ initial, variant, busy, onSave, onCancel }: Pro
             />
             TLS 인증서 검증을 건너뜁니다 — 사내 루트 CA가 Windows 인증서 저장소에 없을 때만
           </label>
+
+          <label className="check">
+            <input
+              type="checkbox"
+              checked={draft.tokenMode}
+              onChange={(e) => void toggleTokenMode(e.target.checked)}
+            />
+            토큰 사용 모드 — 발행된 토큰과 일치하는 요청만 허용 (끄면 아무 토큰이나 통과)
+          </label>
+
+          {draft.tokenMode && (
+            <div className="field">
+              <span className="field__label">발행된 토큰 · 클라이언트의 API 키 칸에 넣으세요</span>
+              {draft.issuedToken.trim() !== '' ? (
+                <>
+                  <div className="setup__row">
+                    <input
+                      className="text-input"
+                      readOnly
+                      value={draft.issuedToken}
+                      spellCheck={false}
+                      onFocus={(e) => e.currentTarget.select()}
+                    />
+                    <button className="btn-ghost" onClick={() => void copyToken()}>
+                      {tokenCopied ? '복사됨' : '복사'}
+                    </button>
+                    <button className="btn-ghost" onClick={() => void regenerateToken()}>
+                      재발급
+                    </button>
+                  </div>
+                  <span className="setup__desc">
+                    이 토큰과 다른 값으로 호출하면 <strong>401</strong> 로 거부됩니다. 재발급하면
+                    이전 토큰은 저장 후 무효가 됩니다.
+                  </span>
+                </>
+              ) : (
+                <span className="setup__desc">저장하면 <code>sk-…</code> 토큰이 자동 발행됩니다.</span>
+              )}
+            </div>
+          )}
         </div>
       )}
 

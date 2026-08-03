@@ -5,7 +5,7 @@ pub mod chat;
 pub mod fabrix;
 pub mod models;
 
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -86,6 +86,50 @@ pub fn error_response(status: u16, envelope: ErrorEnvelope) -> Response {
     (code, Json(envelope)).into_response()
 }
 
+/// 인바운드 토큰을 검사합니다. 토큰 사용 모드일 때만 실제로 검증하고,
+/// 키발급없이 허용 모드면 항상 통과시킵니다(기존 동작 유지).
+///
+/// 통과하면 `Ok(())`, 거부면 OpenAI 표준 `invalid_api_key` 401 을 돌려줍니다.
+pub fn authorize(cfg: &Config, headers: &HeaderMap) -> Result<(), (u16, ErrorEnvelope)> {
+    if !cfg.token_mode {
+        return Ok(());
+    }
+
+    let presented = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.strip_prefix("Bearer ").unwrap_or(v).trim());
+
+    let expected = cfg.issued_token.trim();
+    match presented {
+        Some(tok) if !expected.is_empty() && tok == expected => Ok(()),
+        _ => Err((
+            401,
+            ErrorEnvelope::new(
+                "토큰이 일치하지 않습니다. 발행된 토큰을 API 키로 입력하세요.",
+                "invalid_request_error",
+                Some("invalid_api_key".into()),
+            ),
+        )),
+    }
+}
+
+/// 로그 ① 칸의 `Authorization:` 줄 — 모드에 따라 문구가 달라집니다.
+pub fn inbound_auth_line(cfg: &Config, headers: &HeaderMap) -> &'static str {
+    let has = headers.contains_key("authorization");
+    if cfg.token_mode {
+        if has {
+            "Bearer ●●●●(검증됨)"
+        } else {
+            "(없음 · 토큰 모드에서는 거부)"
+        }
+    } else if has {
+        "Bearer ●●●●(값 무시)"
+    } else {
+        "(없음 · 무시)"
+    }
+}
+
 /// 로그 ② 칸 상단에 붙는 마스킹된 헤더 줄.
 pub fn fabrix_headers_line(cfg: &Config) -> String {
     format!(
@@ -97,4 +141,50 @@ pub fn fabrix_headers_line(cfg: &Config) -> String {
 
 pub fn pretty(value: &serde_json::Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{generate_token, Config};
+
+    fn with_auth(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("authorization", value.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn open_mode_passes_any_token() {
+        let cfg = Config { token_mode: false, ..Config::default() };
+        assert!(authorize(&cfg, &with_auth("Bearer whatever")).is_ok());
+        assert!(authorize(&cfg, &HeaderMap::new()).is_ok());
+    }
+
+    #[test]
+    fn token_mode_accepts_matching_bearer() {
+        let cfg = Config { token_mode: true, issued_token: "sk-abc123".into(), ..Config::default() };
+        assert!(authorize(&cfg, &with_auth("Bearer sk-abc123")).is_ok());
+    }
+
+    #[test]
+    fn token_mode_rejects_mismatch_missing_and_empty_issued() {
+        let cfg = Config { token_mode: true, issued_token: "sk-abc123".into(), ..Config::default() };
+        // 틀린 토큰
+        assert_eq!(authorize(&cfg, &with_auth("Bearer sk-wrong")).unwrap_err().0, 401);
+        // 헤더 없음
+        assert_eq!(authorize(&cfg, &HeaderMap::new()).unwrap_err().0, 401);
+        // 발행 토큰이 비어 있으면 어떤 값도 통과하지 못합니다 (빈 토큰 우회 방지).
+        let empty = Config { token_mode: true, issued_token: String::new(), ..Config::default() };
+        assert_eq!(authorize(&empty, &with_auth("Bearer ")).unwrap_err().0, 401);
+    }
+
+    #[test]
+    fn generated_token_has_openai_shape() {
+        let t = generate_token();
+        assert!(t.starts_with("sk-"));
+        assert_eq!(t.len(), 3 + 48);
+        assert!(t[3..].chars().all(|c| c.is_ascii_alphanumeric()));
+        assert_ne!(generate_token(), generate_token());
+    }
 }

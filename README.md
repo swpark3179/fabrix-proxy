@@ -92,13 +92,24 @@ mock-fabrix/server.mjs 개발용 FabriX 스텁 (의존성 0)
   "port": 8787,
   "autoStart": true,
   "defaultModelAlias": "fabrix-chat-4",
-  "insecureSkipVerify": false
+  "insecureSkipVerify": false,
+  "tokenMode": false,          // 로컬 토큰 검증 모드
+  "issuedToken": ""            // tokenMode=true 일 때 발행되는 sk-… 토큰
 }
 ```
 
 > ⚠️ 평문입니다. 이 폴더를 읽을 수 있는 계정이나 프로그램은 사내 인증키를 그대로 볼 수 있습니다.
 > Windows 자격 증명 관리자로 옮기려면 `src-tauri/src/config.rs` 의 `load_config`/`save_config` 두
 > 함수만 바꾸면 됩니다.
+
+### 로컬 토큰 (키 발급)
+
+기본은 **키발급없이 허용 모드**(`tokenMode: false`) — 클라이언트가 API 키 칸에 아무 값이나
+넣어도 통과합니다(사내 키는 프록시가 붙입니다). 설정 화면에서 **토큰 사용 모드**를 켜면
+OpenAI 양식 토큰(`sk-…`)이 자동 발행되고, 인바운드 `Authorization: Bearer <token>` 이 발행된
+토큰과 **정확히 일치할 때만** 허용합니다. 일치하지 않으면 OpenAI 표준 `invalid_api_key` 로
+`401` 을 돌려줍니다. 발행 토큰은 메인 화면 카드나 설정 화면에서 복사하고, "재발급"으로 언제든
+교체할 수 있습니다(이전 토큰은 저장 후 무효).
 
 `~/.fabrix-proxy/stats.json` 에는 날짜별 호출 건수만 남습니다.
 **호출 본문은 어디에도 기록하지 않습니다** — 최근 200건은 메모리에만 있고 앱을 끄면 사라집니다.

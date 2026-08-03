@@ -26,6 +26,7 @@ pub fn run() {
             commands::check_port,
             commands::test_connection,
             commands::save_config,
+            commands::issue_token,
             commands::start_proxy,
             commands::stop_proxy,
             commands::toggle_proxy,

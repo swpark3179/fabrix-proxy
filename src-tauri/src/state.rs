@@ -60,6 +60,10 @@ pub struct Snapshot {
     pub fabrix_base_url: String,
     pub default_model_alias: String,
     pub insecure_skip_verify: bool,
+    /// 토큰 사용 모드 여부. UI 가 토큰 카드를 보여줄지 판단합니다.
+    pub token_mode: bool,
+    /// 발행된 토큰(`sk-…`). 토큰 모드일 때만 채웁니다 — UI 복사 버튼용.
+    pub issued_token: String,
     pub stats: Stats,
     pub recent: Vec<LogEntry>,
     pub port_status: PortStatus,
@@ -149,6 +153,9 @@ impl AppState {
             fabrix_base_url: cfg.normalized_base_url(),
             default_model_alias: cfg.default_model_alias.clone(),
             insecure_skip_verify: cfg.insecure_skip_verify,
+            token_mode: cfg.token_mode,
+            // 토큰 모드일 때만 노출합니다 — 꺼져 있으면 UI 에 굳이 실을 필요가 없습니다.
+            issued_token: if cfg.token_mode { cfg.issued_token.clone() } else { String::new() },
             stats,
             recent,
             port_status: port::inspect(port, running),

@@ -27,7 +27,7 @@ use super::fabrix::{
     MessagesRequest, ResolvedModel, StreamDecoder, StreamEvent, MESSAGES_PATH,
 };
 use super::models::ensure_models;
-use super::{error_response, fabrix_headers_line, pretty};
+use super::{authorize, error_response, fabrix_headers_line, pretty};
 
 /// 로그 한 건을 조립하는 데 필요한 것들. 스트리밍 제너레이터 안으로 통째로
 /// 옮겨가므로 소유 값만 담습니다.
@@ -111,7 +111,8 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Bytes
     let cfg = state.config();
 
     let ua = headers.get("user-agent").and_then(|v| v.to_str().ok());
-    // 인바운드 Authorization 은 값과 무관하게 통과 — 사내 키는 프록시가 붙입니다.
+    // 인바운드 Authorization: 키발급없이 허용 모드면 값과 무관하게 통과,
+    // 토큰 사용 모드면 발행 토큰과 일치할 때만 통과합니다. (아래 authorize 에서 검사)
     let incoming: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
 
     let mut ctx = Ctx {
@@ -131,6 +132,20 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Bytes
         req_fabrix_headers: fabrix_headers_line(&cfg),
         fabrix_url: format!("{}{MESSAGES_PATH}", cfg.normalized_base_url()),
     };
+
+    // ── 토큰 검증 ───────────────────────────────────────────
+    // 토큰 사용 모드에서 인바운드 토큰이 발행 토큰과 다르면 사내 호출 전에 거부합니다.
+    if let Err((status, envelope)) = authorize(&cfg, &headers) {
+        state.record(ctx.entry(
+            status,
+            true,
+            Some("토큰 거부".into()),
+            Some("토큰 거부".into()),
+            envelope.error.message.clone(),
+            format!("거부 · HTTP {status}"),
+        ));
+        return error_response(status, envelope);
+    }
 
     // ── ① 받은 요청 ─────────────────────────────────────────
     let req: ChatRequest = match serde_json::from_slice(&body) {

@@ -19,6 +19,7 @@ export const testConnection = (input: {
 }) => invoke<TestResult>('test_connection', input)
 
 export const saveConfig = (config: Config) => invoke<Snapshot>('save_config', { config })
+export const issueToken = () => invoke<string>('issue_token')
 
 export const startProxy = () => invoke<Snapshot>('start_proxy')
 export const stopProxy = () => invoke<Snapshot>('stop_proxy')
