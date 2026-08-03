@@ -277,11 +277,37 @@ pub struct FabrixChunk {
     pub event_data: Option<String>,
     #[serde(default, alias = "reasoningContent")]
     pub reasoning_content: Option<String>,
+    /// 플러그인/RAG 가 답한 경우 답변이 여기에 담깁니다(비스트림 응답).
+    #[serde(default, alias = "contentReferences")]
+    pub content_references: Vec<ContentReference>,
+    /// 필터에 걸린 경우 차단 사유가 담깁니다.
+    #[serde(default, alias = "filterBlockReason")]
+    pub filter_block_reason: Option<FilterBlockReason>,
     /// 오류 응답에서 흔히 쓰이는 필드들 — 메시지 추출용.
     #[serde(default)]
     pub message: Option<String>,
     #[serde(default, alias = "errorMessage")]
     pub error_message: Option<String>,
+}
+
+/// 플러그인/RAG 답변 한 건. 답변 텍스트만 쓰고 나머지(references 등)는 무시합니다.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ContentReference {
+    #[serde(default)]
+    pub answer: Option<String>,
+}
+
+/// 필터 차단 사유. 사용자에게 노출할 메시지 추출용.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct FilterBlockReason {
+    #[serde(default)]
+    pub ko: Option<String>,
+    #[serde(default)]
+    pub en: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default, alias = "resultCode")]
+    pub result_code: Option<String>,
 }
 
 impl FabrixChunk {
@@ -302,6 +328,41 @@ impl FabrixChunk {
             .or_else(|| self.event_data.clone())
             .or_else(|| self.content.clone())
             .unwrap_or_else(|| "사내 서버가 오류를 반환했습니다".into())
+    }
+
+    /// 비스트리밍 답변 텍스트를 폴백 순서로 추출합니다.
+    /// content → contentReferences[].answer(결합) → eventData.
+    /// 순수 LLM 답변은 content 에, 플러그인/RAG 답변은 contentReferences 에 오기 때문입니다.
+    pub fn answer_text(&self) -> Option<String> {
+        if let Some(text) = self.content.as_deref().filter(|s| !s.is_empty()) {
+            return Some(text.to_string());
+        }
+        let joined = self
+            .content_references
+            .iter()
+            .filter_map(|r| r.answer.as_deref())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !joined.is_empty() {
+            return Some(joined);
+        }
+        self.event_data
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+
+    /// 필터 차단 사유 메시지를 추출합니다(모두 비어 있으면 None).
+    pub fn filter_message(&self) -> Option<String> {
+        let reason = self.filter_block_reason.as_ref()?;
+        reason
+            .message
+            .as_deref()
+            .or(reason.ko.as_deref())
+            .or(reason.en.as_deref())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
     }
 }
 
@@ -801,6 +862,102 @@ mod tests {
         let mut d = StreamDecoder::new();
         let out = events(&mut d, "data: {\"status\":\"ERROR\",\"eventData\":\"쿼터 초과\"}\n");
         assert_eq!(out, vec![StreamEvent::Error("쿼터 초과".into())]);
+    }
+
+    /// 비스트림 응답 본문(raw JSON)을 실제 파싱 경로대로 FabrixChunk 로 만듭니다.
+    fn parse_nostream(raw: &str) -> FabrixChunk {
+        let value: Value = serde_json::from_str(raw).unwrap();
+        serde_json::from_value::<FabrixChunk>(extract_object(&value)).unwrap()
+    }
+
+    #[test]
+    fn nostream_pure_llm_reads_content() {
+        // 순수 LLM 답변: content 에 답변, contentReferences.answer 는 빈 문자열.
+        let raw = r#"{
+            "modelType": "FabriX",
+            "content": "소프트웨어의 역사는\n\n컴퓨터의 발전과 함께 시작되었습니다.",
+            "reasoningContent": null,
+            "contentReferences": [{ "plugin": "RAG", "answer": "", "references": [] }],
+            "finishReason": null,
+            "filterBlockReason": { "ko": null, "en": null, "message": null, "result_code": "FR-200" },
+            "status": "SUCCESS",
+            "responseCode": "R20000",
+            "plugins": ["LLM"],
+            "eventStatus": "CHUNK",
+            "eventData": ""
+        }"#;
+        let chunk = parse_nostream(raw);
+        assert!(!chunk.looks_like_error());
+        assert_eq!(chunk.answer_text().as_deref(), Some("소프트웨어의 역사는\n\n컴퓨터의 발전과 함께 시작되었습니다."));
+        assert_eq!(chunk.filter_message(), None);
+    }
+
+    #[test]
+    fn nostream_plugin_answer_falls_back_to_content_references() {
+        // 플러그인/RAG 답변: content 는 null, 답변이 contentReferences[].answer 에 온다.
+        let raw = r#"{
+            "modelType": "FabriX",
+            "content": null,
+            "reasoningContent": null,
+            "contentReferences": [
+                { "plugin": "RAG", "answer": "첫 번째 근거 답변", "references": [] },
+                { "plugin": "RAG", "answer": "두 번째 근거 답변", "references": [] }
+            ],
+            "finishReason": null,
+            "status": "SUCCESS",
+            "responseCode": "R20000",
+            "eventStatus": "CHUNK",
+            "eventData": ""
+        }"#;
+        let chunk = parse_nostream(raw);
+        assert_eq!(chunk.content, None);
+        assert_eq!(chunk.answer_text().as_deref(), Some("첫 번째 근거 답변\n두 번째 근거 답변"));
+        assert_eq!(chunk.filter_message(), None);
+    }
+
+    #[test]
+    fn nostream_falls_back_to_event_data() {
+        // content 도 contentReferences 도 없고 eventData 에만 답이 있는 경우.
+        let raw = r#"{
+            "content": null,
+            "contentReferences": [],
+            "eventData": "이벤트 데이터 답변",
+            "status": "SUCCESS"
+        }"#;
+        let chunk = parse_nostream(raw);
+        assert_eq!(chunk.answer_text().as_deref(), Some("이벤트 데이터 답변"));
+    }
+
+    #[test]
+    fn nostream_filter_block_surfaces_reason() {
+        // 필터 차단: 답변은 비고 filterBlockReason 에 사유가 담긴다.
+        let raw = r#"{
+            "content": null,
+            "reasoningContent": null,
+            "contentReferences": [],
+            "finishReason": null,
+            "filterBlockReason": {
+                "ko": "부적절한 표현이 감지되었습니다.",
+                "en": null,
+                "message": null,
+                "result_code": "FR-403"
+            },
+            "status": "SUCCESS",
+            "responseCode": "R20000",
+            "eventStatus": "CHUNK",
+            "eventData": ""
+        }"#;
+        let chunk = parse_nostream(raw);
+        assert_eq!(chunk.answer_text(), None);
+        assert_eq!(chunk.filter_message().as_deref(), Some("부적절한 표현이 감지되었습니다."));
+    }
+
+    #[test]
+    fn nostream_extra_fields_do_not_break_streaming_frame_parsing() {
+        // 새로 추가한 필드들이 스트리밍 프레임(추가 필드 없음) 파싱을 깨지 않는지 확인.
+        let mut d = StreamDecoder::new();
+        let out = events(&mut d, "data: {\"content\":\"조각\",\"model_type\":\"llama\"}\n");
+        assert_eq!(out, vec![StreamEvent::Delta("조각".into())]);
     }
 
     #[test]

@@ -433,9 +433,23 @@ async fn collect_response(
                     ErrorEnvelope::new(err.message(), err.kind(), None),
                 );
             }
+            // content 가 비어도 플러그인/RAG 답변이 contentReferences 등에 올 수 있어 폴백합니다.
+            let content = chunk.answer_text().unwrap_or_default();
+            let reasoning = chunk.reasoning_content.clone().filter(|s| !s.is_empty());
+            // 답변이 하나도 없고 필터 차단 사유가 있으면 일반 파싱오류 대신 사유를 노출합니다.
+            if content.is_empty() && reasoning.is_none() {
+                if let Some(reason) = chunk.filter_message() {
+                    let err = FabrixError::Upstream { status: 502, message: reason };
+                    state.record(ctx.fail(&err));
+                    return error_response(
+                        err.status(),
+                        ErrorEnvelope::new(err.message(), err.kind(), None),
+                    );
+                }
+            }
             Parsed {
-                content: chunk.content.unwrap_or_default(),
-                reasoning: chunk.reasoning_content.filter(|s| !s.is_empty()),
+                content,
+                reasoning,
                 finish: chunk.finish_reason,
                 via_stream_decoder: false,
             }
