@@ -48,6 +48,10 @@ pub fn run() {
             let shared = AppState::new(handle.clone(), cfg, first_run);
             app.manage(shared.clone());
 
+            // 창은 상태를 등록한 뒤에 만듭니다 — config 에 두면 webview 가
+            // `.manage()` 전에 `get_snapshot` 을 불러 "state not managed" 가 납니다.
+            windows::create_all(&handle)?;
+
             tray::build(&handle)?;
             tray::refresh(&handle);
 
