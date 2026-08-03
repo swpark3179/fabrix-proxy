@@ -15,52 +15,7 @@
       "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data: asset: http://asset.localhost; connect-src 'self' ipc: http://ipc.localhost",
       "devCsp": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data: asset: http://asset.localhost; connect-src 'self' ipc: http://ipc.localhost ws://localhost:1420"
     },
-    "windows": [
-      {
-        "label": "main",
-        "url": "index.html",
-        "title": "AI 프록시",
-        "width": 720,
-        "height": 560,
-        "resizable": false,
-        "maximizable": false,
-        "decorations": false,
-        "visible": false,
-        "center": true,
-        "skipTaskbar": false,
-        "shadow": true
-      },
-      {
-        "label": "log",
-        "url": "log.html",
-        "title": "호출 로그",
-        "width": 900,
-        "height": 620,
-        "minWidth": 760,
-        "minHeight": 480,
-        "resizable": true,
-        "decorations": false,
-        "visible": false,
-        "center": true,
-        "skipTaskbar": false,
-        "shadow": true
-      },
-      {
-        "label": "toast",
-        "url": "toast.html",
-        "title": "알림",
-        "width": 300,
-        "height": 132,
-        "resizable": false,
-        "decorations": false,
-        "transparent": true,
-        "alwaysOnTop": true,
-        "skipTaskbar": true,
-        "visible": false,
-        "focus": false,
-        "shadow": false
-      }
-    ]
+    "windows": []
   },
   "bundle": {
     "active": true,
