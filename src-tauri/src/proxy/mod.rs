@@ -1,10 +1,14 @@
 //! 로컬 OpenAI 호환 엔드포인트. 노출 경로는 딱 둘 —
 //! `POST /v1/chat/completions` 와 `GET /v1/models`.
 
+pub mod b64;
 pub mod chat;
 pub mod fabrix;
+pub mod image_backend;
+pub mod images;
 pub mod models;
 
+use axum::extract::DefaultBodyLimit;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -53,13 +57,33 @@ pub fn stop(state: &Shared) {
     }
 }
 
+/// 이미지 요청 본문 상한. i2i 의 base64 data URL 은 axum 기본값(2MiB)을 쉽게 넘기므로
+/// 이미지 라우트에만 올려 줍니다 (chat 은 기본값 유지).
+const IMAGE_BODY_LIMIT: usize = 25 * 1024 * 1024;
+
 fn router(state: Shared) -> Router {
     Router::new()
         .route("/v1/models", get(models::handle))
         .route("/v1/chat/completions", post(chat::handle))
+        .route(
+            "/v1/images/generations",
+            post(images::generations).layer(DefaultBodyLimit::max(IMAGE_BODY_LIMIT)),
+        )
+        .route(
+            "/v1/images/edits",
+            post(images::edits).layer(DefaultBodyLimit::max(IMAGE_BODY_LIMIT)),
+        )
         // Base URL 에 `/v1` 을 빼먹고 넣는 클라이언트도 받아 줍니다.
         .route("/models", get(models::handle))
         .route("/chat/completions", post(chat::handle))
+        .route(
+            "/images/generations",
+            post(images::generations).layer(DefaultBodyLimit::max(IMAGE_BODY_LIMIT)),
+        )
+        .route(
+            "/images/edits",
+            post(images::edits).layer(DefaultBodyLimit::max(IMAGE_BODY_LIMIT)),
+        )
         .route("/health", get(health))
         .fallback(not_found)
         .layer(CorsLayer::permissive())
@@ -74,7 +98,7 @@ async fn not_found() -> Response {
     error_response(
         404,
         ErrorEnvelope::new(
-            "이 프록시는 /v1/chat/completions 와 /v1/models 만 제공합니다.",
+            "이 프록시는 /v1/chat/completions · /v1/models · /v1/images/generations · /v1/images/edits 를 제공합니다.",
             "invalid_request_error",
             Some("unknown_endpoint".into()),
         ),

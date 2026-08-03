@@ -34,6 +34,8 @@ bytes = "1"
 chrono = "0.4"
 dirs = "6"
 uuid = { version = "1", features = ["v4"] }
+# 이미지 data URL 디코드 / b64_json 인코드. 이진 이미지 왕복은 정확성이 중요해 표준 크레이트를 씁니다.
+base64 = "0.22"
 
 [profile.release]
 codegen-units = 1

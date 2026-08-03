@@ -9,12 +9,19 @@ Cursor 같은 표준 클라이언트를 그대로 붙일 수 없습니다. 이 �
 쓰는 앱의 **Base URL** 칸에 `http://127.0.0.1:8787/v1` 을 넣으면 끝입니다.
 **API 키 칸에는 아무 값이나** 넣어도 됩니다 — 사내 키는 프록시가 대신 붙입니다.
 
-노출 엔드포인트는 둘뿐입니다.
+노출 엔드포인트는 다음과 같습니다.
 
 | | |
 |---|---|
 | `POST /v1/chat/completions` | 채팅 · 스트리밍 지원 |
 | `GET /v1/models` | 사내 모델 목록 (60초 캐시) |
+| `POST /v1/images/generations` | 이미지 생성(FLUX) · OpenAI Images 호환 |
+| `POST /v1/images/edits` | 이미지 편집(gemma 인식 → FLUX 재생성) · JSON data-URL |
+
+> ⚠️ 이미지 두 엔드포인트는 현재 **인터페이스/스켈레톤**입니다. 실제 사내 FLUX/gemma 호출은
+> 파이썬 샘플 반영 전까지 스텁이라 **501**(`not_implemented`)로 응답합니다. 배선만 확인하려면
+> 설정에서 `이미지 스텁 모드`(`imageStubMode`)를 켜면 1×1 자리표시자 PNG 를 돌려줍니다
+> (응답 헤더 `x-fabrix-image-stub: 1`, 로그에 `[stub]` 표기).
 
 ---
 
@@ -94,7 +101,10 @@ mock-fabrix/server.mjs 개발용 FabriX 스텁 (의존성 0)
   "defaultModelAlias": "fabrix-chat-4",
   "insecureSkipVerify": false,
   "tokenMode": false,          // 로컬 토큰 검증 모드
-  "issuedToken": ""            // tokenMode=true 일 때 발행되는 sk-… 토큰
+  "issuedToken": "",           // tokenMode=true 일 때 발행되는 sk-… 토큰
+  "imageModel": "",            // 이미지 생성(FLUX) 고정 모델 — 설정 화면에서 선택
+  "visionModel": "",           // 이미지 인식(gemma) 고정 모델 — 설정 화면에서 선택
+  "imageStubMode": false       // 이미지 백엔드 미연결 시 1×1 자리표시자 PNG 반환
 }
 ```
 

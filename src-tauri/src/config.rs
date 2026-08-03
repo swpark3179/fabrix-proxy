@@ -35,6 +35,12 @@ pub struct Config {
     pub token_mode: bool,
     /// 토큰 사용 모드에서 발행한 OpenAI 양식 토큰(`sk-…`). 인바운드 Bearer 와 대조합니다.
     pub issued_token: String,
+    /// 이미지 생성(FLUX) 대상 모델 — 설정 화면에서 고르는 고정값. 비면 이미지 생성이 미설정 오류.
+    pub image_model: String,
+    /// 이미지 인식(gemma) 대상 모델 — 설정 화면에서 고르는 고정값.
+    pub vision_model: String,
+    /// 이미지 백엔드 미연결 상태에서 로컬/E2E 검증용 자리표시자(1×1 PNG) 모드. 기본 false.
+    pub image_stub_mode: bool,
 }
 
 impl Default for Config {
@@ -49,6 +55,9 @@ impl Default for Config {
             insecure_skip_verify: false,
             token_mode: false,
             issued_token: String::new(),
+            image_model: String::new(),
+            vision_model: String::new(),
+            image_stub_mode: false,
         }
     }
 }
@@ -135,6 +144,7 @@ pub struct Stats {
     pub total: u64,
     pub chat: u64,
     pub models: u64,
+    pub images: u64,
     /// `HH:MM` — 꺼짐 화면의 "마지막 호출 14:31" 표시용.
     pub last_call_at: Option<String>,
 }
@@ -146,6 +156,7 @@ impl Stats {
             self.total = 0;
             self.chat = 0;
             self.models = 0;
+            self.images = 0;
             self.last_call_at = None;
         }
     }
