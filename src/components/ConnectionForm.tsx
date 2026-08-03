@@ -4,6 +4,15 @@ import { useEffect, useState } from 'react'
 import { errText, getConfigPath, issueToken, testConnection } from '../lib/ipc'
 import type { Config } from '../types'
 
+// 사내 이미지/비전 모델 후보. 실제 목록은 파이썬 샘플(이미지 분석/생성) 확정 시 갱신합니다.
+const IMAGE_MODELS = ['flux-2.0', 'flux-1.1-pro', 'flux-dev']
+const VISION_MODELS = ['gemma-4', 'gemma-3']
+
+/** 현재 저장된 값이 후보 목록에 없더라도 드롭다운에서 사라지지 않게 앞에 끼워 줍니다. */
+function withCurrent(list: string[], current: string): string[] {
+  return current && !list.includes(current) ? [current, ...list] : list
+}
+
 interface Props {
   initial: Config
   /** 온보딩은 필수 3개만, 설정은 고급 항목까지 보여줍니다. */
@@ -189,6 +198,49 @@ export function ConnectionForm({ initial, variant, busy, onSave, onCancel }: Pro
               />
             </div>
           </div>
+
+          <span className="setup__section-label">이미지 (OpenAI 호환 /v1/images)</span>
+          <div className="setup__row">
+            <div className="field">
+              <span className="field__label">이미지 생성 모델 · FLUX</span>
+              <select
+                className="text-input"
+                value={draft.imageModel}
+                onChange={(e) => set('imageModel', e.target.value)}
+              >
+                <option value="">— 선택 —</option>
+                {withCurrent(IMAGE_MODELS, draft.imageModel).map((m) => (
+                  <option key={m} value={m}>
+                    {m}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="field">
+              <span className="field__label">이미지 인식 모델 · gemma</span>
+              <select
+                className="text-input"
+                value={draft.visionModel}
+                onChange={(e) => set('visionModel', e.target.value)}
+              >
+                <option value="">— 선택 —</option>
+                {withCurrent(VISION_MODELS, draft.visionModel).map((m) => (
+                  <option key={m} value={m}>
+                    {m}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          <label className="check">
+            <input
+              type="checkbox"
+              checked={draft.imageStubMode}
+              onChange={(e) => set('imageStubMode', e.target.checked)}
+            />
+            이미지 스텁 모드 — 백엔드 미연결 상태에서 1×1 자리표시자 PNG 반환 (개발·배선 검증용)
+          </label>
 
           <label className="check">
             <input

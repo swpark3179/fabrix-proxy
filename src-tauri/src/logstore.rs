@@ -14,6 +14,7 @@ pub const CAPACITY: usize = 50;
 pub enum Kind {
     Chat,
     Models,
+    Images,
 }
 
 impl Kind {
@@ -21,13 +22,17 @@ impl Kind {
         match self {
             Kind::Chat => "POST",
             Kind::Models => "GET",
+            Kind::Images => "POST",
         }
     }
 
+    /// 대표 경로. 이미지는 두 엔드포인트(`/generations`·`/edits`)를 한 종류로 묶으므로
+    /// 실제 경로는 핸들러가 `LogEntry.path` 리터럴로 직접 설정합니다.
     pub fn path(self) -> &'static str {
         match self {
             Kind::Chat => "/v1/chat/completions",
             Kind::Models => "/v1/models",
+            Kind::Images => "/v1/images/generations",
         }
     }
 }

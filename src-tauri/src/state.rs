@@ -129,6 +129,21 @@ impl AppState {
         })
     }
 
+    /// 이미지 백엔드 클라이언트. FabriX 연결(base URL · 헤더)을 그대로 재사용합니다
+    /// — `fabrix_client()` 와 같은 게이트를 쓰되, 이미지 전용 메서드를 갖는 클라이언트를 돌려줍니다.
+    pub fn image_client(&self) -> Option<crate::proxy::image_backend::ImageClient> {
+        let cfg = self.config();
+        if !cfg.is_configured() {
+            return None;
+        }
+        Some(crate::proxy::image_backend::ImageClient {
+            http: self.http.lock().unwrap().clone(),
+            base: cfg.normalized_base_url(),
+            client_key: cfg.fabrix_client.clone(),
+            token: cfg.openapi_token.clone(),
+        })
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         let cfg = self.config();
         let running = self.running_port();
@@ -176,6 +191,7 @@ impl AppState {
             match entry.kind {
                 crate::logstore::Kind::Chat => stats.chat += 1,
                 crate::logstore::Kind::Models => stats.models += 1,
+                crate::logstore::Kind::Images => stats.images += 1,
             }
             stats.last_call_at = Some(entry.ts.clone());
         }
