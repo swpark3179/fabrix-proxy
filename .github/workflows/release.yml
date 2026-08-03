@@ -26,32 +26,69 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
+          fetch-tags: true
 
       - name: Compute next version
         id: version
         shell: pwsh
+        env:
+          BUMP: ${{ inputs.bump }}
         run: |
+          # The next version is frozen HERE — at the moment the run starts —
+          # and every downstream step (build, release, config commit) reuses
+          # these outputs, so the chosen bump is applied consistently.
+          #
+          # The base version is the HIGHEST of every existing release tag and
+          # the version currently in the config. Deriving it from the tags
+          # (not just the config file) keeps the bump collision-free even if a
+          # previous run failed to commit its bump back to the config files —
+          # which is exactly what caused the "tag already exists" failure.
+
+          # --- Versions from existing release tags (vX.Y.Z) on origin ---
+          $tagVersions = @(
+            git ls-remote --tags origin 2>$null | ForEach-Object {
+              if ($_ -match 'refs/tags/v(\d+)\.(\d+)\.(\d+)(\^\{\})?$') {
+                [Version]::new([int]$Matches[1], [int]$Matches[2], [int]$Matches[3])
+              }
+            }
+          )
+
+          # --- Version currently declared in the config ---
           $conf = Get-Content -Raw -Path "src-tauri/tauri.conf.json" | ConvertFrom-Json
           $current = $conf.version
           if ($current -notmatch '^\d+\.\d+\.\d+$') {
             Write-Error "Unexpected version format in tauri.conf.json: '$current'"
             exit 1
           }
-          $parts = $current.Split('.')
-          $major = [int]$parts[0]
-          $minor = [int]$parts[1]
-          $patch = [int]$parts[2]
-          switch ("${{ inputs.bump }}") {
+          $cp = $current.Split('.')
+          $configVersion = [Version]::new([int]$cp[0], [int]$cp[1], [int]$cp[2])
+
+          $base = (@($tagVersions) + @($configVersion) | Sort-Object -Descending | Select-Object -First 1)
+          Write-Host "Base version (highest of release tags + config): $base"
+
+          $major = $base.Major
+          $minor = $base.Minor
+          $patch = $base.Build
+          switch ($env:BUMP) {
             "major" { $major++; $minor = 0; $patch = 0 }
             "minor" { $minor++; $patch = 0 }
             "patch" { $patch++ }
-            default { Write-Error "Unknown bump: ${{ inputs.bump }}"; exit 1 }
+            default { Write-Error "Unknown bump: $($env:BUMP)"; exit 1 }
           }
           $new = "$major.$minor.$patch"
-          Write-Host "Bumping $current -> $new ($env:GITHUB_ACTOR chose '${{ inputs.bump }}')"
+          $tag = "v$new"
+
+          # --- Guard: never reuse a tag that already exists ---
+          $target = [Version]::new($major, $minor, $patch)
+          if ($tagVersions | Where-Object { $_ -eq $target }) {
+            Write-Error "Refusing to release: tag $tag already exists. Choose a different bump."
+            exit 1
+          }
+
+          Write-Host "Releasing $tag (bump '$($env:BUMP)' from base $base) — frozen for this run."
           "current_version=$current" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "new_version=$new"         | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "tag=v$new"                | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "tag=$tag"                 | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Apply new version to config files
         shell: pwsh
@@ -137,23 +174,34 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add src-tauri/tauri.conf.json package.json src-tauri/Cargo.toml src-tauri/Cargo.lock
-          if (git diff --cached --quiet) {
+
+          # --quiet exits 1 when there are staged changes; check the exit code
+          # (not stdout, which is always empty under --quiet).
+          git diff --cached --quiet
+          if ($LASTEXITCODE -eq 0) {
             Write-Host "No version changes to commit."
             exit 0
           }
           git commit -m "chore(release): v$env:NEW_VERSION"
 
+          # Sync with origin/main before each attempt so a concurrent push to
+          # main results in a rebase-and-retry rather than a hard failure.
           $delays = @(0, 2, 4, 8, 16)
-          for ($i = 0; $i -lt $delays.Length; $i++) {
-            if ($delays[$i] -gt 0) { Start-Sleep -Seconds $delays[$i] }
-            git push origin HEAD:main
-            if ($LASTEXITCODE -eq 0) {
-              Write-Host "Pushed version bump to main."
-              exit 0
-            }
-            Write-Host "Push attempt $($i + 1) failed; retrying..."
+          foreach ($delay in $delays) {
+            if ($delay -gt 0) { Start-Sleep -Seconds $delay }
             git fetch origin main
             git rebase origin/main
+            if ($LASTEXITCODE -ne 0) {
+              git rebase --abort 2>$null
+              Write-Host "Rebase onto origin/main failed; retrying..."
+              continue
+            }
+            git push origin HEAD:main
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "Pushed version bump ($env:NEW_VERSION) to main."
+              exit 0
+            }
+            Write-Host "Push failed; retrying..."
           }
-          Write-Error "Failed to push version bump to main after retries."
+          Write-Error "Failed to push version bump to main after retries. If 'main' is a protected branch, allow the release workflow (github-actions[bot]) to push to it, or commit the bump manually."
           exit 1
