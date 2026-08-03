@@ -11,9 +11,14 @@
 //   MOCK_RAW=1              `data: ` 접두 없이 개행 구분 JSON 으로 흘림
 //   MOCK_FAIL=429|500|timeout|midstream   실패 경로 재현
 //   MOCK_DELAY=40           프레임 간 지연(ms)
+//   MOCK_NOSTREAM=llm|rag|filter   비스트림 응답 형태 (기본 llm)
+//                            llm    = content 에 답변
+//                            rag    = content 는 null, 답변을 contentReferences[].answer 에
+//                            filter = content 는 null, filterBlockReason 에 차단 사유
 //
 // 조합 예시:
 //   MOCK_CASE=camel MOCK_STREAM=cumulative npm run mock
+//   MOCK_NOSTREAM=rag npm run mock
 
 import { createServer } from 'node:http'
 
@@ -23,6 +28,9 @@ const MODE = process.env.MOCK_STREAM === 'cumulative' ? 'cumulative' : 'delta'
 const RAW = process.env.MOCK_RAW === '1'
 const FAIL = process.env.MOCK_FAIL ?? ''
 const DELAY = Number(process.env.MOCK_DELAY ?? 40)
+const NOSTREAM = ['rag', 'filter'].includes(process.env.MOCK_NOSTREAM)
+  ? process.env.MOCK_NOSTREAM
+  : 'llm'
 
 const CLIENT_HEADER = 'x-fabrix-client'
 const TOKEN_HEADER = 'x-openapi-token'
@@ -134,13 +142,39 @@ async function handleMessages(req, res) {
   const modelType = MODELS.find((m) => m.id === body.modelIds?.[0])?.en ?? 'unknown'
 
   if (!body.isStream) {
+    // 실제 FabriX 비스트림 응답 스키마를 재현합니다(mock 이 그동안 흉내 내지 않던 필드 포함).
+    // 순수 LLM 답변은 content 에, 플러그인/RAG 답변은 contentReferences[].answer 에 옵니다.
+    const isRag = NOSTREAM === 'rag'
+    const isFilter = NOSTREAM === 'filter'
+    const filterBlockReason = isFilter
+      ? {
+          ko: '입력에 부적절한 표현이 포함되어 응답이 차단되었습니다(모의).',
+          en: null,
+          policy_id: 'MOCK-POLICY',
+          message: null,
+          result_code: 'FR-403',
+          filter_log_id: null,
+        }
+      : { ko: null, en: null, policy_id: null, message: null, result_code: 'FR-200', filter_log_id: null }
     return json(res, 200, {
+      userId: '00000000-0000-0000-0000-000000000000',
       modelType,
-      content: ANSWER,
+      content: isRag || isFilter ? null : ANSWER,
+      reasoningContent: null,
+      processingContent: [],
+      contentReferences: isRag
+        ? [{ plugin: 'RAG', answer: ANSWER, references: [], argumented_standalone_queries: '' }]
+        : [],
       truncated: false,
-      finishReason: 'stop',
+      finishReason: null,
+      filterBlockReason,
       status: 'SUCCESS',
-      responseCode: '200',
+      responseCode: 'R20000',
+      plugins: [isRag ? 'RAG' : 'LLM'],
+      orchestratorType: null,
+      actions: [],
+      eventStatus: 'CHUNK',
+      eventData: '',
     })
   }
 
