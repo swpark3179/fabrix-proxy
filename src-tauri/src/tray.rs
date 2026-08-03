@@ -52,7 +52,9 @@ pub struct TrayItems {
 }
 
 pub fn build(app: &AppHandle) -> tauri::Result<()> {
-    let status = MenuItem::with_id(app, "status", "○ 프록시 꺼짐", false, None::<&str>)?;
+    // 상태 줄은 클릭 가능(활성)하게 둡니다. 비활성이면 회색으로 흐려져
+    // 실행 중에도 "꺼진 것처럼" 보이기 때문입니다. 클릭하면 창을 엽니다.
+    let status = MenuItem::with_id(app, "status", "○ 프록시 꺼짐", true, None::<&str>)?;
     let url = MenuItem::with_id(app, "url", "포트 8787", false, None::<&str>)?;
     let toggle = MenuItem::with_id(app, "toggle", "프록시 켜기", true, None::<&str>)?;
     let copy = MenuItem::with_id(app, "copy", "엔드포인트 주소 복사", false, None::<&str>)?;
@@ -106,7 +108,7 @@ pub fn refresh(app: &AppHandle) {
     let running = snapshot.running;
 
     let _ = items.status.set_text(if running {
-        format!("● 프록시 실행 중 · 오늘 {}건", snapshot.stats.total)
+        "● 프록시 실행 중".to_string()
     } else {
         "○ 프록시 꺼짐".to_string()
     });
@@ -152,7 +154,8 @@ fn on_menu(app: &AppHandle, event: MenuEvent) {
         "copy" => {
             let _ = crate::commands::copy_endpoint_inner(app);
         }
-        "open" => windows::show_main(app),
+        // 상태 줄을 눌러도 창을 엽니다 (활성 항목이라 클릭이 들어옵니다).
+        "status" | "open" => windows::show_main(app),
         "logs" => windows::show_log(app),
         "settings" => windows::show_settings(app),
         "quit" => crate::commands::shutdown(app),

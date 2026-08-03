@@ -1,4 +1,4 @@
-//! 최근 호출 링버퍼. 목업: "최근 200건 · 본문은 메모리에만 보관".
+//! 최근 호출 링버퍼. "최근 50건 · 본문은 메모리에만 보관".
 //!
 //! 여기 담기는 본문(`req_openai` / `req_fabrix` / `resp_preview`)은 디스크로
 //! 나가지 않습니다. 앱을 끄면 사라지는 것이 의도된 동작입니다.
@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 
 use serde::Serialize;
 
-pub const CAPACITY: usize = 200;
+pub const CAPACITY: usize = 50;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]

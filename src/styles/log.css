@@ -385,6 +385,90 @@
   color: var(--ink-3);
 }
 
+/* ── 접기 / 전체보기 ─────────────────────────────────────────── */
+
+/* 10줄을 넘겨 잘렸음을 알리는 꼬리 줄. */
+.code__ellipsis {
+  display: block;
+  margin-top: 8px;
+  font: 400 10.5px var(--font-mono);
+  color: var(--ink-5);
+}
+
+/* 답변 본문(prose)에서도 이 표시는 코드 톤으로 눈에 띄게 둡니다. */
+.code--prose .code__ellipsis {
+  font-family: var(--font-mono);
+}
+
+.code__more {
+  align-self: flex-start;
+  margin-top: 1px;
+}
+
+/* ── 전체보기 팝업 ───────────────────────────────────────────── */
+
+.modal__backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+  background: rgba(20, 18, 14, 0.34);
+}
+
+.modal__card {
+  width: min(760px, 100%);
+  max-height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  box-shadow: 0 14px 44px rgba(0, 0, 0, 0.28);
+}
+
+.modal__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 14px;
+  flex: none;
+  background: var(--surface-1);
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.modal__title {
+  font: 600 12.5px var(--font-sans);
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+.modal__close {
+  font: 400 18px/1 var(--font-sans);
+  color: var(--ink-4);
+  padding: 2px 6px;
+  flex: none;
+  background: transparent;
+}
+
+.modal__close:hover {
+  color: var(--ink);
+}
+
+/* `.code` 를 그대로 재사용하되 카드 안에서는 테두리 대신 스크롤만 둡니다. */
+.modal__body {
+  flex: 1;
+  min-height: 0;
+  margin: 0;
+  max-height: none;
+  border: none;
+  border-radius: 0;
+  overflow-y: auto;
+}
+
 .detail__placeholder {
   flex: 1;
   display: flex;

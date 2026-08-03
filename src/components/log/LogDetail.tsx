@@ -1,5 +1,9 @@
+import { useState } from 'react'
+
 import { toCurl, tone } from '../../lib/format'
 import type { LogEntry } from '../../types'
+import { CollapsibleCode } from './CollapsibleCode'
+import { FullTextModal, type FullText } from './FullTextModal'
 
 interface Props {
   entry: LogEntry
@@ -15,6 +19,12 @@ export function LogDetail({ entry, baseUrl, onCopyCurl }: Props) {
   const t = tone(entry)
   const host = hostOf(entry.fabrixUrl)
   const chat = entry.kind === 'chat'
+  const [full, setFull] = useState<FullText | null>(null)
+
+  // ③ 응답 칸의 톤 클래스 — 접힌 화면과 팝업이 같은 색을 쓰도록 한 번만 계산합니다.
+  const respTone = `${entry.isError ? 'code--error' : 'code--reply'}${
+    chat && !entry.isError ? ' code--prose' : ''
+  }`
 
   return (
     <div className="detail">
@@ -40,7 +50,12 @@ export function LogDetail({ entry, baseUrl, onCopyCurl }: Props) {
             OpenAI 형식 · {chat ? '클라이언트 → 프록시' : '본문 없음'}
           </span>
         </div>
-        <pre className="code">{entry.reqOpenai}</pre>
+        <CollapsibleCode
+          text={entry.reqOpenai}
+          className="code"
+          title="받은 요청"
+          onExpand={setFull}
+        />
       </section>
 
       {/* ② 변환해서 보낸 요청 */}
@@ -53,13 +68,19 @@ export function LogDetail({ entry, baseUrl, onCopyCurl }: Props) {
             {entry.cached && ' · 캐시로 생략'}
           </span>
         </div>
-        <pre className="code code--sent">
-          <span className="code__headers">
-            {entry.method === 'POST' ? 'POST' : 'GET'} {pathOf(entry.fabrixUrl)} ·{' '}
-            {entry.reqFabrixHeaders}
-          </span>
-          {entry.reqFabrix}
-        </pre>
+        <CollapsibleCode
+          text={entry.reqFabrix}
+          className="code code--sent"
+          title="변환해서 보낸 요청"
+          modalClassName="code--sent"
+          header={
+            <span className="code__headers">
+              {entry.method === 'POST' ? 'POST' : 'GET'} {pathOf(entry.fabrixUrl)} ·{' '}
+              {entry.reqFabrixHeaders}
+            </span>
+          }
+          onExpand={setFull}
+        />
         {/* 변환까지 간 요청에만 매핑 칩을 붙입니다 — 파싱 단계에서 실패한
             요청에 "model → modelIds" 를 보여주면 하지도 않은 일을 한 것처럼 읽힙니다. */}
         {chat && entry.modelId !== null && <MappingTags entry={entry} />}
@@ -81,14 +102,14 @@ export function LogDetail({ entry, baseUrl, onCopyCurl }: Props) {
             {!entry.isError && !chat && '를 OpenAI 목록 형식으로'}
           </span>
         </div>
-        <pre
-          className={`code ${entry.isError ? 'code--error' : 'code--reply'}${
-            chat && !entry.isError ? ' code--prose' : ''
-          }`}
-        >
-          {entry.respPreview}
-          {entry.respMeta && <span className="meta-line">{entry.respMeta}</span>}
-        </pre>
+        <CollapsibleCode
+          text={entry.respPreview}
+          className={`code ${respTone}`}
+          title="돌려준 응답"
+          modalClassName={respTone}
+          footer={entry.respMeta ? <span className="meta-line">{entry.respMeta}</span> : undefined}
+          onExpand={setFull}
+        />
       </section>
 
       {!chat && !entry.isError && (
@@ -111,6 +132,8 @@ export function LogDetail({ entry, baseUrl, onCopyCurl }: Props) {
           )}
         </div>
       )}
+
+      {full && <FullTextModal open={full} onClose={() => setFull(null)} />}
     </div>
   )
 }
