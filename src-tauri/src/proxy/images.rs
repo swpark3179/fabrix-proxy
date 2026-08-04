@@ -57,7 +57,7 @@ impl Ctx {
         is_error: bool,
         note: Option<String>,
         summary: Option<String>,
-        resp_preview: String,
+        resp_body: String,
         resp_meta: String,
     ) -> LogEntry {
         LogEntry {
@@ -83,7 +83,7 @@ impl Ctx {
             req_fabrix: self.req_fabrix.clone(),
             req_fabrix_headers: self.req_fabrix_headers.clone(),
             fabrix_url: self.fabrix_url.clone(),
-            resp_preview,
+            resp_body,
             resp_meta,
         }
     }
@@ -145,12 +145,14 @@ fn finish(state: &Shared, ctx: Ctx, images: Vec<Vec<u8>>) -> Response {
     let mime = images.first().map(|b| image_backend::sniff_mime(b)).unwrap_or("image/png");
     let tag = if ctx.stub { "[stub] " } else { "" };
     let summary = format!("{tag}이미지 {}장 · {mime}", images.len());
-    let preview = format!("{tag}이미지 {}장 · {mime} · b64 {total} bytes", images.len());
+    // 이미지 응답만은 본문 대신 한 줄 요약을 남깁니다 — 수 MB base64 를 50건
+    // 링버퍼에 들고 있지 않기 위한 것으로, 요청 쪽 redact_data_urls 와 같은 이유입니다.
+    let body = format!("{tag}이미지 {}장 · {mime} · b64 {total} bytes", images.len());
     let meta = format!("{tag}{}장 · {mime} · {total} bytes", images.len());
     let note = if ctx.stub { Some("[stub] 자리표시자 PNG".into()) } else { None };
 
     let resp = ImagesResponse { created: state::epoch_secs(), data };
-    state.record(ctx.entry(200, false, note, Some(summary), preview, meta));
+    state.record(ctx.entry(200, false, note, Some(summary), body, meta));
 
     let mut response = Json(resp).into_response();
     if ctx.stub {
