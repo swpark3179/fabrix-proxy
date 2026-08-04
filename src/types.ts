@@ -45,7 +45,8 @@ export interface LogEntry {
   reqFabrix: string
   reqFabrixHeaders: string
   fabrixUrl: string
-  respPreview: string
+  /** ③ 돌려준 응답 — 자르지 않은 전문. 화면에서 앞부분만 보이고 전체보기로 펼칩니다. */
+  respBody: string
   respMeta: string
 }
 

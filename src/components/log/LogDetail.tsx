@@ -96,14 +96,14 @@ export function LogDetail({ entry, baseUrl, onCopyCurl }: Props) {
               ? '실패'
               : chat
                 ? entry.stream
-                  ? '앞부분만 · SSE 프레임을 합친 결과'
-                  : '앞부분만'
+                  ? 'SSE 프레임을 합친 결과 전문'
+                  : '전문'
                 : (entry.summary ?? '')}
             {!entry.isError && !chat && '를 OpenAI 목록 형식으로'}
           </span>
         </div>
         <CollapsibleCode
-          text={entry.respPreview}
+          text={entry.respBody}
           className={`code ${respTone}`}
           title="돌려준 응답"
           modalClassName={respTone}

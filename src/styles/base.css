@@ -169,13 +169,24 @@ button:focus-visible {
   cursor: text;
 }
 
-/* 스크롤바 — 목업의 종이 같은 톤에 맞춥니다. */
+/* 스크롤바 — 목업의 종이 같은 톤에 맞춥니다.
+ *
+ * 손잡이는 집기 편하도록 조금 두껍게 둡니다(폭 14px 중 투명 여백 3px씩 →
+ * 실제 손잡이 8px). 커서는 스크롤바 위에서 화살표로 되돌립니다 — 본문 칸이
+ * `cursor: text` 라 그대로 두면 스크롤바 위에서도 글자 커서가 남습니다.
+ * 손잡이 위에서는 잡아끄는 곳임을 grab/grabbing 으로 알립니다. */
 ::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
+  width: 14px;
+  height: 14px;
+  cursor: default;
 }
 
 ::-webkit-scrollbar-track {
+  background: transparent;
+  cursor: default;
+}
+
+::-webkit-scrollbar-corner {
   background: transparent;
 }
 
@@ -184,9 +195,16 @@ button:focus-visible {
   border: 3px solid transparent;
   border-radius: 999px;
   background-clip: content-box;
+  cursor: grab;
 }
 
 ::-webkit-scrollbar-thumb:hover {
   background: #bfbcb4;
   background-clip: content-box;
+}
+
+::-webkit-scrollbar-thumb:active {
+  background: #a9a69e;
+  background-clip: content-box;
+  cursor: grabbing;
 }

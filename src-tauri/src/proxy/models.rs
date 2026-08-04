@@ -86,7 +86,7 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap) -> Response
             req_fabrix: "(토큰 검증 실패 — 사내 호출을 하지 않았습니다)".into(),
             req_fabrix_headers: headers_line,
             fabrix_url,
-            resp_preview: envelope.error.message.clone(),
+            resp_body: envelope.error.message.clone(),
             resp_meta: format!("거부 · HTTP {status}"),
         });
         return error_response(status, envelope);
@@ -136,7 +136,7 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap) -> Response
                 },
                 req_fabrix_headers: headers_line,
                 fabrix_url,
-                resp_preview: render_preview(&models),
+                resp_body: render_model_list(&models),
                 resp_meta: format!(
                     "모델 {}개 · {} · 캐시 60초",
                     models.len(),
@@ -172,7 +172,7 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap) -> Response
                 req_fabrix: format!("GET {fabrix_url}"),
                 req_fabrix_headers: headers_line,
                 fabrix_url,
-                resp_preview: err.message(),
+                resp_body: err.message(),
                 resp_meta: format!("실패 · HTTP {status}"),
             });
 
@@ -182,18 +182,16 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap) -> Response
 }
 
 /// 목업 L2 ③ 칸 — alias 옆에 실제 UUID 를 나란히 보여줍니다.
-fn render_preview(models: &[ResolvedModel]) -> String {
-    const SHOWN: usize = 8;
+///
+/// 모델을 몇 개만 추리지 않고 전부 적습니다. 화면이 앞부분만 보여 주고
+/// "전체보기" 팝업에서 나머지를 펼치므로, 여기서 줄이면 펼칠 것이 없어집니다.
+fn render_model_list(models: &[ResolvedModel]) -> String {
     let mut out = String::from("{ \"object\": \"list\", \"data\": [\n");
-    for m in models.iter().take(SHOWN) {
-        let short: String = m.model_id.chars().take(18).collect();
+    for m in models {
         out.push_str(&format!(
-            "  {{ \"id\": \"{}\", \"owned_by\": \"corp\" }},   ← {}… · {}\n",
-            m.alias, short, m.label
+            "  {{ \"id\": \"{}\", \"owned_by\": \"corp\" }},   ← {} · {}\n",
+            m.alias, m.model_id, m.label
         ));
-    }
-    if models.len() > SHOWN {
-        out.push_str(&format!("  … 외 {}개\n", models.len() - SHOWN));
     }
     out.push_str("] }");
     out

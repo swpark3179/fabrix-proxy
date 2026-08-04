@@ -53,7 +53,7 @@ impl Ctx {
         is_error: bool,
         note: Option<String>,
         summary: Option<String>,
-        resp_preview: String,
+        resp_body: String,
         resp_meta: String,
     ) -> LogEntry {
         LogEntry {
@@ -79,7 +79,7 @@ impl Ctx {
             req_fabrix: self.req_fabrix.clone(),
             req_fabrix_headers: self.req_fabrix_headers.clone(),
             fabrix_url: self.fabrix_url.clone(),
-            resp_preview,
+            resp_body,
             resp_meta,
         }
     }
@@ -297,12 +297,14 @@ impl Drop for StreamLog {
             (false, false) => None,
         };
 
-        let preview = match (&self.failure, text.is_empty()) {
+        // 받은 답변은 자르지 않고 통째로 담습니다 — 화면이 앞부분만 보여 주고
+        // "전체보기" 로 펼치므로, 여기서 자르면 펼칠 뒤가 남지 않습니다.
+        let body = match (&self.failure, text.is_empty()) {
             (Some(msg), true) => msg.clone(),
-            (Some(msg), false) => format!("{}\n\n[중단] {msg}", logstore::preview(&text, 600)),
+            (Some(msg), false) => format!("{text}\n\n[중단] {msg}"),
             (None, true) if aborted => "(클라이언트가 먼저 끊어 받은 내용이 없습니다)".into(),
             (None, true) => "(빈 응답)".into(),
-            (None, false) => logstore::preview(&text, 600),
+            (None, false) => text,
         };
 
         let failed = note.is_some();
@@ -313,7 +315,7 @@ impl Drop for StreamLog {
             failed,
             note.clone(),
             if failed { note } else { self.ctx.success_summary() },
-            preview,
+            body,
             meta.join(" · "),
         ));
     }
@@ -522,7 +524,8 @@ async fn collect_response(
         false,
         None,
         ctx.success_summary(),
-        logstore::preview(&parsed.content, 600),
+        // 자르지 않은 전문 — 화면에서 앞부분만 보여 주고 "전체보기" 로 펼칩니다.
+        parsed.content,
         meta.join(" · "),
     ));
 

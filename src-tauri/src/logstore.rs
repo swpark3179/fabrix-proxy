@@ -1,6 +1,6 @@
 //! 최근 호출 링버퍼. "최근 50건 · 본문은 메모리에만 보관".
 //!
-//! 여기 담기는 본문(`req_openai` / `req_fabrix` / `resp_preview`)은 디스크로
+//! 여기 담기는 본문(`req_openai` / `req_fabrix` / `resp_body`)은 디스크로
 //! 나가지 않습니다. 앱을 끄면 사라지는 것이 의도된 동작입니다.
 
 use std::collections::VecDeque;
@@ -75,8 +75,12 @@ pub struct LogEntry {
     /// ② 상단에 붙는 마스킹된 헤더 줄.
     pub req_fabrix_headers: String,
     pub fabrix_url: String,
-    /// ③ 돌려준 응답 — 앞부분만.
-    pub resp_preview: String,
+    /// ③ 돌려준 응답 — 자르지 않은 전문.
+    ///
+    /// 목록 화면에서 앞부분만 보여 주고 "전체보기" 팝업에서 전부 펼치는 것은
+    /// 화면(`CollapsibleCode`)의 몫입니다. 여기서 미리 자르면 팝업을 열어도
+    /// 잘린 뒤가 없어 되살릴 수 없으므로, 저장은 언제나 전문으로 합니다.
+    pub resp_body: String,
     /// ③ 하단 메타 라인.
     pub resp_meta: String,
 }
@@ -123,7 +127,8 @@ pub fn short_client(ua: Option<&str>) -> Option<String> {
     }
 }
 
-/// 상세 3번째 칸은 "앞부분만" 보여줍니다.
+/// 로그에 그대로 담기 곤란한 원문(해석 실패한 요청 본문, 오류 응답 머리말 등)을
+/// 앞부분만 남깁니다. 응답 본문(`resp_body`)에는 쓰지 않습니다 — 그 칸은 전문입니다.
 pub fn preview(text: &str, limit: usize) -> String {
     let trimmed = text.trim();
     if trimmed.chars().count() <= limit {
