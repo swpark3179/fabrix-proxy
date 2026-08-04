@@ -205,32 +205,81 @@ impl LlmConfig {
     }
 }
 
-fn role_label(role: &str) -> &str {
-    match role {
-        "assistant" => "Assistant",
-        "tool" | "function" => "Tool",
-        "user" => "User",
-        other => other,
-    }
-}
-
 /// OpenAI `messages` → FabriX `systemPrompt` + `contents`.
 ///
 /// FabriX 에는 롤 구조가 없어 멀티턴은 한 덩어리 트랜스크립트로 평탄화됩니다.
 /// 손실적이지만 대안이 없고, 로그 ② 칸에 변환 결과가 그대로 보이므로 사용자가
 /// 무엇이 어떻게 접혔는지 확인할 수 있습니다.
+///
+/// 도구를 쓰는 대화에서 조심할 것이 둘 있습니다.
+///
+/// 1. 도구 호출만 있는 assistant 턴은 `content` 가 `null` 이라 본문이 빕니다. 공백
+///    이라고 버리면 모델은 다음 턴에 **자기가 호출한 적 없는 결과**를 보게 되고,
+///    같은 도구를 다시 부르는 루프에 빠집니다. 그래서 공백 판정을 역할별 분기
+///    안으로 내렸습니다.
+/// 2. 라벨을 `Option` 으로 둔 이유는 도구 결과 줄이 자기 머리말을 이미 갖고 있어서
+///    입니다. 그대로 롤 라벨을 붙이면 `Tool: Tool result (id=…)` 가 됩니다.
 pub fn fold_messages(messages: &[crate::openai::Message]) -> (Option<String>, Vec<String>) {
     let mut system: Vec<String> = Vec::new();
-    let mut turns: Vec<(String, String)> = Vec::new();
+    // 라벨이 `None` 이면 본문에 이미 머리말이 들어 있다는 뜻입니다.
+    let mut turns: Vec<(Option<&'static str>, String)> = Vec::new();
+
+    // 병렬 호출을 상관시키려면 결과 줄에 함수 이름이 필요한데, `role:"tool"` 메시지는
+    // `tool_call_id` 만 갖고 이름은 그 호출을 낸 assistant 턴에 있습니다.
+    let mut call_names: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for m in messages {
+        for c in m.tool_calls() {
+            if !c.id.is_empty() {
+                call_names.insert(c.id.as_str(), c.function.name.as_str());
+            }
+        }
+    }
 
     for m in messages {
-        let text = m.text();
-        if text.trim().is_empty() {
-            continue;
-        }
         match m.role.as_str() {
-            "system" | "developer" => system.push(text),
-            role => turns.push((role.to_string(), text)),
+            "system" | "developer" => {
+                let text = m.text();
+                if !text.trim().is_empty() {
+                    system.push(text);
+                }
+            }
+            "assistant" => {
+                let mut parts: Vec<String> = Vec::new();
+                let text = m.text();
+                if !text.trim().is_empty() {
+                    parts.push(text);
+                }
+                for c in m.tool_calls() {
+                    parts.push(super::tools::render_history_call(c));
+                }
+                if !parts.is_empty() {
+                    turns.push((Some("Assistant"), parts.join("\n")));
+                }
+            }
+            "tool" | "function" => {
+                let body = m.tool_result_text();
+                let name = m.name.as_deref().or_else(|| {
+                    m.tool_call_id.as_deref().and_then(|id| call_names.get(id).copied())
+                });
+                let head = match (m.tool_call_id.as_deref(), name) {
+                    (Some(id), Some(n)) => format!("Tool result (id={id}, name={n})"),
+                    (Some(id), None) => format!("Tool result (id={id})"),
+                    (None, Some(n)) => format!("Tool result (name={n})"),
+                    (None, None) => "Tool result".to_string(),
+                };
+                // 본문이 비어도 남깁니다 — "불렀고 결과가 비었다"도 정보입니다.
+                turns.push((None, format!("{head}:\n{body}")));
+            }
+            role => {
+                let text = m.text();
+                if !text.trim().is_empty() {
+                    // 모르는 롤은 본문에 머리말을 직접 넣고 라벨은 비웁니다.
+                    match role {
+                        "user" => turns.push((Some("User"), text)),
+                        other => turns.push((None, format!("{other}: {text}"))),
+                    }
+                }
+            }
         }
     }
 
@@ -238,10 +287,13 @@ pub fn fold_messages(messages: &[crate::openai::Message]) -> (Option<String>, Ve
 
     let content = match turns.len() {
         0 => String::new(),
-        1 if turns[0].0 == "user" => turns.remove(0).1,
+        1 if turns[0].0 == Some("User") => turns.remove(0).1,
         _ => turns
             .iter()
-            .map(|(role, text)| format!("{}: {}", role_label(role), text))
+            .map(|(label, text)| match label {
+                Some(l) => format!("{l}: {text}"),
+                None => text.clone(),
+            })
             .collect::<Vec<_>>()
             .join("\n\n"),
     };
@@ -1021,5 +1073,117 @@ mod tests {
         let (system, contents) = fold_messages(&msgs);
         assert!(system.is_none());
         assert_eq!(contents, vec!["User: 안녕\n\nAssistant: 네\n\nUser: 규정은?".to_string()]);
+    }
+
+    // ── 도구 대화 평탄화 ──
+
+    fn msg(json: &str) -> crate::openai::Message {
+        serde_json::from_str(json).unwrap()
+    }
+
+    /// 회귀 방지: 예전에는 `content: null` 이라 공백 드롭에 걸려 이 턴이 통째로
+    /// 사라졌고, 모델은 자기가 부른 적 없는 결과를 보게 됐습니다.
+    #[test]
+    fn assistant_tool_call_turn_is_not_dropped() {
+        let msgs = vec![
+            msg(r#"{"role":"user","content":"페이지 만들어줘"}"#),
+            msg(
+                r#"{"role":"assistant","content":null,"tool_calls":[
+                     {"id":"call_a1","type":"function",
+                      "function":{"name":"write","arguments":"{\"filePath\":\"a.html\"}"}}]}"#,
+            ),
+            msg(r#"{"role":"tool","tool_call_id":"call_a1","content":"wrote 12 bytes"}"#),
+        ];
+        let (_, contents) = fold_messages(&msgs);
+        let t = &contents[0];
+        assert!(t.contains("<tool_call>"), "도구 호출이 사라졌습니다:\n{t}");
+        assert!(t.contains("\"name\":\"write\""), "{t}");
+        assert!(t.contains("call_a1"), "{t}");
+        assert!(t.contains("wrote 12 bytes"), "{t}");
+    }
+
+    #[test]
+    fn tool_result_is_not_double_labelled() {
+        let msgs = vec![
+            msg(r#"{"role":"user","content":"go"}"#),
+            msg(
+                r#"{"role":"assistant","content":null,"tool_calls":[
+                     {"id":"c1","function":{"name":"read","arguments":"{}"}}]}"#,
+            ),
+            msg(r#"{"role":"tool","tool_call_id":"c1","content":"body"}"#),
+        ];
+        let (_, contents) = fold_messages(&msgs);
+        assert!(!contents[0].contains("Tool: Tool result"), "이중 라벨:\n{}", contents[0]);
+        // 이름은 호출을 낸 assistant 턴에서 끌어옵니다.
+        assert!(contents[0].contains("Tool result (id=c1, name=read)"), "{}", contents[0]);
+    }
+
+    #[test]
+    fn parallel_calls_correlate_by_id() {
+        let msgs = vec![
+            msg(r#"{"role":"user","content":"go"}"#),
+            msg(
+                r#"{"role":"assistant","content":null,"tool_calls":[
+                     {"id":"c1","function":{"name":"write","arguments":"{}"}},
+                     {"id":"c2","function":{"name":"read","arguments":"{}"}}]}"#,
+            ),
+            msg(r#"{"role":"tool","tool_call_id":"c2","content":"두번째"}"#),
+            msg(r#"{"role":"tool","tool_call_id":"c1","content":"첫번째"}"#),
+        ];
+        let (_, contents) = fold_messages(&msgs);
+        let t = &contents[0];
+        // 결과가 호출 순서와 다르게 와도 id 로 짝지어져야 합니다.
+        assert!(t.contains("Tool result (id=c2, name=read)"), "{t}");
+        assert!(t.contains("Tool result (id=c1, name=write)"), "{t}");
+    }
+
+    /// 회귀 방지: AI SDK v5 는 결과를 파트 배열로 보냅니다. `text` 파트가 없어
+    /// `text()` 가 비고, 예전이라면 여기서 결과가 통째로 사라졌습니다.
+    #[test]
+    fn ai_sdk_tool_result_parts_survive_the_fold() {
+        let msgs = vec![
+            msg(r#"{"role":"user","content":"go"}"#),
+            msg(
+                r#"{"role":"tool","tool_call_id":"c1",
+                    "content":[{"type":"tool-result","output":{"ok":true}}]}"#,
+            ),
+        ];
+        let (_, contents) = fold_messages(&msgs);
+        assert!(contents[0].contains("tool-result"), "{}", contents[0]);
+        assert!(contents[0].contains("\"ok\":true"), "{}", contents[0]);
+    }
+
+    #[test]
+    fn empty_tool_result_still_records_the_call() {
+        let msgs = vec![msg(r#"{"role":"tool","tool_call_id":"c1","content":""}"#)];
+        let (_, contents) = fold_messages(&msgs);
+        // "불렀는데 결과가 비었다"도 정보라 줄은 남아야 합니다.
+        assert_eq!(contents.len(), 1);
+        assert!(contents[0].contains("Tool result (id=c1)"), "{}", contents[0]);
+    }
+
+    #[test]
+    fn legacy_function_role_uses_its_own_name() {
+        let msgs = vec![msg(r#"{"role":"function","name":"calc","content":"84"}"#)];
+        let (_, contents) = fold_messages(&msgs);
+        assert!(contents[0].contains("Tool result (name=calc)"), "{}", contents[0]);
+    }
+
+    #[test]
+    fn unknown_roles_keep_their_label() {
+        let msgs = vec![
+            msg(r#"{"role":"user","content":"안녕"}"#),
+            msg(r#"{"role":"critic","content":"별로"}"#),
+        ];
+        let (_, contents) = fold_messages(&msgs);
+        assert_eq!(contents[0], "User: 안녕\n\ncritic: 별로");
+    }
+
+    #[test]
+    fn single_user_turn_stays_bare() {
+        // 도구 분기를 넣어도 가장 흔한 단일 턴은 라벨 없이 그대로 나가야 합니다.
+        let msgs = vec![msg(r#"{"role":"user","content":"안녕"}"#)];
+        let (_, contents) = fold_messages(&msgs);
+        assert_eq!(contents, vec!["안녕".to_string()]);
     }
 }
