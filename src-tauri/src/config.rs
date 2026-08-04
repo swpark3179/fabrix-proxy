@@ -41,6 +41,10 @@ pub struct Config {
     pub vision_model: String,
     /// 이미지 백엔드 미연결 상태에서 로컬/E2E 검증용 자리표시자(1×1 PNG) 모드. 기본 false.
     pub image_stub_mode: bool,
+    /// 도구 호출(툴 콜) 에뮬레이션. FabriX 요청 스키마에는 도구 필드가 없어,
+    /// 규약을 `systemPrompt` 에 심고 답변에서 `<tool_call>` 을 걷어내는 방식으로
+    /// 흉내 냅니다. 요청에 `tools` 가 없으면 아무 영향이 없습니다.
+    pub tool_emulation: bool,
 }
 
 impl Default for Config {
@@ -58,6 +62,7 @@ impl Default for Config {
             image_model: String::new(),
             vision_model: String::new(),
             image_stub_mode: false,
+            tool_emulation: true,
         }
     }
 }

@@ -11,6 +11,13 @@
 //   MOCK_RAW=1              `data: ` 접두 없이 개행 구분 JSON 으로 흘림
 //   MOCK_FAIL=429|500|timeout|midstream   실패 경로 재현
 //   MOCK_DELAY=40           프레임 간 지연(ms)
+//   MOCK_TOOLCALL=single|parallel|prose|malformed|unknown|fenced
+//                           답변 본문에 <tool_call> 블록을 섞습니다 (기본 off).
+//                           single/parallel/prose 는 도구로 잡혀야 하고,
+//                           malformed/unknown/fenced 는 원문 텍스트로 되돌아와야 합니다.
+//   MOCK_CHUNK=7            프레임당 글자 수. 3 이나 1 로 낮추면 <tool_call> 센티널이
+//                           여러 프레임에 걸쳐 쪼개집니다 — 파서가 깨지는 지점.
+//   MOCK_SPLITBYTES=1       SSE 한 줄을 임의 바이트 지점에서 두 번에 나눠 write
 //   MOCK_NOSTREAM=llm|rag|filter   비스트림 응답 형태 (기본 llm)
 //                            llm    = content 에 답변
 //                            rag    = content 는 null, 답변을 contentReferences[].answer 에
@@ -49,6 +56,52 @@ const MODELS = [
 const ANSWER =
   '시연차는 입사 1년 차에 15일이 부여되며, 미사용분은 다음 해로 최대 5일까지 이월할 수 있습니다. ' +
   '이월분은 이월된 해의 12월 31일까지 사용해야 하고, 그 이후에는 소멸합니다.'
+
+// 도구 호출 에뮬레이션 검증용 본문들.
+//
+// 프록시는 답변에서 <tool_call> 블록을 걷어내 OpenAI tool_calls 로 조립합니다.
+// 그 파서가 깨지는 곳은 거의 언제나 **프레임 경계**라, 이 본문을 MOCK_CHUNK 로 잘게
+// 쪼개 센티널 한가운데를 가르는 것이 이 모드의 목적입니다.
+const TOOL_CALL_BODIES = {
+  off: () => ANSWER,
+  // 가장 흔한 모양 — 짧은 설명 뒤에 파일 쓰기 한 건.
+  single: () =>
+    '만들겠습니다.\n<tool_call>\n' +
+    JSON.stringify({
+      name: 'write',
+      arguments: { filePath: 'index.html', content: '<!doctype html>\n<html>…</html>' },
+    }) +
+    '\n</tool_call>',
+  // 병렬 호출 — index 0,1 로 나뉘어야 합니다.
+  parallel: () =>
+    '<tool_call>\n' +
+    JSON.stringify({ name: 'write', arguments: { filePath: 'a.html', content: 'a' } }) +
+    '\n</tool_call>\n<tool_call>\n' +
+    JSON.stringify({ name: 'read', arguments: { filePath: 'b.css' } }) +
+    '\n</tool_call>',
+  // 호출 뒤에도 말을 잇는 경우 — 뒤 텍스트가 살아 있어야 합니다.
+  prose: () =>
+    '먼저 읽어 보겠습니다.\n<tool_call>\n' +
+    JSON.stringify({ name: 'read', arguments: { filePath: 'b.css' } }) +
+    '\n</tool_call>\n' +
+    `그리고 이어서 설명합니다. ${ANSWER}`,
+  // 아래 셋은 전부 "도구가 아님" 으로 판정되어 원문 텍스트로 되돌아와야 합니다.
+  malformed: () => '<tool_call>\n{"name":"write", 여기가 깨진 JSON}\n</tool_call>',
+  unknown: () =>
+    '<tool_call>\n' +
+    JSON.stringify({ name: 'definitely_not_a_tool', arguments: {} }) +
+    '\n</tool_call>',
+  // 규약이 금지한 코드 펜스 안 호출. 프록시는 걷어내지만, 클라이언트가 이걸 도구로
+  // 읽지 않는다는 점을 눈으로 확인하려고 남겨 둡니다.
+  fenced: () =>
+    '```json\n<tool_call>\n' +
+    JSON.stringify({ name: 'read', arguments: { filePath: 'b.css' } }) +
+    '\n</tool_call>\n```',
+}
+
+const BODY = (TOOL_CALL_BODIES[process.env.MOCK_TOOLCALL] ?? TOOL_CALL_BODIES.off)()
+const CHUNK = Math.max(1, Number(process.env.MOCK_CHUNK ?? 7))
+const SPLITBYTES = process.env.MOCK_SPLITBYTES === '1'
 
 const log = (...args) => console.log('[mock-fabrix]', ...args)
 
@@ -159,11 +212,11 @@ async function handleMessages(req, res) {
     return json(res, 200, {
       userId: '00000000-0000-0000-0000-000000000000',
       modelType,
-      content: isRag || isFilter ? null : ANSWER,
+      content: isRag || isFilter ? null : BODY,
       reasoningContent: null,
       processingContent: [],
       contentReferences: isRag
-        ? [{ plugin: 'RAG', answer: ANSWER, references: [], argumented_standalone_queries: '' }]
+        ? [{ plugin: 'RAG', answer: BODY, references: [], argumented_standalone_queries: '' }]
         : [],
       truncated: false,
       finishReason: null,
@@ -178,6 +231,11 @@ async function handleMessages(req, res) {
     })
   }
 
+  if (process.env.MOCK_TOOLCALL) {
+    const injected = String(body.systemPrompt ?? '').includes('<tool_call>')
+    log(`systemPrompt 에 도구 규약 주입됨: ${injected}`)
+  }
+
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-cache',
@@ -185,12 +243,20 @@ async function handleMessages(req, res) {
   })
 
   // 의도적으로 한글 경계를 무시하고 잘라, 멀티바이트가 청크 경계에 걸리게 합니다.
+  // MOCK_CHUNK 를 낮추면 <tool_call> 센티널도 여러 프레임에 걸쳐 쪼개집니다.
   const pieces = []
-  for (let i = 0; i < ANSWER.length; i += 7) pieces.push(ANSWER.slice(i, i + 7))
+  for (let i = 0; i < BODY.length; i += CHUNK) pieces.push(BODY.slice(i, i + CHUNK))
 
   const send = (obj) => {
     const line = JSON.stringify(obj)
-    res.write(RAW ? `${line}\n` : `data: ${line}\n\n`)
+    const frame = RAW ? `${line}\n` : `data: ${line}\n\n`
+    if (!SPLITBYTES) return res.write(frame)
+    // SSE 한 줄을 임의 바이트 지점에서 두 번에 나눠 씁니다 — 디코더가 줄 단위로만
+    // 자르는지, 멀티바이트 문자가 write 경계에 걸려도 견디는지 봅니다.
+    const buf = Buffer.from(frame, 'utf8')
+    const cut = 1 + Math.floor(Math.random() * Math.max(1, buf.length - 2))
+    res.write(buf.subarray(0, cut))
+    res.write(buf.subarray(cut))
   }
 
   let sent = ''
