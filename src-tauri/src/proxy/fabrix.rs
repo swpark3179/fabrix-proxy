@@ -418,10 +418,42 @@ impl FabrixChunk {
     }
 }
 
+/// FabriX 의 종료 사유를 OpenAI `finish_reason` 으로 옮깁니다.
+///
+/// 절단이 최우선입니다. 예전에는 `truncated` 를 파싱만 하고 아무 데도 쓰지 않아,
+/// 상한에 걸려 잘린 답변이 클라이언트에는 깔끔한 `"stop"` 으로 보였습니다 —
+/// 도구 호출 인자 한가운데서 잘려도 마찬가지라, 파일이 반쪽만 써지고도 성공으로
+/// 보입니다.
+pub fn map_finish_reason(raw: Option<&str>, truncated: bool) -> Option<String> {
+    if truncated {
+        return Some("length".into());
+    }
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(
+        match raw.to_ascii_lowercase().as_str() {
+            "length" | "max_tokens" | "max_new_tokens" | "truncated" => "length",
+            "content_filter" | "filtered" | "blocked" => "content_filter",
+            "stop" | "end_turn" | "eos" | "complete" | "completed" => "stop",
+            // 모르는 값은 지어내지 않고 그대로 넘깁니다.
+            _ => return Some(raw.to_string()),
+        }
+        .to_string(),
+    )
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamEvent {
     Delta(String),
     Reasoning(String),
+    /// 누적 모드에서 상위가 답변을 **통째로 다시 쓴** 지점.
+    ///
+    /// 이때 `Delta` 로 전체 본문이 다시 흘러나오므로, 텍스트를 누적해 파싱하는
+    /// 소비자(도구 호출 스캐너)는 상태를 버려야 합니다. 그러지 않으면 이미
+    /// 내보낸 도구 호출을 두 번 냅니다.
+    Reset,
     Finish(String),
     Error(String),
     Done,
@@ -450,6 +482,11 @@ pub struct StreamDecoder {
     pub finish_reason: Option<String>,
     pub model_type: Option<String>,
     pub done: bool,
+    /// 상위가 답변을 잘랐다고 알려 왔는지. `finish_reason: "length"` 로 옮깁니다.
+    ///
+    /// 플래그로 들고 있는 이유: 여기서 `Finish` 이벤트를 내면 뒤따라 오는 진짜
+    /// 종료 프레임이 값을 덮어씁니다. 최종 판단은 소비자가 마지막에 합니다.
+    pub truncated: bool,
 }
 
 impl StreamDecoder {
@@ -536,6 +573,9 @@ impl StreamDecoder {
         if let Some(mt) = chunk.model_type.clone() {
             self.model_type.get_or_insert(mt);
         }
+        if chunk.truncated == Some(true) {
+            self.truncated = true;
+        }
         if let Some(reasoning) = chunk.reasoning_content.as_deref() {
             if !reasoning.is_empty() {
                 self.reasoning.push_str(reasoning);
@@ -543,8 +583,13 @@ impl StreamDecoder {
             }
         }
         if let Some(content) = chunk.content.as_deref() {
-            if let Some(delta) = self.absorb(content) {
-                out.push(StreamEvent::Delta(delta));
+            match self.absorb(content) {
+                Absorbed::Append(delta) => out.push(StreamEvent::Delta(delta)),
+                Absorbed::Rewrite(whole) => {
+                    out.push(StreamEvent::Reset);
+                    out.push(StreamEvent::Delta(whole));
+                }
+                Absorbed::Nothing => {}
             }
         }
         if let Some(reason) = chunk.finish_reason.as_deref().filter(|r| !r.is_empty()) {
@@ -555,50 +600,58 @@ impl StreamDecoder {
 
     /// 누적/증분 판별. 두 번째 프레임에서 모드를 확정하고 이후로는 고정합니다 —
     /// 매 프레임 접두사 검사를 하면 "안" 다음에 증분 "안녕"이 왔을 때 오판합니다.
-    fn absorb(&mut self, content: &str) -> Option<String> {
+    fn absorb(&mut self, content: &str) -> Absorbed {
         if content.is_empty() {
-            return None;
+            return Absorbed::Nothing;
         }
         if self.acc.is_empty() {
             self.acc.push_str(content);
-            return Some(content.to_string());
+            return Absorbed::Append(content.to_string());
         }
 
         match self.mode {
             DeltaMode::Unknown => {
                 if content == self.acc {
                     self.mode = DeltaMode::Cumulative;
-                    None
+                    Absorbed::Nothing
                 } else if content.len() > self.acc.len() && content.starts_with(self.acc.as_str()) {
                     self.mode = DeltaMode::Cumulative;
                     let delta = content[self.acc.len()..].to_string();
                     self.acc = content.to_string();
-                    Some(delta)
+                    Absorbed::Append(delta)
                 } else {
                     self.mode = DeltaMode::Incremental;
                     self.acc.push_str(content);
-                    Some(content.to_string())
+                    Absorbed::Append(content.to_string())
                 }
             }
             DeltaMode::Cumulative => {
                 if content == self.acc {
-                    None
+                    Absorbed::Nothing
                 } else if content.len() > self.acc.len() && content.starts_with(self.acc.as_str()) {
                     let delta = content[self.acc.len()..].to_string();
                     self.acc = content.to_string();
-                    Some(delta)
+                    Absorbed::Append(delta)
                 } else {
-                    // 서버가 답변을 다시 쓴 경우 — 통째로 교체합니다.
+                    // 서버가 답변을 다시 쓴 경우 — 통째로 교체합니다. 이건 증분이
+                    // 아니라 재작성이므로 소비자에게 그 사실을 알려야 합니다.
                     self.acc = content.to_string();
-                    Some(content.to_string())
+                    Absorbed::Rewrite(content.to_string())
                 }
             }
             DeltaMode::Incremental => {
                 self.acc.push_str(content);
-                Some(content.to_string())
+                Absorbed::Append(content.to_string())
             }
         }
     }
+}
+
+/// `absorb` 의 결과. 추가인지 재작성인지 구분해야 소비자가 상태를 언제 버릴지 압니다.
+enum Absorbed {
+    Nothing,
+    Append(String),
+    Rewrite(String),
 }
 
 // ─────────────────────────── 오류 ───────────────────────────
@@ -1177,6 +1230,70 @@ mod tests {
         ];
         let (_, contents) = fold_messages(&msgs);
         assert_eq!(contents[0], "User: 안녕\n\ncritic: 별로");
+    }
+
+    // ── 종료 사유와 절단 ──
+
+    #[test]
+    fn truncation_outranks_every_other_finish_reason() {
+        // 회귀 방지: `truncated` 를 파싱만 하고 안 쓰던 시절에는 상한에 걸려 잘린
+        // 답변이 클라이언트에 깔끔한 "stop" 으로 보였습니다.
+        assert_eq!(map_finish_reason(Some("stop"), true).as_deref(), Some("length"));
+        assert_eq!(map_finish_reason(None, true).as_deref(), Some("length"));
+    }
+
+    #[test]
+    fn finish_reason_maps_known_synonyms() {
+        assert_eq!(map_finish_reason(Some("max_tokens"), false).as_deref(), Some("length"));
+        assert_eq!(map_finish_reason(Some("MAX_NEW_TOKENS"), false).as_deref(), Some("length"));
+        assert_eq!(map_finish_reason(Some("filtered"), false).as_deref(), Some("content_filter"));
+        assert_eq!(map_finish_reason(Some("end_turn"), false).as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn finish_reason_passes_unknown_values_through() {
+        // 모르는 값을 "stop" 으로 지어내면 진짜 상태를 감추게 됩니다.
+        assert_eq!(map_finish_reason(Some("weird"), false).as_deref(), Some("weird"));
+        assert_eq!(map_finish_reason(Some("   "), false), None);
+        assert_eq!(map_finish_reason(None, false), None);
+    }
+
+    #[test]
+    fn decoder_records_the_truncated_flag() {
+        let mut d = StreamDecoder::new();
+        d.push(b"data: {\"content\":\"ab\"}\n");
+        assert!(!d.truncated);
+        d.push(b"data: {\"content\":\"cd\",\"truncated\":true}\n");
+        assert!(d.truncated);
+    }
+
+    /// 누적 모드에서 상위가 답변을 다시 쓰면 전체 본문이 델타로 재방출됩니다.
+    /// 그 사실을 알려 주지 않으면 텍스트를 누적해 파싱하는 소비자가 이미 처리한
+    /// 것을 두 번 처리합니다.
+    #[test]
+    fn cumulative_rewrite_emits_reset_before_the_replacement() {
+        let mut d = StreamDecoder::new();
+        assert_eq!(d.push("data: {\"content\":\"안녕\"}\n".as_bytes()), vec![StreamEvent::Delta("안녕".into())]);
+        // 두 번째 프레임이 접두사라 누적 모드로 확정됩니다.
+        assert_eq!(
+            d.push("data: {\"content\":\"안녕하세요\"}\n".as_bytes()),
+            vec![StreamEvent::Delta("하세요".into())]
+        );
+        // 접두사가 아닌 본문 → 재작성.
+        assert_eq!(
+            d.push("data: {\"content\":\"전혀 다른 답\"}\n".as_bytes()),
+            vec![StreamEvent::Reset, StreamEvent::Delta("전혀 다른 답".into())]
+        );
+        assert_eq!(d.text(), "전혀 다른 답");
+    }
+
+    #[test]
+    fn incremental_mode_never_emits_reset() {
+        let mut d = StreamDecoder::new();
+        d.push("data: {\"content\":\"안\"}\n".as_bytes());
+        let events = d.push("data: {\"content\":\"녕\"}\n".as_bytes());
+        assert_eq!(events, vec![StreamEvent::Delta("녕".into())]);
+        assert_eq!(d.text(), "안녕");
     }
 
     #[test]

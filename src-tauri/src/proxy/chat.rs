@@ -25,8 +25,8 @@ use crate::openai::{
 use crate::state::{self, Shared};
 
 use super::fabrix::{
-    extract_object, fold_messages, resolve_model, FabrixChunk, FabrixError, LlmConfig,
-    MessagesRequest, ResolvedModel, StreamDecoder, StreamEvent, MESSAGES_PATH,
+    extract_object, fold_messages, map_finish_reason, resolve_model, FabrixChunk, FabrixError,
+    LlmConfig, MessagesRequest, ResolvedModel, StreamDecoder, StreamEvent, MESSAGES_PATH,
 };
 use super::models::ensure_models;
 use super::tools::{self, ToolCallScanner};
@@ -496,6 +496,7 @@ fn stream_response(
                         sent_role = true;
                         yield Ok(sse_json(&ChatChunk::new(&id, created, &model, delta, None)));
                     }
+                    StreamEvent::Reset => scanner.reset(),
                     StreamEvent::Finish(reason) => log.finish = Some(reason),
                     StreamEvent::Error(msg) => {
                         log.failure = Some(msg);
@@ -527,6 +528,7 @@ fn stream_response(
                     sent_role = true;
                     yield Ok(sse_json(&ChatChunk::new(&id, created, &model, delta, None)));
                 }
+                StreamEvent::Reset => scanner.reset(),
                 StreamEvent::Finish(reason) => log.finish = Some(reason),
                 StreamEvent::Error(msg) => log.failure = Some(msg),
                 StreamEvent::Done => {}
@@ -544,11 +546,13 @@ fn stream_response(
             yield Ok(sse_json(&ErrorEnvelope::new(msg, "upstream_error", None)));
         } else {
             // 도구 호출이 하나라도 나왔으면 그 사실이 상위 사유보다 우선합니다 —
-            // 클라이언트는 이 값으로 에이전트 루프를 계속할지 정합니다.
+            // 클라이언트는 이 값으로 에이전트 루프를 계속할지 정합니다. 그다음이
+            // 절단(length), 마지막이 상위가 준 사유입니다.
             let reason = if scanner.saw_call() {
                 "tool_calls".to_string()
             } else {
-                log.finish.clone().unwrap_or_else(|| "stop".into())
+                map_finish_reason(log.finish.as_deref(), log.decoder.truncated)
+                    .unwrap_or_else(|| "stop".into())
             };
             yield Ok(sse_json(&ChatChunk::new(&id, created, &model, Delta::default(), Some(reason))));
         }
@@ -606,6 +610,7 @@ async fn collect_response(
             Parsed {
                 content,
                 reasoning,
+                truncated: chunk.truncated == Some(true),
                 finish: chunk.finish_reason,
                 via_stream_decoder: false,
             }
@@ -619,6 +624,7 @@ async fn collect_response(
                 content: decoder.text().to_string(),
                 reasoning: Some(decoder.reasoning().to_string()).filter(|s| !s.is_empty()),
                 finish: decoder.finish_reason.clone(),
+                truncated: decoder.truncated,
                 via_stream_decoder: true,
             }
         }
@@ -642,7 +648,8 @@ async fn collect_response(
     let reason = if has_calls {
         "tool_calls".to_string()
     } else {
-        parsed.finish.clone().unwrap_or_else(|| "stop".into())
+        map_finish_reason(parsed.finish.as_deref(), parsed.truncated)
+            .unwrap_or_else(|| "stop".into())
     };
     let completion = ChatCompletion {
         id: format!("chatcmpl-{}", Uuid::new_v4().simple()),
@@ -706,6 +713,7 @@ struct Parsed {
     content: String,
     reasoning: Option<String>,
     finish: Option<String>,
+    truncated: bool,
     via_stream_decoder: bool,
 }
 
