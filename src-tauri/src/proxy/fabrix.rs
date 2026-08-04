@@ -1002,8 +1002,8 @@ mod tests {
     fn system_messages_split_into_system_prompt() {
         use crate::openai::{Content, Message};
         let msgs = vec![
-            Message { role: "system".into(), content: Some(Content::Text("너는 사내 규정 도우미다.".into())) },
-            Message { role: "user".into(), content: Some(Content::Text("연차 이월 규정 알려줘".into())) },
+            Message { role: "system".into(), content: Some(Content::Text("너는 사내 규정 도우미다.".into())), ..Default::default() },
+            Message { role: "user".into(), content: Some(Content::Text("연차 이월 규정 알려줘".into())), ..Default::default() },
         ];
         let (system, contents) = fold_messages(&msgs);
         assert_eq!(system.as_deref(), Some("너는 사내 규정 도우미다."));
@@ -1014,9 +1014,9 @@ mod tests {
     fn multi_turn_flattens_into_a_labelled_transcript() {
         use crate::openai::{Content, Message};
         let msgs = vec![
-            Message { role: "user".into(), content: Some(Content::Text("안녕".into())) },
-            Message { role: "assistant".into(), content: Some(Content::Text("네".into())) },
-            Message { role: "user".into(), content: Some(Content::Text("규정은?".into())) },
+            Message { role: "user".into(), content: Some(Content::Text("안녕".into())), ..Default::default() },
+            Message { role: "assistant".into(), content: Some(Content::Text("네".into())), ..Default::default() },
+            Message { role: "user".into(), content: Some(Content::Text("규정은?".into())), ..Default::default() },
         ];
         let (system, contents) = fold_messages(&msgs);
         assert!(system.is_none());

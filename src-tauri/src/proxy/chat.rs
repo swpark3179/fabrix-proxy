@@ -364,7 +364,7 @@ fn stream_response(state: Shared, ctx: Ctx, res: reqwest::Response, model: Strin
                         let delta = Delta {
                             role: (!sent_role).then_some("assistant"),
                             content: Some(text),
-                            reasoning_content: None,
+                            ..Delta::default()
                         };
                         sent_role = true;
                         yield Ok::<Event, Infallible>(sse_json(&ChatChunk::new(&id, created, &model, delta, None)));
@@ -372,8 +372,8 @@ fn stream_response(state: Shared, ctx: Ctx, res: reqwest::Response, model: Strin
                     StreamEvent::Reasoning(text) => {
                         let delta = Delta {
                             role: (!sent_role).then_some("assistant"),
-                            content: None,
                             reasoning_content: Some(text),
+                            ..Delta::default()
                         };
                         sent_role = true;
                         yield Ok(sse_json(&ChatChunk::new(&id, created, &model, delta, None)));
@@ -397,7 +397,7 @@ fn stream_response(state: Shared, ctx: Ctx, res: reqwest::Response, model: Strin
                     let delta = Delta {
                         role: (!sent_role).then_some("assistant"),
                         content: Some(text),
-                        reasoning_content: None,
+                        ..Delta::default()
                     };
                     sent_role = true;
                     yield Ok(sse_json(&ChatChunk::new(&id, created, &model, delta, None)));
@@ -501,8 +501,9 @@ async fn collect_response(
             index: 0,
             message: AssistantMessage {
                 role: "assistant",
-                content: parsed.content.clone(),
+                content: Some(parsed.content.clone()),
                 reasoning_content: parsed.reasoning.clone(),
+                tool_calls: None,
             },
             finish_reason: Some(reason.clone()),
         }],
