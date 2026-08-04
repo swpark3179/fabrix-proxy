@@ -150,6 +150,12 @@ function MappingTags({ entry }: { entry: LogEntry }) {
   const tags: { text: string; muted?: boolean }[] = [{ text: 'model → modelIds' }]
   if ('messages' in request) tags.push({ text: 'messages → systemPrompt + contents' })
   if ('stream' in request) tags.push({ text: 'stream → isStream' })
+  // 사내 API 에 도구 필드가 없어 규약 텍스트로 접힙니다. 위 ② 칸의 systemPrompt
+  // 안에서 실제로 접힌 결과를 그대로 볼 수 있습니다.
+  if ('tools' in request || 'functions' in request) {
+    tags.push({ text: 'tools → systemPrompt 규약' })
+  }
+  if ('tool_choice' in request) tags.push({ text: 'tool_choice → 규약 강도', muted: true })
 
   const llm: [string, string][] = [
     ['temperature', 'temperature'],

@@ -245,6 +245,17 @@ export function ConnectionForm({ initial, variant, busy, onSave, onCancel }: Pro
           <label className="check">
             <input
               type="checkbox"
+              checked={draft.toolEmulation}
+              onChange={(e) => set('toolEmulation', e.target.checked)}
+            />
+            도구 호출 흉내 내기 — 사내 API 에 도구 필드가 없어, 규약을 시스템 프롬프트에 심고
+            답변에서 걷어냅니다. 끄면 클라이언트가 보낸 도구를 무시하고 글만 돌려줍니다
+            (코딩 에이전트는 파일을 만들지 못합니다)
+          </label>
+
+          <label className="check">
+            <input
+              type="checkbox"
               checked={draft.autoStart}
               onChange={(e) => set('autoStart', e.target.checked)}
             />
