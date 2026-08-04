@@ -302,11 +302,23 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Bytes
     };
 
     // ── ③ 돌려준 응답 ───────────────────────────────────────
-    let alias = model.alias.clone();
+    //
+    // OpenAI 는 요청받은 `model` 문자열을 **그대로** 되돌려줍니다. 우리는 해석된
+    // alias 를 넣고 있었는데, 그러면 폴백이 일어난 순간 값이 달라집니다. 이걸
+    // 모델 없음으로 읽고 연결 자체를 실패로 처리하는 클라이언트가 있습니다
+    // (Open Design 의 연결 테스트가 그렇습니다). 진단 정보는 로그의
+    // model_alias/model_id/model_label 에 그대로 남으므로 잃는 것이 없습니다.
+    let echo_model = req
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| model.alias.clone());
     if payload.is_stream {
-        stream_response(state, ctx, res, alias, tool_names)
+        stream_response(state, ctx, res, echo_model, tool_names)
     } else {
-        collect_response(state, ctx, res, alias, tool_names).await
+        collect_response(state, ctx, res, echo_model, tool_names).await
     }
 }
 
