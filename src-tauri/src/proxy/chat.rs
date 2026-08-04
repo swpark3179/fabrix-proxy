@@ -326,18 +326,20 @@ fn sse_json<T: serde::Serialize>(value: &T) -> Event {
     Event::default().data(serde_json::to_string(value).unwrap_or_default())
 }
 
-/// 스캐너 출력 하나를 SSE 이벤트들로 바꿉니다 — 텍스트 먼저, 그다음 도구 호출.
+/// 스캐너 출력 하나를 `chat.completion.chunk` 들로 바꿉니다 — 텍스트 먼저,
+/// 그다음 도구 호출. 클라이언트가 보는 순서가 곧 이 순서입니다.
 ///
 /// 펌프 본문과 꼬리 처리가 같은 경로를 쓰도록 함수로 뺐습니다
 /// (`async_stream::stream!` 안에서는 `yield` 를 매크로로 감쌀 수 없습니다).
-fn scan_events(
+/// SSE 직렬화는 호출부가 하므로 이 함수는 순수하고 테스트할 수 있습니다.
+fn scan_chunks(
     id: &str,
     created: i64,
     model: &str,
     out: tools::ScanOut,
     sent_role: &mut bool,
-) -> Vec<Event> {
-    let mut events = Vec::new();
+) -> Vec<ChatChunk> {
+    let mut chunks = Vec::new();
     if !out.text.is_empty() {
         let delta = Delta {
             role: (!*sent_role).then_some("assistant"),
@@ -345,7 +347,7 @@ fn scan_events(
             ..Delta::default()
         };
         *sent_role = true;
-        events.push(sse_json(&ChatChunk::new(id, created, model, delta, None)));
+        chunks.push(ChatChunk::new(id, created, model, delta, None));
     }
     for call in out.calls {
         let delta = Delta {
@@ -359,9 +361,22 @@ fn scan_events(
             ..Delta::default()
         };
         *sent_role = true;
-        events.push(sse_json(&ChatChunk::new(id, created, model, delta, None)));
+        chunks.push(ChatChunk::new(id, created, model, delta, None));
     }
-    events
+    chunks
+}
+
+fn scan_events(
+    id: &str,
+    created: i64,
+    model: &str,
+    out: tools::ScanOut,
+    sent_role: &mut bool,
+) -> Vec<Event> {
+    scan_chunks(id, created, model, out, sent_role)
+        .iter()
+        .map(sse_json)
+        .collect()
 }
 
 /// 스트리밍 한 건의 로그를 `Drop` 에서 남깁니다.
@@ -759,5 +774,82 @@ mod tests {
         let line = tool_meta(3, true, 1, 2).unwrap();
         assert!(line.contains("호출 1건"), "{line}");
         assert!(line.contains("형식 오류 2건"), "{line}");
+    }
+
+    // ── 클라이언트가 실제로 보는 청크 ──
+
+    fn scan(out: tools::ScanOut, sent_role: &mut bool) -> Vec<Value> {
+        scan_chunks("chatcmpl-x", 1, "fabrix-chat-4", out, sent_role)
+            .iter()
+            .map(|c| serde_json::to_value(c).unwrap())
+            .collect()
+    }
+
+    fn call(index: u32, name: &str, arguments: &str) -> tools::ScannedCall {
+        tools::ScannedCall {
+            index,
+            id: format!("call_{name}"),
+            name: name.into(),
+            arguments: arguments.into(),
+        }
+    }
+
+    #[test]
+    fn text_chunk_carries_the_role_only_once() {
+        let mut sent_role = false;
+        let a = scan(tools::ScanOut { text: "안".into(), calls: vec![] }, &mut sent_role);
+        let b = scan(tools::ScanOut { text: "녕".into(), calls: vec![] }, &mut sent_role);
+        assert_eq!(a[0]["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(a[0]["choices"][0]["delta"]["content"], "안");
+        // 두 번째부터는 role 키 자체가 없어야 합니다.
+        assert!(b[0]["choices"][0]["delta"].get("role").is_none());
+        assert_eq!(b[0]["choices"][0]["delta"]["content"], "녕");
+    }
+
+    /// `@ai-sdk/openai-compatible` 은 같은 index 의 첫 조각에 id 와 function.name 이
+    /// 없으면 InvalidResponseDataError 를 던집니다. 우리는 완성된 호출만 내보내므로
+    /// 조각이 하나뿐이고, 그 하나에 전부 들어 있어야 합니다.
+    #[test]
+    fn tool_call_chunk_is_self_contained() {
+        let mut sent_role = true;
+        let out = tools::ScanOut {
+            text: String::new(),
+            calls: vec![call(0, "write", r#"{"filePath":"a.html"}"#)],
+        };
+        let chunks = scan(out, &mut sent_role);
+        assert_eq!(chunks.len(), 1);
+        let tc = &chunks[0]["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(tc["index"], 0);
+        assert_eq!(tc["id"], "call_write");
+        assert_eq!(tc["type"], "function");
+        assert_eq!(tc["function"]["name"], "write");
+        assert_eq!(tc["function"]["arguments"], r#"{"filePath":"a.html"}"#);
+        // 도구 청크에는 content 키가 없어야 합니다 (null 이 아니라 아예 없음).
+        assert!(chunks[0]["choices"][0]["delta"].get("content").is_none());
+        assert_eq!(chunks[0]["object"], "chat.completion.chunk");
+    }
+
+    #[test]
+    fn text_is_emitted_before_tool_calls() {
+        let mut sent_role = false;
+        let out = tools::ScanOut {
+            text: "만들겠습니다.".into(),
+            calls: vec![call(0, "write", "{}"), call(1, "read", "{}")],
+        };
+        let chunks = scan(out, &mut sent_role);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0]["choices"][0]["delta"]["content"], "만들겠습니다.");
+        assert_eq!(chunks[1]["choices"][0]["delta"]["tool_calls"][0]["index"], 0);
+        assert_eq!(chunks[2]["choices"][0]["delta"]["tool_calls"][0]["index"], 1);
+        // role 은 맨 앞 청크에만.
+        assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+        assert!(chunks[1]["choices"][0]["delta"].get("role").is_none());
+    }
+
+    #[test]
+    fn empty_scan_emits_nothing() {
+        let mut sent_role = false;
+        assert!(scan(tools::ScanOut::default(), &mut sent_role).is_empty());
+        assert!(!sent_role, "빈 출력이 role 을 소비하면 안 됩니다");
     }
 }

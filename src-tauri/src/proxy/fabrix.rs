@@ -1296,6 +1296,102 @@ mod tests {
         assert_eq!(d.text(), "안녕");
     }
 
+    // ── 디코더 + 스캐너 결합 (펌프가 실제로 하는 일) ──
+
+    /// 목업이 `MOCK_CHUNK=3` 으로 흘리는 것과 같은 모양의 SSE 프레임을 만듭니다.
+    /// 센티널 한가운데가 갈립니다: `.\n<` `too` `l_c` `all` `>\n{` …
+    fn sse_frames(body: &str, chunk: usize, cumulative: bool) -> Vec<String> {
+        let chars: Vec<char> = body.chars().collect();
+        let mut frames = Vec::new();
+        let mut sent = String::new();
+        for piece in chars.chunks(chunk) {
+            let piece: String = piece.iter().collect();
+            sent.push_str(&piece);
+            let content = if cumulative { sent.clone() } else { piece };
+            frames.push(format!(
+                "data: {}\n",
+                serde_json::json!({ "content": content })
+            ));
+        }
+        frames
+    }
+
+    /// 프레임을 디코더에 먹이고 스캐너까지 태워, 펌프가 내보낼 텍스트와 도구 호출을
+    /// 그대로 재현합니다.
+    fn decode_and_scan(frames: &[String], names: &[&str]) -> (String, Vec<(u32, String, String)>) {
+        use super::super::tools::ToolCallScanner;
+        let mut decoder = StreamDecoder::new();
+        let mut scanner =
+            ToolCallScanner::new(names.iter().map(|s| s.to_string()).collect::<Vec<_>>(), true);
+        let mut text = String::new();
+        let mut calls = Vec::new();
+
+        let absorb = |out: super::super::tools::ScanOut,
+                          text: &mut String,
+                          calls: &mut Vec<(u32, String, String)>| {
+            text.push_str(&out.text);
+            for c in out.calls {
+                calls.push((c.index, c.name, c.arguments));
+            }
+        };
+
+        for frame in frames {
+            for event in decoder.push(frame.as_bytes()) {
+                match event {
+                    StreamEvent::Delta(d) => absorb(scanner.push(&d), &mut text, &mut calls),
+                    StreamEvent::Reset => scanner.reset(),
+                    _ => {}
+                }
+            }
+        }
+        for event in decoder.finish() {
+            if let StreamEvent::Delta(d) = event {
+                absorb(scanner.push(&d), &mut text, &mut calls);
+            }
+        }
+        absorb(scanner.finish(), &mut text, &mut calls);
+        (text, calls)
+    }
+
+    const TOOL_BODY: &str = "만들겠습니다.\n<tool_call>\n{\"name\":\"write\",\"arguments\":{\"filePath\":\"index.html\",\"content\":\"<!doctype html>\"}}\n</tool_call>";
+
+    /// README 가 요구하는 불변식: snake|camel × delta|cumulative 네 조합이 같은
+    /// 결과를 내야 합니다. 도구 호출도 예외가 아닙니다.
+    #[test]
+    fn tool_call_survives_frame_splitting_in_both_stream_modes() {
+        for cumulative in [false, true] {
+            for chunk in [1usize, 3, 7, 200] {
+                let frames = sse_frames(TOOL_BODY, chunk, cumulative);
+                let (text, calls) = decode_and_scan(&frames, &["write", "read"]);
+                let label = format!("cumulative={cumulative} chunk={chunk}");
+
+                assert_eq!(calls.len(), 1, "{label} — 도구 호출 수");
+                assert_eq!(calls[0].0, 0, "{label} — index");
+                assert_eq!(calls[0].1, "write", "{label} — 이름");
+
+                let args: Value = serde_json::from_str(&calls[0].2)
+                    .unwrap_or_else(|e| panic!("{label} — arguments 가 JSON 이 아님: {e}"));
+                assert_eq!(args["filePath"], "index.html", "{label}");
+                assert_eq!(args["content"], "<!doctype html>", "{label}");
+
+                assert!(text.contains("만들겠습니다."), "{label} — 앞 산문 유실");
+                assert!(!text.contains("tool_call"), "{label} — 센티널이 본문에 남음: {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_answer_is_untouched_by_the_scanner() {
+        for cumulative in [false, true] {
+            let frames = sse_frames(ANSWER_SAMPLE, 3, cumulative);
+            let (text, calls) = decode_and_scan(&frames, &["write"]);
+            assert!(calls.is_empty(), "cumulative={cumulative}");
+            assert_eq!(text, ANSWER_SAMPLE, "cumulative={cumulative}");
+        }
+    }
+
+    const ANSWER_SAMPLE: &str = "시연차는 입사 1년 차에 15일이 부여됩니다. 자세한 내용은 규정을 보세요.";
+
     #[test]
     fn single_user_turn_stays_bare() {
         // 도구 분기를 넣어도 가장 흔한 단일 턴은 라벨 없이 그대로 나가야 합니다.

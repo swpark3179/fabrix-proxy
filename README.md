@@ -79,7 +79,8 @@ src-tauri/src/
   proxy/chat.rs        POST /v1/chat/completions  ← 핵심
   proxy/models.rs      GET  /v1/models + 60초 캐시 + alias 매핑
   proxy/fabrix.rs      FabriX 스키마 · SSE 디코더 · 오류 분류
-  logstore.rs          최근 200건 링버퍼 (본문은 메모리 전용)
+  proxy/tools.rs       도구 호출 에뮬레이션 — 규약 주입 · <tool_call> 파스아웃
+  logstore.rs          최근 50건 링버퍼 (본문은 메모리 전용)
   port.rs              포트 가용성 · 점유 PID 조회 · 빈 포트 추천
   tray.rs windows.rs   트레이 메뉴 · 창 3개 관리
 mock-fabrix/server.mjs 개발용 FabriX 스텁 (의존성 0)
@@ -104,7 +105,8 @@ mock-fabrix/server.mjs 개발용 FabriX 스텁 (의존성 0)
   "issuedToken": "",           // tokenMode=true 일 때 발행되는 sk-… 토큰
   "imageModel": "",            // 이미지 생성(FLUX) 고정 모델 — 설정 화면에서 선택
   "visionModel": "",           // 이미지 인식(gemma) 고정 모델 — 설정 화면에서 선택
-  "imageStubMode": false       // 이미지 백엔드 미연결 시 1×1 자리표시자 PNG 반환
+  "imageStubMode": false,      // 이미지 백엔드 미연결 시 1×1 자리표시자 PNG 반환
+  "toolEmulation": true        // 도구 호출(툴 콜) 흉내 내기 — 아래 "도구 호출" 참고
 }
 ```
 
@@ -122,7 +124,7 @@ OpenAI 양식 토큰(`sk-…`)이 자동 발행되고, 인바운드 `Authorizati
 교체할 수 있습니다(이전 토큰은 저장 후 무효).
 
 `~/.fabrix-proxy/stats.json` 에는 날짜별 호출 건수만 남습니다.
-**호출 본문은 어디에도 기록하지 않습니다** — 최근 200건은 메모리에만 있고 앱을 끄면 사라집니다.
+**호출 본문은 어디에도 기록하지 않습니다** — 최근 50건은 메모리에만 있고 앱을 끄면 사라집니다.
 
 ---
 
@@ -135,12 +137,42 @@ OpenAI 양식 토큰(`sk-…`)이 자동 발행되고, 인바운드 `Authorizati
 | 나머지 `messages` | `contents` — 단일 user 턴이면 그 텍스트, 멀티턴이면 `User:`/`Assistant:` 트랜스크립트 하나 |
 | `stream` | `isStream` |
 | `temperature` `top_p` `max_tokens` `seed` `frequency_penalty` `top_k` | `llmConfig.{temperature, top_p, max_new_tokens, seed, repetion_penalty, tok_k}` |
+| `tools` `tool_choice` | 대응 필드가 **없어** `systemPrompt` 뒤의 규약 텍스트로 접힙니다 (아래 참고) |
 
 FabriX에는 롤 구조가 없어 멀티턴은 한 덩어리로 접힙니다. 무엇이 어떻게 접혔는지는
 로그 창 ② 칸에서 그대로 확인할 수 있습니다.
 
 모델 alias는 영문명에서 만듭니다 (`Chat 4` → `fabrix-chat-4`). 영문명이 없으면 UUID 앞 8자리를
 씁니다 (`fabrix-01970a3b`) — 서버가 순서를 바꿔도 alias가 흔들리지 않게 하기 위함입니다.
+
+### 도구 호출 (툴 콜)
+
+FabriX 요청 스키마에는 도구 필드가 **없습니다**. 그래서 `tools` 를 그대로 넘길 수 없고,
+프롬프트 규약 + 출력 파싱으로 흉내 냅니다. 요청에 `tools` 가 있으면 자동으로 켜지고,
+설정 화면에서 끌 수 있습니다(`toolEmulation`). 도구를 안 쓰는 요청은 아무 영향이 없습니다.
+
+- **나갈 때** — 도구 스키마와 출력 규약을 `systemPrompt` 뒤에 붙입니다. 규약은 영어로
+  씁니다. 감싸는 대상(도구 이름·설명·JSON Schema)이 전부 영어라, 한국어 프레임을 씌우면
+  모델이 센티널을 뱉는 대신 도구를 한국어로 *설명하기* 시작합니다.
+- **들어올 때** — 답변에서 아래 블록을 걷어내 OpenAI `tool_calls` 로 조립하고,
+  `finish_reason` 을 `tool_calls` 로 바꿉니다.
+
+```
+<tool_call>
+{"name": "write", "arguments": {"filePath": "index.html", "content": "…"}}
+</tool_call>
+```
+
+이 모양은 Qwen 2.5/3 의 기본 chat template, Hermes, vLLM 의 `hermes` 파서가 쓰는 것과
+같습니다. 사내 모델이 그 계열이면 규약을 읽기 전에 이미 맞는 모양을 뱉을 수 있습니다.
+
+**도구가 아니라고 판단하면 블록을 원문 텍스트 그대로 되돌립니다.** 판단 기준에서 가장
+중요한 것은 이름이 그 요청에 선언된 도구 집합에 있는지입니다. JSON 파싱 실패, 닫히지 않은
+블록, 2MiB 초과도 같은 길로 흘러갑니다 — 어떤 경우에도 버리지 않습니다.
+
+> 이 방식은 **모델이 형식을 지켜 줘야** 동작합니다. 지키지 않으면 로그 ③ 칸 꼬리에
+> `호출 0건 — 모델이 규약을 따르지 않음` 이 남습니다. ③ 칸은 파서가 걷어내기 **전** 원문이라
+> `<tool_call>` 이 실제로 있었는지 눈으로 확인할 수 있습니다.
 
 ### 오류 매핑
 
@@ -169,6 +201,9 @@ MOCK_CASE=camel MOCK_STREAM=cumulative npm run mock
 | `MOCK_RAW` | `1` | `data:` 접두 없이 개행 구분 JSON |
 | `MOCK_FAIL` | `429` · `500` · `timeout` · `midstream` | 오류 경로 |
 | `MOCK_DELAY` | ms (기본 40) | 프레임 간 지연 |
+| `MOCK_TOOLCALL` | `single` · `parallel` · `prose` · `malformed` · `unknown` · `fenced` | 답변에 `<tool_call>` 을 섞습니다 |
+| `MOCK_CHUNK` | 글자 수 (기본 7) | 낮출수록 센티널이 여러 프레임에 걸쳐 쪼개집니다 |
+| `MOCK_SPLITBYTES` | `1` | SSE 한 줄을 임의 바이트 지점에서 두 번에 write |
 
 네 조합(`snake|camel` × `delta|cumulative`) 모두 같은 결과가 나와야 합니다.
 
@@ -177,6 +212,43 @@ curl http://127.0.0.1:8787/v1/models
 curl http://127.0.0.1:8787/v1/chat/completions \
   -H "Content-Type: application/json" -H "Authorization: Bearer anything" \
   -d '{"model":"gpt-4o","messages":[{"role":"user","content":"안녕"}],"stream":true}'
+```
+
+### 도구 호출 확인
+
+도구 호출 파서가 깨지는 곳은 거의 언제나 **프레임 경계**입니다. `MOCK_CHUNK` 를 낮추면
+`<tool_call>` 한가운데가 갈립니다.
+
+```bash
+MOCK_TOOLCALL=single MOCK_CHUNK=3 npm run mock       # 센티널을 프레임 5개로 쪼갬
+MOCK_TOOLCALL=parallel MOCK_STREAM=cumulative npm run mock
+MOCK_TOOLCALL=malformed npm run mock                 # 텍스트로 되돌아와야 함
+```
+
+```bash
+curl http://127.0.0.1:8787/v1/chat/completions \
+  -H "Content-Type: application/json" -H "Authorization: Bearer anything" \
+  -d '{"model":"fabrix-chat-4","stream":true,
+       "messages":[{"role":"user","content":"페이지 만들어줘"}],
+       "tools":[{"type":"function","function":{"name":"write","description":"Write a file",
+         "parameters":{"type":"object","properties":{"filePath":{"type":"string"},
+                                                     "content":{"type":"string"}}}}}]}'
+```
+
+`delta.tool_calls` 와 마지막 청크의 `finish_reason: "tool_calls"` 가 보이면 정상입니다.
+
+실제 통합 경계는 그 위입니다 — OpenCode 를 프록시에 직접 물려 **빈 폴더에 파일이
+생기는지** 보는 것이 UI 전체를 띄우는 것보다 훨씬 빠릅니다.
+
+```bash
+export OPEN_DESIGN_BYOK_API_KEY=anything
+export OPENCODE_CONFIG_CONTENT='{"provider":{"open-design-byok":{"name":"Open Design BYOK",
+  "npm":"@ai-sdk/openai-compatible",
+  "options":{"baseURL":"http://127.0.0.1:8787/v1","apiKey":"{env:OPEN_DESIGN_BYOK_API_KEY}"},
+  "models":{"fabrix-chat-4":{"name":"fabrix-chat-4","limit":{"context":128000,"output":16384}}}}}}'
+echo 'index.html 에 hello world 페이지를 만들어줘' \
+  | opencode run --format json --dir /tmp/odtest -m open-design-byok/fabrix-chat-4
+ls /tmp/odtest
 ```
 
 ---
