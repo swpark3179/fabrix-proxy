@@ -58,14 +58,24 @@ pub fn stop(state: &Shared) {
     }
 }
 
-/// 이미지 요청 본문 상한. i2i 의 base64 data URL 은 axum 기본값(2MiB)을 쉽게 넘기므로
-/// 이미지 라우트에만 올려 줍니다 (chat 은 기본값 유지).
+/// 이미지 요청 본문 상한. i2i 의 base64 data URL 은 axum 기본값(2MiB)을 쉽게 넘깁니다.
 const IMAGE_BODY_LIMIT: usize = 25 * 1024 * 1024;
+
+/// 채팅 요청 본문 상한.
+///
+/// axum 기본값은 2MiB 인데, 에이전트 클라이언트는 도구 스키마 여러 벌에 더해 읽은
+/// 파일 내용을 `role:"tool"` 결과로 되먹이기 때문에 긴 세션에서 이를 넘길 수 있습니다.
+/// 넘기면 axum 이 **핸들러에 들어오기 전에** 413 을 내므로 로그 창에 아무 흔적도
+/// 남지 않습니다 — 사용자 입장에서는 원인 없는 실패입니다.
+const CHAT_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
 fn router(state: Shared) -> Router {
     Router::new()
         .route("/v1/models", get(models::handle))
-        .route("/v1/chat/completions", post(chat::handle))
+        .route(
+            "/v1/chat/completions",
+            post(chat::handle).layer(DefaultBodyLimit::max(CHAT_BODY_LIMIT)),
+        )
         .route(
             "/v1/images/generations",
             post(images::generations).layer(DefaultBodyLimit::max(IMAGE_BODY_LIMIT)),
@@ -76,7 +86,10 @@ fn router(state: Shared) -> Router {
         )
         // Base URL 에 `/v1` 을 빼먹고 넣는 클라이언트도 받아 줍니다.
         .route("/models", get(models::handle))
-        .route("/chat/completions", post(chat::handle))
+        .route(
+            "/chat/completions",
+            post(chat::handle).layer(DefaultBodyLimit::max(CHAT_BODY_LIMIT)),
+        )
         .route(
             "/images/generations",
             post(images::generations).layer(DefaultBodyLimit::max(IMAGE_BODY_LIMIT)),
