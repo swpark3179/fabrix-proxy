@@ -7,6 +7,7 @@ pub mod fabrix;
 pub mod image_backend;
 pub mod images;
 pub mod models;
+pub mod tools;
 
 use axum::extract::DefaultBodyLimit;
 use axum::http::{HeaderMap, StatusCode};
