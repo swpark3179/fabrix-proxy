@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, HeaderValue};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -31,6 +31,7 @@ use super::fabrix::{
 };
 use super::models::ensure_models;
 use super::tools::{self, ToolCallScanner};
+use super::usage;
 use super::validate;
 use super::{
     authorize, error_response, fabrix_headers_line, openai_type, pretty, read_body,
@@ -61,6 +62,11 @@ struct Ctx {
     /// `model` 을 아예 안 보내 기본 모델로 처리했는가. 없는 이름을 보낸 것과 구분해야
     /// 하므로(그건 이제 404 입니다) 따로 들고 있습니다.
     model_defaulted: bool,
+    /// 실제로 사내에 보낸 프롬프트 전문(systemPrompt + contents).
+    ///
+    /// 클라이언트의 `messages` 가 아니라 이걸로 토큰을 추정합니다 — 모델이 실제로 본
+    /// 글이 이것이고, 주입된 도구 규약까지 포함해야 값이 맞습니다.
+    prompt_text: String,
 }
 
 /// 스트림이 중간에 끊겼을 때 마지막 청크에 넣는 `finish_reason`.
@@ -255,6 +261,7 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Body)
         tools_emulated: false,
         plan: validate::Plan::default(),
         model_defaulted: false,
+        prompt_text: String::new(),
     };
 
     // ── 토큰 검증 ───────────────────────────────────────────
@@ -445,6 +452,15 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Body)
         llm_config: LlmConfig::from_request(&req),
     };
     ctx.req_fabrix = serde_json::to_string_pretty(&payload).unwrap_or_default();
+    // 토큰 추정의 입력 — 클라이언트가 보낸 messages 가 아니라 **모델이 실제로 본 글**
+    // 입니다(주입된 도구 규약 포함).
+    ctx.prompt_text = payload
+        .system_prompt
+        .iter()
+        .map(String::as_str)
+        .chain(payload.contents.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join("\n\n");
 
     let Some(client) = state.fabrix_client() else {
         let err = FabrixError::NotConfigured;
@@ -480,7 +496,7 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Body)
     let fingerprint = Some(super::system_fingerprint(&payload.model_ids[0]));
 
     if payload.is_stream {
-        stream_response(state, ctx, res, echo_model, tool_names, fingerprint)
+        stream_response(state, ctx, res, echo_model, tool_names, fingerprint, plan.include_usage)
     } else {
         collect_response(state, ctx, res, echo_model, tool_names, fingerprint).await
     }
@@ -543,6 +559,25 @@ fn scan_events(
         .collect()
 }
 
+/// `scan_events` + 생성 텍스트 누적. 토큰 추정의 completion 쪽 입력을 모으기 위한
+/// 것으로, 산문뿐 아니라 도구 호출 이름·인자까지 더합니다 — 그것도 모델이 만든
+/// 토큰이라, 빼면 도구를 쓰는 요청의 출력이 통째로 0 이 됩니다.
+fn scan_events_counting(
+    id: &str,
+    created: i64,
+    model: &str,
+    out: tools::ScanOut,
+    sent_role: &mut bool,
+    generated: &mut String,
+) -> Vec<Event> {
+    generated.push_str(&out.text);
+    for call in &out.calls {
+        generated.push_str(&call.name);
+        generated.push_str(&call.arguments);
+    }
+    scan_events(id, created, model, out, sent_role)
+}
+
 /// 스트리밍 한 건의 로그를 `Drop` 에서 남깁니다.
 ///
 /// 클라이언트가 도중에 연결을 끊으면 제너레이터가 통째로 버려지므로, 마지막
@@ -564,6 +599,10 @@ struct StreamLog {
     /// 실제로 클라이언트에 내보낸 `finish_reason`. 상위가 준 원문(`finish`)과 다를 수
     /// 있고, 그 차이가 로그에 보여야 합니다.
     emitted_finish: Option<&'static str>,
+    /// 도구 호출 인자까지 더한 생성 텍스트 — 토큰 추정의 completion 쪽 입력.
+    generated: String,
+    /// 이 스트림에서 계산한 usage. 로그 꼬리 한 줄에 씁니다.
+    counted: Option<usage::Counted>,
 }
 
 impl Drop for StreamLog {
@@ -586,7 +625,12 @@ impl Drop for StreamLog {
         });
         meta.push(format!("SSE {}프레임", self.frames));
         meta.push(format!("{}자", text.chars().count()));
-        meta.push("사내 응답에 토큰 수 없음".into());
+        meta.push(match &self.counted {
+            Some(counted) => usage::meta_line(counted),
+            // include_usage 를 안 켠 스트림은 usage 를 계산하지 않습니다 — 규약대로
+            // 청크를 안 보내므로 지어낸 숫자를 로그에만 남길 이유가 없습니다.
+            None => "usage 미계산 (stream_options.include_usage 를 켜면 계산합니다)".to_string(),
+        });
         if let Some(line) = tool_meta(
             self.ctx.tools_declared,
             self.ctx.tools_emulated,
@@ -643,6 +687,7 @@ fn stream_response(
     model: String,
     tool_names: HashSet<String>,
     fingerprint: Option<String>,
+    include_usage: bool,
 ) -> Response {
     let id = format!("chatcmpl-{}", Uuid::new_v4().simple());
     let created = state::epoch_secs();
@@ -663,6 +708,8 @@ fn stream_response(
             tool_calls: 0,
             tool_rejects: 0,
             emitted_finish: None,
+            generated: String::new(),
+            counted: None,
         };
 
         let mut bytes = res.bytes_stream();
@@ -691,7 +738,9 @@ fn stream_response(
                         let started = log.ctx.started;
                         log.first_token.get_or_insert_with(|| started.elapsed());
                         let out = scanner.push(&text);
-                        for event in scan_events(&id, created, &model, out, &mut sent_role) {
+                        for event in scan_events_counting(
+                            &id, created, &model, out, &mut sent_role, &mut log.generated,
+                        ) {
                             yield Ok(event);
                         }
                     }
@@ -723,7 +772,9 @@ fn stream_response(
                     let started = log.ctx.started;
                     log.first_token.get_or_insert_with(|| started.elapsed());
                     let out = scanner.push(&text);
-                    for event in scan_events(&id, created, &model, out, &mut sent_role) {
+                    for event in scan_events_counting(
+                        &id, created, &model, out, &mut sent_role, &mut log.generated,
+                    ) {
                         yield Ok(event);
                     }
                 }
@@ -743,7 +794,9 @@ fn stream_response(
             }
         }
         // 스캐너가 붙들고 있던 미완성 꼬리를 흘려보냅니다 — 절대 버리지 않습니다.
-        for event in scan_events(&id, created, &model, scanner.finish(), &mut sent_role) {
+        for event in scan_events_counting(
+            &id, created, &model, scanner.finish(), &mut sent_role, &mut log.generated,
+        ) {
             yield Ok(event);
         }
         log.drained = true;
@@ -775,12 +828,36 @@ fn stream_response(
                 &id, created, &model, Delta::default(), Some(reason.into()),
             ).with_fingerprint(fingerprint.clone())));
         }
+        // 규약 순서: finish 청크 → usage 청크(choices: []) → [DONE].
+        // 클라이언트가 include_usage 로 **명시적으로 옵트인**했을 때만 보냅니다.
+        if include_usage {
+            let counted = usage::build(
+                log.decoder.upstream_tokens,
+                &log.ctx.prompt_text,
+                &log.generated,
+            );
+            yield Ok(sse_json(&ChatChunk::usage_only(
+                &id, created, &model, counted.usage.clone(),
+            )));
+            log.counted = Some(counted);
+        }
         yield Ok(Event::default().data("[DONE]"));
     };
 
     // keep-alive 주석은 붙이지 않습니다 — 로컬호스트에는 중간 프록시가 없고,
     // 일부 OpenAI 호환 클라이언트가 주석 프레임을 다루지 못합니다.
-    Sse::new(body).into_response()
+    let mut response = Sse::new(body).into_response();
+    if include_usage {
+        // 헤더는 첫 바이트와 함께 나가므로 스트림이 끝나기 전에 정해야 합니다.
+        // 사내가 토큰 수를 주기 시작하면 이 값이 `upstream` 이 되어야 하지만, 그건
+        // 마지막 프레임을 읽어야 알 수 있어 여기서는 추정으로 표기합니다 — 실제 출처는
+        // 로그 ③ 칸 꼬리가 정확히 말합니다.
+        response.headers_mut().insert(
+            "x-fabrix-usage",
+            HeaderValue::from_static(usage::Source::Estimated.header_value()),
+        );
+    }
+    response
 }
 
 /// 비스트리밍 응답을 `chat.completion` 하나로 조립합니다.
@@ -832,6 +909,7 @@ async fn collect_response(
                 reasoning,
                 truncated: chunk.truncated == Some(true),
                 looks_successful: chunk.looks_successful(),
+                upstream_tokens: chunk.upstream_tokens(),
                 finish: chunk.finish_reason,
                 via_stream_decoder: false,
             }
@@ -848,6 +926,7 @@ async fn collect_response(
                 truncated: decoder.truncated,
                 // 스트림 디코더까지 태워 프레임을 읽어 냈다면 응답 자체는 성립했습니다.
                 looks_successful: decoder.finish_reason.is_some(),
+                upstream_tokens: decoder.upstream_tokens,
                 via_stream_decoder: true,
             }
         }
@@ -882,6 +961,11 @@ async fn collect_response(
             map_finish_reason(parsed.finish.as_deref(), parsed.truncated).as_deref(),
         )
     };
+    // 비스트림 응답에는 `usage` 를 **항상** 채웁니다 — 규약이 요구하는 필드입니다.
+    // 사내가 실측을 주지 않으므로 추정치이고, 추정임은 헤더·로그·README 가 말합니다.
+    let answer_for_usage = completion_text_for_usage(&parsed.content, &scanned);
+    let counted = usage::build(parsed.upstream_tokens, &ctx.prompt_text, &answer_for_usage);
+
     let completion = ChatCompletion {
         id: format!("chatcmpl-{}", Uuid::new_v4().simple()),
         object: "chat.completion",
@@ -899,8 +983,7 @@ async fn collect_response(
             finish_reason: Some(reason.to_string()),
             logprobs: None,
         }],
-        // FabriX 가 토큰 수를 주지 않으므로 추정치를 지어내지 않고 생략합니다.
-        usage: None,
+        usage: Some(counted.usage.clone()),
         system_fingerprint: fingerprint,
     };
 
@@ -910,7 +993,7 @@ async fn collect_response(
             _ => format!("finish_reason: {reason}"),
         },
         format!("{}자", parsed.content.chars().count()),
-        "사내 응답에 토큰 수 없음".to_string(),
+        usage::meta_line(&counted),
     ];
     if parsed.via_stream_decoder {
         meta.push("SSE 본문을 합쳐 해석".into());
@@ -938,7 +1021,22 @@ async fn collect_response(
         meta.join(" · "),
     ));
 
-    Json(completion).into_response()
+    let mut response = Json(completion).into_response();
+    response
+        .headers_mut()
+        .insert("x-fabrix-usage", HeaderValue::from_static(counted.source.header_value()));
+    response
+}
+
+/// usage 의 completion 쪽 입력 — 산문에 도구 호출 `arguments` 까지 더합니다.
+/// 그것도 모델이 생성한 토큰이라, 빼면 도구를 쓰는 요청의 출력이 통째로 0 이 됩니다.
+fn completion_text_for_usage(content: &str, scanned: &tools::ScanOut) -> String {
+    let mut out = String::from(content);
+    for call in &scanned.calls {
+        out.push_str(&call.name);
+        out.push_str(&call.arguments);
+    }
+    out
 }
 
 struct Parsed {
@@ -948,6 +1046,8 @@ struct Parsed {
     truncated: bool,
     /// 상위 응답이 성공 표지를 가졌는가 — 빈 답변을 200 으로 볼지 502 로 볼지 가릅니다.
     looks_successful: bool,
+    /// 사내가 준 토큰 수. 오늘은 항상 `None` 입니다.
+    upstream_tokens: Option<(u32, u32)>,
     via_stream_decoder: bool,
 }
 
@@ -1013,6 +1113,7 @@ mod tests {
             tools_emulated: false,
             plan,
             model_defaulted,
+            prompt_text: String::new(),
         }
     }
 
@@ -1047,6 +1148,26 @@ mod tests {
         // 도구가 없으면 빈 문자열도 문자열입니다.
         assert_eq!(assistant_content("", "", false).as_deref(), Some(""));
         assert_eq!(assistant_content("", "안녕", false).as_deref(), Some("안녕"));
+    }
+
+    /// 도구 호출 인자도 모델이 생성한 토큰입니다 — 빼면 도구를 쓰는 요청의 출력이
+    /// 통째로 0 이 됩니다.
+    #[test]
+    fn usage_counts_tool_call_arguments_as_output() {
+        let scanned = tools::ScanOut {
+            text: "만들겠습니다.".into(),
+            calls: vec![call(0, "write", r#"{"filePath":"index.html"}"#)],
+        };
+        let counted = completion_text_for_usage("만들겠습니다.", &scanned);
+        assert!(counted.contains("만들겠습니다."), "{counted}");
+        assert!(counted.contains("write"), "{counted}");
+        assert!(counted.contains("index.html"), "{counted}");
+
+        // 도구가 없으면 산문 그대로입니다.
+        assert_eq!(
+            completion_text_for_usage("안녕", &tools::ScanOut::default()),
+            "안녕"
+        );
     }
 
     // ── 클라이언트가 실제로 보는 청크 ──

@@ -345,6 +345,38 @@ pub struct FabrixChunk {
     pub message: Option<String>,
     #[serde(default, alias = "errorMessage")]
     pub error_message: Option<String>,
+
+    // ── 토큰 수 후보 필드들 ──
+    //
+    // 스펙에 없어서 **오늘은 항상 `None`** 입니다. 방어적으로 받아 두는 이유: 사내가
+    // 토큰 수를 주기 시작하면 다른 코드를 고치지 않고 `usage` 가 추정치에서 실측으로
+    // 넘어갑니다(`proxy::usage::build`). 받는 값이 없을 때 비용은 0 입니다.
+    #[serde(default, alias = "inputTokens", alias = "prompt_tokens", alias = "promptTokens")]
+    pub input_tokens: Option<u32>,
+    #[serde(
+        default,
+        alias = "outputTokens",
+        alias = "completion_tokens",
+        alias = "completionTokens"
+    )]
+    pub output_tokens: Option<u32>,
+    /// 중첩 `usage {prompt_tokens, completion_tokens}` 모양도 받습니다.
+    #[serde(default)]
+    pub usage: Option<UpstreamUsage>,
+}
+
+/// 사내가 OpenAI 처럼 중첩 `usage` 를 줄 경우의 모양.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct UpstreamUsage {
+    #[serde(default, alias = "promptTokens", alias = "inputTokens", alias = "input_tokens")]
+    pub prompt_tokens: Option<u32>,
+    #[serde(
+        default,
+        alias = "completionTokens",
+        alias = "outputTokens",
+        alias = "output_tokens"
+    )]
+    pub completion_tokens: Option<u32>,
 }
 
 /// 플러그인/RAG 답변 한 건. 답변 텍스트만 쓰고 나머지(references 등)는 무시합니다.
@@ -385,6 +417,15 @@ impl FabrixChunk {
             .or_else(|| self.event_data.clone())
             .or_else(|| self.content.clone())
             .unwrap_or_else(|| "사내 서버가 오류를 반환했습니다".into())
+    }
+
+    /// 사내가 준 토큰 수. 둘 다 있어야 씁니다 — 한쪽만 있으면 반쪽짜리 usage 가 되어
+    /// 추정치보다 오해를 부릅니다.
+    pub fn upstream_tokens(&self) -> Option<(u32, u32)> {
+        let nested = self.usage.as_ref();
+        let prompt = self.input_tokens.or_else(|| nested.and_then(|u| u.prompt_tokens))?;
+        let completion = self.output_tokens.or_else(|| nested.and_then(|u| u.completion_tokens))?;
+        Some((prompt, completion))
     }
 
     /// 응답이 "제대로 온 것"인지 — 답변이 비었을 때 502 를 낼지 200 을 낼지 가릅니다.
@@ -529,6 +570,9 @@ pub struct StreamDecoder {
     /// 플래그로 들고 있는 이유: 여기서 `Finish` 이벤트를 내면 뒤따라 오는 진짜
     /// 종료 프레임이 값을 덮어씁니다. 최종 판단은 소비자가 마지막에 합니다.
     pub truncated: bool,
+    /// 사내가 토큰 수를 실어 보냈다면 그 값. 오늘은 항상 `None` 입니다
+    /// (`FabrixChunk::upstream_tokens` 참고).
+    pub upstream_tokens: Option<(u32, u32)>,
 }
 
 impl StreamDecoder {
@@ -617,6 +661,11 @@ impl StreamDecoder {
         }
         if chunk.truncated == Some(true) {
             self.truncated = true;
+        }
+        // 토큰 수는 보통 마지막 프레임에만 오지만, 어느 프레임에 실릴지 스펙에 없어
+        // 나오는 대로 기억합니다(나중 값이 이깁니다).
+        if let Some(tokens) = chunk.upstream_tokens() {
+            self.upstream_tokens = Some(tokens);
         }
         if let Some(reasoning) = chunk.reasoning_content.as_deref() {
             if !reasoning.is_empty() {

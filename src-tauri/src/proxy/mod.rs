@@ -8,6 +8,7 @@ pub mod image_backend;
 pub mod images;
 pub mod models;
 pub mod tools;
+pub mod usage;
 pub mod validate;
 
 use axum::extract::DefaultBodyLimit;
@@ -90,7 +91,12 @@ fn router(state: Shared) -> Router {
         // 불러야 그 시점의 라우트들에 적용됩니다.
         .method_not_allowed_fallback(method_not_allowed)
         .fallback(not_found)
-        .layer(CorsLayer::permissive())
+        // `x-fabrix-*` 는 브라우저 클라이언트가 읽어야 뜻이 있습니다. CORS 는 기본적으로
+        // 안전 목록 밖 응답 헤더를 스크립트에서 가립니다.
+        .layer(CorsLayer::permissive().expose_headers([
+            axum::http::HeaderName::from_static("x-fabrix-usage"),
+            axum::http::HeaderName::from_static("x-fabrix-image-stub"),
+        ]))
         .with_state(state)
 }
 
