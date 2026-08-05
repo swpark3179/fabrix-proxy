@@ -78,9 +78,11 @@ export interface Config {
   insecureSkipVerify: boolean
   tokenMode: boolean
   issuedToken: string
-  /** 이미지 생성(FLUX) 대상 모델 — 설정 화면에서 고르는 고정값. */
+  /** 이미지 호출에 함께 보내는 텍스트(베이스 LLM) 모델 id — 설정 화면에서 고르는 고정값. */
+  imageTextModel: string
+  /** 이미지 생성(FLUX) 대상 모델 id — 설정 화면에서 고르는 고정값. */
   imageModel: string
-  /** 이미지 인식(gemma) 대상 모델 — 설정 화면에서 고르는 고정값. */
+  /** 이미지 인식(gemma) 대상 모델 id — 설정 화면에서 고르는 고정값. */
   visionModel: string
   /** 이미지 백엔드 미연결 시 자리표시자(1×1 PNG) 반환 모드. */
   imageStubMode: boolean

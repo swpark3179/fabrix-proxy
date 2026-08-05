@@ -19,10 +19,17 @@ Cursor 같은 표준 클라이언트를 그대로 붙일 수 없습니다. 이 �
 | `POST /v1/images/generations` | 이미지 생성(FLUX) · OpenAI Images 호환 |
 | `POST /v1/images/edits` | 이미지 편집(gemma 인식 → FLUX 재생성) · JSON data-URL |
 
-> ⚠️ 이미지 두 엔드포인트는 현재 **인터페이스/스켈레톤**입니다. 실제 사내 FLUX/gemma 호출은
-> 파이썬 샘플 반영 전까지 스텁이라 **501**(`not_implemented`)로 응답합니다. 배선만 확인하려면
-> 설정에서 `이미지 스텁 모드`(`imageStubMode`)를 켜면 1×1 자리표시자 PNG 를 돌려줍니다
-> (응답 헤더 `x-fabrix-image-stub: 1`, 로그에 `[stub]` 표기).
+이미지 두 엔드포인트는 사내 **`POST /openapi/chat/v1/messages-with-models`** 로 번역됩니다
+(chat 의 `/messages` 와 다름). `modelIds` 는 **[텍스트 모델, 이미지 모델]** 두 개를 함께 보냅니다 —
+셋(텍스트·생성·인식) 모두 **설정 화면에서 선택**하며, 값은 All Model API 의 모델 id 입니다.
+
+| | |
+|---|---|
+| 생성(t2i) | `application/x-www-form-urlencoded` · `isStream=false` · `messageConfig={width,height}` → 응답 `actions[0].answer`(base64) |
+| 인식(i2t) | `multipart/form-data`(파일 파트 `files`) · `isStream=true` → SSE `content` 누적 |
+
+> 배선만 확인하려면 설정에서 `이미지 스텁 모드`(`imageStubMode`)를 켜면 사내 호출 없이 1×1 자리표시자
+> PNG 를 돌려줍니다 (응답 헤더 `x-fabrix-image-stub: 1`, 로그에 `[stub]` 표기).
 
 ---
 
@@ -123,9 +130,10 @@ mock-fabrix/server.mjs 개발용 FabriX 스텁 (의존성 0)
   "insecureSkipVerify": false,
   "tokenMode": false,          // 로컬 토큰 검증 모드
   "issuedToken": "",           // tokenMode=true 일 때 발행되는 sk-… 토큰
-  "imageModel": "",            // 이미지 생성(FLUX) 고정 모델 — 설정 화면에서 선택
-  "visionModel": "",           // 이미지 인식(gemma) 고정 모델 — 설정 화면에서 선택
-  "imageStubMode": false,      // 이미지 백엔드 미연결 시 1×1 자리표시자 PNG 반환
+  "imageTextModel": "",        // 이미지 호출에 함께 보내는 텍스트 모델 id — 설정 화면에서 선택
+  "imageModel": "",            // 이미지 생성(FLUX) 모델 id — 설정 화면에서 선택
+  "visionModel": "",           // 이미지 인식(gemma) 모델 id — 설정 화면에서 선택
+  "imageStubMode": false,      // 이미지 백엔드 없이 1×1 자리표시자 PNG 로 배선만 검증
   "toolEmulation": true        // 도구 호출(툴 콜) 흉내 내기 — 아래 "도구 호출" 참고
 }
 ```
@@ -216,11 +224,15 @@ OpenAI 가 내보내는 필드를 그대로 맞춥니다 — `choices[].logprobs
 드래그로 직접 선택해도 됩니다.
 
 - **모델 ID** 가 클라이언트의 `model` 칸에 넣는 값입니다.
-- **사내 UUID** 는 사내 담당자와 대조할 때 씁니다 — HTTP 응답에는 노출하지 않습니다.
+- **사내 UUID** 는 사내 담당자와 대조할 때, 그리고 **설정 화면의 이미지 모델 셋**
+  (텍스트·생성·인식)을 고를 때 씁니다 — 이미지 업스트림은 alias 가 아니라 UUID 를 받습니다.
+  HTTP 응답(`/v1/models`)에는 노출하지 않습니다.
 - `전체 복사` 는 사람이 읽는 표 형식 평문(머리말에 서버 주소와 조회 시각),
   `ID만 복사` 는 줄바꿈으로 이은 모델 ID — OpenCode/Continue 설정의 `models` 배열에
   통째로 붙여넣는 용도입니다. 둘 다 **검색으로 걸러 놓은 것만** 담습니다.
 - 행의 `기본으로` 를 누르면 `defaultModelAlias` 가 바뀝니다 (`model` 을 안 보낸 요청에 쓰는 값).
+- 설정 화면의 기본 모델 선택기와 이미지 모델 드롭다운 셋도 **이 목록 한 번의 조회**를
+  나눠 씁니다 — 사내에 목록 엔드포인트가 하나뿐이라 두 번 물을 이유가 없습니다.
 - 목록은 60초 캐시를 공유하고 `다시 조회` 로 즉시 새로 받습니다. 새 조회가 실패해도
   **이전 목록을 지우지 않습니다** — 사내가 잠깐 안 되는 것과 "쓸 모델이 없다"는 다른
   이야기인데, 표를 비우면 똑같이 보입니다.

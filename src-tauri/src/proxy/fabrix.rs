@@ -922,7 +922,7 @@ pub fn build_http_client(insecure: bool) -> reqwest::Client {
     builder.build().unwrap_or_else(|_| reqwest::Client::new())
 }
 
-fn classify_status(status: u16, body: &str) -> FabrixError {
+pub fn classify_status(status: u16, body: &str) -> FabrixError {
     let message = extract_message(body).unwrap_or_else(|| head(body));
     match status {
         429 => FabrixError::Quota(message),

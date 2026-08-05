@@ -11,17 +11,14 @@ import {
 } from '../lib/ipc'
 import type { Config, ModelRow } from '../types'
 
-// 사내 이미지/비전 모델 후보.
-//
-// 채팅 모델과 달리 하드코딩입니다 — 사내에 이미지/비전 모델을 나열하는 엔드포인트가
-// 없습니다. 파이썬 샘플(이미지 분석/생성) 확정 시 갱신합니다.
-const IMAGE_MODELS = ['flux-2.0', 'flux-1.1-pro', 'flux-dev']
-const VISION_MODELS = ['gemma-4', 'gemma-3']
+// 하드코딩된 IMAGE_MODELS/VISION_MODELS 는 없어졌습니다. 이미지도 채팅과 **같은** 사내
+// 모델 목록(`messages-with-models`)을 쓴다는 것이 확인됐으므로, 후보를 추측해 적어 둘
+// 이유가 사라졌습니다.
 
 /** `직접 입력…` 을 고른 상태를 나타내는 센티널. 실제 alias 와 겹칠 수 없는 값입니다. */
 const MANUAL = '\u0000manual'
 
-/** 기본 모델 선택기를 채울 목록의 상태. */
+/** 사내 모델 목록의 상태. 기본 모델 선택기와 이미지 드롭다운이 **같은 조회**를 씁니다. */
 type Choices =
   | { s: 'off' }
   | { s: 'loading' }
@@ -29,9 +26,18 @@ type Choices =
   /** 미설정·오프라인·조회 실패 — 자유 입력으로 되돌립니다. */
   | { s: 'unavailable' }
 
-/** 현재 저장된 값이 후보 목록에 없더라도 드롭다운에서 사라지지 않게 앞에 끼워 줍니다. */
-function withCurrent(list: string[], current: string): string[] {
-  return current && !list.includes(current) ? [current, ...list] : list
+/**
+ * 이미지 드롭다운 옵션. 값이 **UUID**(`modelId`)인 이유: 이미지 업스트림
+ * (`messages-with-models`)은 alias 가 아니라 UUID 를 받습니다.
+ *
+ * 저장된 값이 조회 목록에 없으면(오프라인/미조회) 그대로 보이도록 앞에 끼워 줍니다.
+ */
+function modelOptionList(models: ModelRow[], current: string): { value: string; label: string }[] {
+  const opts = models.map((m) => ({ value: m.modelId, label: `${m.label} · ${m.alias}` }))
+  if (current && !opts.some((o) => o.value === current)) {
+    opts.unshift({ value: current, label: `${current} (저장됨)` })
+  }
+  return opts
 }
 
 interface Props {
@@ -66,8 +72,9 @@ export function ConnectionForm({ initial, variant, busy, onSave, onCancel }: Pro
     void getConfigPath().then(setConfigPath)
   }, [])
 
-  // 저장된 설정이 있는 설정 화면에서만 목록을 미리 받아 둡니다. 온보딩에는 아직 시험할
-  // 대상이 없으므로 `연결 확인` 이 목록을 채워 줍니다(아래 runProbe).
+  // 설정 화면에서만 사내 목록을 미리 받아 둡니다 — 기본 모델 선택기와 이미지 드롭다운 셋이
+  // **이 한 번의 조회**를 나눠 씁니다. 온보딩에는 아직 시험할 대상이 없으므로
+  // `연결 확인` 이 목록을 채워 줍니다(아래 runProbe).
   //
   // 실패는 **조용히** unavailable 로 내립니다 — 설정 화면을 열었을 뿐인데 오류 배너가
   // 뜨면 안 됩니다. 자유 입력으로 되돌아가므로 오프라인에서도 막히지 않습니다.
@@ -82,6 +89,10 @@ export function ConnectionForm({ initial, variant, busy, onSave, onCancel }: Pro
       alive = false
     }
   }, [variant])
+
+  /// 이미지 드롭다운 셋이 보는 목록. 기본 모델 선택기와 **같은 조회**에서 나옵니다 —
+  /// 사내에 목록 엔드포인트가 하나뿐이라 두 번 물을 이유가 없습니다.
+  const models = choices.s === 'ready' ? choices.rows : []
 
   const set = <K extends keyof Config>(key: K, value: Config[K]) =>
     setDraft((prev) => ({ ...prev, [key]: value }))
@@ -296,39 +307,60 @@ export function ConnectionForm({ initial, variant, busy, onSave, onCancel }: Pro
             </div>
           </div>
 
-          <span className="setup__section-label">이미지 (OpenAI 호환 /v1/images)</span>
+          <span className="setup__section-label">이미지 (OpenAI 호환 /v1/images · messages-with-models)</span>
+          <div className="field">
+            <span className="field__label">텍스트 모델 — 이미지 호출에 함께 전송 (modelIds 첫 번째)</span>
+            <select
+              className="text-input"
+              value={draft.imageTextModel}
+              onChange={(e) => set('imageTextModel', e.target.value)}
+            >
+              <option value="">— 선택 —</option>
+              {modelOptionList(models, draft.imageTextModel).map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+          </div>
           <div className="setup__row">
             <div className="field">
-              <span className="field__label">이미지 생성 모델 · FLUX</span>
+              <span className="field__label">이미지 생성 모델 · FLUX (T2I)</span>
               <select
                 className="text-input"
                 value={draft.imageModel}
                 onChange={(e) => set('imageModel', e.target.value)}
               >
                 <option value="">— 선택 —</option>
-                {withCurrent(IMAGE_MODELS, draft.imageModel).map((m) => (
-                  <option key={m} value={m}>
-                    {m}
+                {modelOptionList(models, draft.imageModel).map((o) => (
+                  <option key={o.value} value={o.value}>
+                    {o.label}
                   </option>
                 ))}
               </select>
             </div>
             <div className="field">
-              <span className="field__label">이미지 인식 모델 · gemma</span>
+              <span className="field__label">이미지 인식 모델 · gemma (I2T)</span>
               <select
                 className="text-input"
                 value={draft.visionModel}
                 onChange={(e) => set('visionModel', e.target.value)}
               >
                 <option value="">— 선택 —</option>
-                {withCurrent(VISION_MODELS, draft.visionModel).map((m) => (
-                  <option key={m} value={m}>
-                    {m}
+                {modelOptionList(models, draft.visionModel).map((o) => (
+                  <option key={o.value} value={o.value}>
+                    {o.label}
                   </option>
                 ))}
               </select>
             </div>
           </div>
+          {models.length === 0 && (
+            <span className="setup__desc">
+              모델 목록이 비어 있습니다 — 위 연결 정보를 저장한 뒤 설정을 다시 열면 사내 모델을 드롭다운으로
+              고를 수 있습니다. (저장된 값은 그대로 유지됩니다.)
+            </span>
+          )}
 
           <label className="check">
             <input

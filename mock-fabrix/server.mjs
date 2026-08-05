@@ -140,6 +140,10 @@ function usageFields(prompt, completion) {
   return USAGE ? { inputTokens: prompt, outputTokens: completion } : {}
 }
 
+// 이미지 생성(messages-with-models · isStream=false) 응답의 actions[0].answer 용 1×1 PNG.
+const PLACEHOLDER_PNG_B64 =
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='
+
 const log = (...args) => console.log('[mock-fabrix]', ...args)
 
 function json(res, status, body) {
@@ -340,6 +344,55 @@ async function handleMessages(req, res) {
   setTimeout(tick, 300)
 }
 
+// 이미지 생성/인식 공용 엔드포인트. 프록시가 multipart(i2t) / form-urlencoded(t2i) 로 보냅니다.
+// 모의라 본문을 엄밀히 파싱하지 않고, isStream 값만 찾아 응답 형태를 고릅니다.
+async function handleImages(req, res) {
+  if (!authorized(req)) {
+    return json(res, 401, { message: '인증 헤더가 없습니다' })
+  }
+  if (FAIL === '429') return json(res, 429, { message: '사내 쿼터를 초과했습니다(모의)' })
+  if (FAIL === '500') return json(res, 500, { message: '사내 서버 내부 오류(모의)' })
+
+  const raw = await readBody(req)
+  const lower = raw.toLowerCase()
+  const idx = lower.indexOf('isstream')
+  const isStream = idx >= 0 && lower.slice(idx, idx + 60).includes('true')
+  log(`POST /openapi/chat/v1/messages-with-models · isStream=${isStream}`)
+
+  if (isStream) {
+    // 이미지 인식(i2t) — SSE 로 설명 텍스트를 흘립니다.
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+    })
+    const send = (obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`)
+    const pieces = ['(모의) 파란 하늘 아래 ', '잔디밭에 앉은 ', '갈색 강아지 한 마리.']
+    let i = 0
+    const tick = () => {
+      if (res.writableEnded) return
+      if (i >= pieces.length) {
+        send({ event_status: 'CHUNK', content: '', status: 'SUCCESS', response_code: 'R20000', finish_reason: 'stop' })
+        res.write('data: [DONE]\n\n')
+        res.end()
+        return
+      }
+      send({ event_status: 'CHUNK', content: pieces[i], status: 'CHUNK' })
+      i += 1
+      setTimeout(tick, DELAY)
+    }
+    setTimeout(tick, 100)
+    return
+  }
+
+  // 이미지 생성(t2i) — actions[0].answer 에 base64 이미지.
+  json(res, 200, {
+    status: 'SUCCESS',
+    response_code: 'R20000',
+    actions: [{ answer: PLACEHOLDER_PNG_B64 }],
+  })
+}
+
 const server = createServer((req, res) => {
   const url = new URL(req.url ?? '/', `http://${req.headers.host}`)
 
@@ -348,6 +401,9 @@ const server = createServer((req, res) => {
   }
   if (req.method === 'POST' && url.pathname === '/openapi/chat/v1/messages') {
     return handleMessages(req, res)
+  }
+  if (req.method === 'POST' && url.pathname === '/openapi/chat/v1/messages-with-models') {
+    return handleImages(req, res)
   }
   json(res, 404, { message: `모르는 경로: ${req.method} ${url.pathname}` })
 })

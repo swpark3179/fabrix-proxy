@@ -35,9 +35,12 @@ pub struct Config {
     pub token_mode: bool,
     /// 토큰 사용 모드에서 발행한 OpenAI 양식 토큰(`sk-…`). 인바운드 Bearer 와 대조합니다.
     pub issued_token: String,
-    /// 이미지 생성(FLUX) 대상 모델 — 설정 화면에서 고르는 고정값. 비면 이미지 생성이 미설정 오류.
+    /// 이미지 호출에 함께 보내는 텍스트(베이스 LLM) 모델 id — messages-with-models 는 modelIds 를
+    /// [텍스트 모델, 이미지 모델] 두 개로 받습니다. 설정 화면에서 고르는 고정값.
+    pub image_text_model: String,
+    /// 이미지 생성(FLUX) 대상 모델 id — 설정 화면에서 고르는 고정값. 비면 이미지 생성이 미설정 오류.
     pub image_model: String,
-    /// 이미지 인식(gemma) 대상 모델 — 설정 화면에서 고르는 고정값.
+    /// 이미지 인식(gemma) 대상 모델 id — 설정 화면에서 고르는 고정값.
     pub vision_model: String,
     /// 이미지 백엔드 미연결 상태에서 로컬/E2E 검증용 자리표시자(1×1 PNG) 모드. 기본 false.
     pub image_stub_mode: bool,
@@ -59,6 +62,7 @@ impl Default for Config {
             insecure_skip_verify: false,
             token_mode: false,
             issued_token: String::new(),
+            image_text_model: String::new(),
             image_model: String::new(),
             vision_model: String::new(),
             image_stub_mode: false,
