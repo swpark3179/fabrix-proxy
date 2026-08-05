@@ -125,23 +125,28 @@ pub fn build_aliases(models: &[FabrixModel]) -> Vec<ResolvedModel> {
     out
 }
 
-/// UUID 직매치 → alias 완전일치 → 대소문자 무시 → 기본 모델 폴백.
-pub fn resolve_model<'a>(
+/// UUID 직매치 → alias 완전일치 → 대소문자 무시. **폴백하지 않습니다.**
+///
+/// 폴백을 이 함수 안에 두면 `/v1/models/{id}` 가 모르는 id 에 200 을 돌려주는 거짓말이
+/// 됩니다 — 클라이언트는 그 id 가 있다고 믿고 계속 씁니다. 폴백이 필요한 자리
+/// (`model` 을 아예 안 보낸 요청)는 [`default_model`] 을 따로 부릅니다.
+pub fn find_model<'a>(models: &'a [ResolvedModel], requested: &str) -> Option<&'a ResolvedModel> {
+    let req = requested.trim();
+    if req.is_empty() {
+        return None;
+    }
+    models
+        .iter()
+        .find(|m| m.model_id == req)
+        .or_else(|| models.iter().find(|m| m.alias == req))
+        .or_else(|| models.iter().find(|m| m.alias.eq_ignore_ascii_case(req)))
+}
+
+/// `model` 을 아예 안 보낸 요청에 쓸 모델 — 설정의 기본 alias, 없으면 목록의 첫 모델.
+pub fn default_model<'a>(
     models: &'a [ResolvedModel],
-    requested: Option<&str>,
     default_alias: &str,
 ) -> Option<&'a ResolvedModel> {
-    if let Some(req) = requested.map(str::trim).filter(|s| !s.is_empty()) {
-        if let Some(hit) = models.iter().find(|m| m.model_id == req) {
-            return Some(hit);
-        }
-        if let Some(hit) = models.iter().find(|m| m.alias == req) {
-            return Some(hit);
-        }
-        if let Some(hit) = models.iter().find(|m| m.alias.eq_ignore_ascii_case(req)) {
-            return Some(hit);
-        }
-    }
     models
         .iter()
         .find(|m| m.alias == default_alias)
@@ -340,6 +345,38 @@ pub struct FabrixChunk {
     pub message: Option<String>,
     #[serde(default, alias = "errorMessage")]
     pub error_message: Option<String>,
+
+    // ── 토큰 수 후보 필드들 ──
+    //
+    // 스펙에 없어서 **오늘은 항상 `None`** 입니다. 방어적으로 받아 두는 이유: 사내가
+    // 토큰 수를 주기 시작하면 다른 코드를 고치지 않고 `usage` 가 추정치에서 실측으로
+    // 넘어갑니다(`proxy::usage::build`). 받는 값이 없을 때 비용은 0 입니다.
+    #[serde(default, alias = "inputTokens", alias = "prompt_tokens", alias = "promptTokens")]
+    pub input_tokens: Option<u32>,
+    #[serde(
+        default,
+        alias = "outputTokens",
+        alias = "completion_tokens",
+        alias = "completionTokens"
+    )]
+    pub output_tokens: Option<u32>,
+    /// 중첩 `usage {prompt_tokens, completion_tokens}` 모양도 받습니다.
+    #[serde(default)]
+    pub usage: Option<UpstreamUsage>,
+}
+
+/// 사내가 OpenAI 처럼 중첩 `usage` 를 줄 경우의 모양.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct UpstreamUsage {
+    #[serde(default, alias = "promptTokens", alias = "inputTokens", alias = "input_tokens")]
+    pub prompt_tokens: Option<u32>,
+    #[serde(
+        default,
+        alias = "completionTokens",
+        alias = "outputTokens",
+        alias = "output_tokens"
+    )]
+    pub completion_tokens: Option<u32>,
 }
 
 /// 플러그인/RAG 답변 한 건. 답변 텍스트만 쓰고 나머지(references 등)는 무시합니다.
@@ -380,6 +417,30 @@ impl FabrixChunk {
             .or_else(|| self.event_data.clone())
             .or_else(|| self.content.clone())
             .unwrap_or_else(|| "사내 서버가 오류를 반환했습니다".into())
+    }
+
+    /// 사내가 준 토큰 수. 둘 다 있어야 씁니다 — 한쪽만 있으면 반쪽짜리 usage 가 되어
+    /// 추정치보다 오해를 부릅니다.
+    pub fn upstream_tokens(&self) -> Option<(u32, u32)> {
+        let nested = self.usage.as_ref();
+        let prompt = self.input_tokens.or_else(|| nested.and_then(|u| u.prompt_tokens))?;
+        let completion = self.output_tokens.or_else(|| nested.and_then(|u| u.completion_tokens))?;
+        Some((prompt, completion))
+    }
+
+    /// 응답이 "제대로 온 것"인지 — 답변이 비었을 때 502 를 낼지 200 을 낼지 가릅니다.
+    ///
+    /// 모델이 정말 빈 답을 줄 수도 있습니다(짧은 max_tokens, 필터 직전 등). 그걸
+    /// 502 로 처리하면 사내 잘못이 아닌 것을 사내 오류로 보고하는 셈입니다. 성공
+    /// 표지(`status`/`responseCode`/`finish_reason`)가 하나라도 있으면 빈 답변도
+    /// 정상 응답으로 봅니다. 아무 표지도 없으면 애초에 우리가 못 알아본 본문이라
+    /// 502 가 맞습니다.
+    pub fn looks_successful(&self) -> bool {
+        if self.looks_like_error() {
+            return false;
+        }
+        let filled = |s: &Option<String>| s.as_deref().is_some_and(|v| !v.trim().is_empty());
+        filled(&self.status) || filled(&self.response_code) || filled(&self.finish_reason)
     }
 
     /// 비스트리밍 답변 텍스트를 폴백 순서로 추출합니다.
@@ -444,6 +505,28 @@ pub fn map_finish_reason(raw: Option<&str>, truncated: bool) -> Option<String> {
     )
 }
 
+/// `map_finish_reason` 의 결과를 **와이어에 나가기 직전** OpenAI 열거값으로 접습니다.
+///
+/// `map_finish_reason` 이 모르는 값을 그대로 넘기는 것은 의도입니다 — 상위가 뭐라고
+/// 했는지는 로그에 남아야 합니다. 다만 그 값이 응답에까지 나가면 `finish_reason` 을
+/// 열거형으로 파싱하는 클라이언트가 깨집니다. 그래서 보존과 준수를 두 함수로 나누고,
+/// 이 함수는 직렬화 경계에서만 씁니다.
+///
+/// 중단 계열(`abort`·`timeout`·`error`…)은 `stop` 이 아니라 `length` 로 접습니다 —
+/// 끊긴 답변을 완성된 것처럼 부르면 안 됩니다.
+pub fn clamp_finish_reason(mapped: Option<&str>) -> &'static str {
+    match mapped.unwrap_or("stop").trim().to_ascii_lowercase().as_str() {
+        "stop" => "stop",
+        "length" => "length",
+        "tool_calls" => "tool_calls",
+        "content_filter" => "content_filter",
+        "function_call" => "function_call",
+        "abort" | "aborted" | "cancel" | "cancelled" | "canceled" | "error" | "timeout"
+        | "incomplete" => "length",
+        _ => "stop",
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamEvent {
     Delta(String),
@@ -487,6 +570,9 @@ pub struct StreamDecoder {
     /// 플래그로 들고 있는 이유: 여기서 `Finish` 이벤트를 내면 뒤따라 오는 진짜
     /// 종료 프레임이 값을 덮어씁니다. 최종 판단은 소비자가 마지막에 합니다.
     pub truncated: bool,
+    /// 사내가 토큰 수를 실어 보냈다면 그 값. 오늘은 항상 `None` 입니다
+    /// (`FabrixChunk::upstream_tokens` 참고).
+    pub upstream_tokens: Option<(u32, u32)>,
 }
 
 impl StreamDecoder {
@@ -575,6 +661,11 @@ impl StreamDecoder {
         }
         if chunk.truncated == Some(true) {
             self.truncated = true;
+        }
+        // 토큰 수는 보통 마지막 프레임에만 오지만, 어느 프레임에 실릴지 스펙에 없어
+        // 나오는 대로 기억합니다(나중 값이 이깁니다).
+        if let Some(tokens) = chunk.upstream_tokens() {
+            self.upstream_tokens = Some(tokens);
         }
         if let Some(reasoning) = chunk.reasoning_content.as_deref() {
             if !reasoning.is_empty() {
@@ -701,12 +792,26 @@ impl FabrixError {
         }
     }
 
-    pub fn kind(&self) -> &'static str {
+    /// 기계가 분기하는 값. `type` 은 상태 코드에서 유도되므로(`proxy::openai_type`)
+    /// 우리 고유의 구분은 여기 담습니다 — 예전 `kind()` 가 `type` 자리에 넣던
+    /// 비표준 값(`upstream_error` · `configuration_error`)이 이쪽으로 옮겨온 것입니다.
+    pub fn code(&self) -> &'static str {
         match self {
-            FabrixError::Quota(_) => "rate_limit_error",
-            FabrixError::NotConfigured => "configuration_error",
-            _ => "upstream_error",
+            FabrixError::NotConfigured => "not_configured",
+            FabrixError::Unreachable(_) => "upstream_unreachable",
+            FabrixError::Quota(_) => "rate_limit_exceeded",
+            FabrixError::Upstream { .. } => "upstream_error",
+            FabrixError::BadPayload(_) => "upstream_bad_response",
         }
+    }
+
+    /// 응답 봉투 하나. 호출부가 `status`/`message`/`code` 를 따로 엮지 않게 모아 둡니다.
+    pub fn envelope(&self) -> crate::openai::ErrorEnvelope {
+        crate::openai::ErrorEnvelope::new(
+            self.message(),
+            super::openai_type(self.status()),
+            Some(self.code().to_string()),
+        )
     }
 }
 
@@ -1090,17 +1195,134 @@ mod tests {
         assert_eq!(resolved[1].label, "라이트");
     }
 
+    fn two_models() -> Vec<ResolvedModel> {
+        build_aliases(&[
+            FabrixModel {
+                model_id: "uuid-1".into(),
+                name: vec![LocalizedText {
+                    language_code: Some("en".into()),
+                    content: Some("Chat 4".into()),
+                }],
+                description: vec![],
+            },
+            FabrixModel {
+                model_id: "uuid-2".into(),
+                name: vec![LocalizedText {
+                    language_code: Some("en".into()),
+                    content: Some("Chat Lite".into()),
+                }],
+                description: vec![],
+            },
+        ])
+    }
+
+    /// 클라이언트가 열거형으로 파싱하는 값이라 규약 밖 값이 절대 나가면 안 됩니다.
     #[test]
-    fn unknown_model_falls_back_to_default() {
-        let models = build_aliases(&[FabrixModel {
-            model_id: "uuid-1".into(),
-            name: vec![LocalizedText { language_code: Some("en".into()), content: Some("Chat 4".into()) }],
-            description: vec![],
-        }]);
-        let hit = resolve_model(&models, Some("gpt-4o"), "fabrix-chat-4").unwrap();
-        assert_eq!(hit.model_id, "uuid-1");
-        // UUID 를 직접 보내도 통합니다.
-        assert_eq!(resolve_model(&models, Some("uuid-1"), "").unwrap().alias, "fabrix-chat-4");
+    fn clamp_never_leaks_a_non_openai_value() {
+        const LEGAL: &[&str] = &["stop", "length", "tool_calls", "content_filter", "function_call"];
+        for raw in [
+            Some("stop"),
+            Some("length"),
+            Some("tool_calls"),
+            Some("content_filter"),
+            Some("function_call"),
+            Some("weird"),
+            Some(""),
+            Some("   "),
+            Some("STOP"),
+            Some("사내값"),
+            None,
+        ] {
+            let out = clamp_finish_reason(raw);
+            assert!(LEGAL.contains(&out), "{raw:?} → {out}");
+        }
+        // 열거값은 그대로 통과합니다.
+        assert_eq!(clamp_finish_reason(Some("tool_calls")), "tool_calls");
+        assert_eq!(clamp_finish_reason(Some("content_filter")), "content_filter");
+        // 모르는 값과 없는 값은 stop.
+        assert_eq!(clamp_finish_reason(Some("weird")), "stop");
+        assert_eq!(clamp_finish_reason(None), "stop");
+    }
+
+    /// 중단은 `stop` 이 아닙니다 — 끊긴 답변을 완성된 것처럼 부르면 안 됩니다.
+    #[test]
+    fn abortish_values_clamp_to_length() {
+        for raw in ["abort", "aborted", "cancelled", "canceled", "error", "timeout", "incomplete"] {
+            assert_eq!(clamp_finish_reason(Some(raw)), "length", "{raw}");
+        }
+    }
+
+    /// 빈 답변을 200 으로 볼지 502 로 볼지 가르는 판단.
+    #[test]
+    fn looks_successful_distinguishes_an_empty_answer_from_garbage() {
+        let of = |raw: &str| {
+            serde_json::from_str::<FabrixChunk>(raw).unwrap().looks_successful()
+        };
+        // 성공 표지가 있으면 답변이 비어도 성공입니다.
+        assert!(of(r#"{"content":"","status":"SUCCESS"}"#));
+        assert!(of(r#"{"content":null,"finishReason":"stop"}"#));
+        assert!(of(r#"{"responseCode":"200"}"#));
+        // 표지가 하나도 없으면 우리가 못 알아본 본문입니다.
+        assert!(!of(r#"{}"#));
+        assert!(!of(r#"{"content":""}"#));
+        assert!(!of(r#"{"status":"   "}"#));
+        // 오류 표지가 있으면 성공이 아닙니다.
+        assert!(!of(r#"{"status":"ERROR","finishReason":"stop"}"#));
+    }
+
+    /// 다섯 변형 모두 합법 `type` + 우리 고유의 `code` 를 내야 합니다.
+    #[test]
+    fn every_error_variant_maps_to_a_legal_type_and_a_code() {
+        let cases = [
+            (FabrixError::NotConfigured, 503, "api_error", "not_configured"),
+            (FabrixError::Unreachable("t".into()), 502, "api_error", "upstream_unreachable"),
+            (FabrixError::Quota("q".into()), 429, "rate_limit_error", "rate_limit_exceeded"),
+            (
+                FabrixError::Upstream { status: 418, message: "teapot".into() },
+                418,
+                "invalid_request_error",
+                "upstream_error",
+            ),
+            (FabrixError::BadPayload("p".into()), 502, "api_error", "upstream_bad_response"),
+        ];
+        for (err, status, kind, code) in cases {
+            assert_eq!(err.status(), status, "{err:?}");
+            assert_eq!(err.code(), code, "{err:?}");
+            let env = err.envelope();
+            assert_eq!(env.error.kind, kind, "{err:?}");
+            assert_eq!(env.error.code.as_deref(), Some(code), "{err:?}");
+            // 사람이 읽는 메시지는 한국어 그대로 남습니다.
+            assert!(!env.error.message.is_empty());
+        }
+    }
+
+    #[test]
+    fn find_model_hits_by_uuid_alias_and_ignoring_case() {
+        let models = two_models();
+        assert_eq!(find_model(&models, "uuid-1").unwrap().alias, "fabrix-chat-4");
+        assert_eq!(find_model(&models, "fabrix-chat-lite").unwrap().model_id, "uuid-2");
+        assert_eq!(find_model(&models, "FABRIX-Chat-4").unwrap().model_id, "uuid-1");
+        // 앞뒤 공백은 다듬습니다.
+        assert_eq!(find_model(&models, "  fabrix-chat-4  ").unwrap().model_id, "uuid-1");
+    }
+
+    /// 이 함수의 존재 이유입니다 — 모르는 이름에 아무 모델도 돌려주지 않아야 합니다.
+    #[test]
+    fn find_model_never_falls_back() {
+        let models = two_models();
+        assert!(find_model(&models, "gpt-4o").is_none());
+        assert!(find_model(&models, "").is_none());
+        assert!(find_model(&models, "   ").is_none());
+    }
+
+    #[test]
+    fn default_model_prefers_the_configured_alias_then_the_first() {
+        let models = two_models();
+        assert_eq!(default_model(&models, "fabrix-chat-lite").unwrap().model_id, "uuid-2");
+        // 설정이 비었거나 목록에 없으면 첫 모델.
+        assert_eq!(default_model(&models, "").unwrap().model_id, "uuid-1");
+        assert_eq!(default_model(&models, "fabrix-nope").unwrap().model_id, "uuid-1");
+        assert!(default_model(&[], "fabrix-chat-4").is_none());
     }
 
     #[test]
@@ -1253,6 +1475,8 @@ mod tests {
     #[test]
     fn finish_reason_passes_unknown_values_through() {
         // 모르는 값을 "stop" 으로 지어내면 진짜 상태를 감추게 됩니다.
+        // 이 함수는 원문 보존용입니다 — 모르는 값을 그대로 넘깁니다.
+        // 와이어로 나가기 전에 `clamp_finish_reason` 이 접습니다.
         assert_eq!(map_finish_reason(Some("weird"), false).as_deref(), Some("weird"));
         assert_eq!(map_finish_reason(Some("   "), false), None);
         assert_eq!(map_finish_reason(None, false), None);

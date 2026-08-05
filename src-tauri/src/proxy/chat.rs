@@ -7,9 +7,9 @@ use std::collections::HashSet;
 use std::convert::Infallible;
 use std::time::{Duration, Instant};
 
-use axum::body::Bytes;
+use axum::body::Body;
 use axum::extract::State;
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, HeaderValue};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -25,12 +25,18 @@ use crate::openai::{
 use crate::state::{self, Shared};
 
 use super::fabrix::{
-    extract_object, fold_messages, map_finish_reason, resolve_model, FabrixChunk, FabrixError,
+    clamp_finish_reason, default_model, extract_object, find_model, fold_messages,
+    map_finish_reason, FabrixChunk, FabrixError,
     LlmConfig, MessagesRequest, ResolvedModel, StreamDecoder, StreamEvent, MESSAGES_PATH,
 };
 use super::models::ensure_models;
 use super::tools::{self, ToolCallScanner};
-use super::{authorize, error_response, fabrix_headers_line, pretty};
+use super::usage;
+use super::validate;
+use super::{
+    authorize, error_response, fabrix_headers_line, openai_type, pretty, read_body,
+    CHAT_BODY_LIMIT,
+};
 
 /// 로그 한 건을 조립하는 데 필요한 것들. 스트리밍 제너레이터 안으로 통째로
 /// 옮겨가므로 소유 값만 담습니다.
@@ -50,7 +56,25 @@ struct Ctx {
     tools_declared: usize,
     /// 그 도구를 규약으로 접어 실제로 보냈는가(설정으로 끌 수 있습니다).
     tools_emulated: bool,
+    /// 검증을 통과한 요청에서 뽑아낸 실행 계획 — 무시한 필드와 버린 이미지 파트를
+    /// 로그 ③ 칸까지 들고 갑니다.
+    plan: validate::Plan,
+    /// `model` 을 아예 안 보내 기본 모델로 처리했는가. 없는 이름을 보낸 것과 구분해야
+    /// 하므로(그건 이제 404 입니다) 따로 들고 있습니다.
+    model_defaulted: bool,
+    /// 실제로 사내에 보낸 프롬프트 전문(systemPrompt + contents).
+    ///
+    /// 클라이언트의 `messages` 가 아니라 이걸로 토큰을 추정합니다 — 모델이 실제로 본
+    /// 글이 이것이고, 주입된 도구 규약까지 포함해야 값이 맞습니다.
+    prompt_text: String,
 }
+
+/// 스트림이 중간에 끊겼을 때 마지막 청크에 넣는 `finish_reason`.
+///
+/// `stop` 은 쓰지 않습니다 — 끊긴 답변을 완성된 것처럼 부르는 거짓말이 됩니다
+/// (`d550bc4` 의 "절단은 length" 와 같은 판단). 이 값을 보고 자동으로 이어받기를
+/// 시도하는 클라이언트가 있다는 것이 대가입니다. 뒤집으려면 이 한 줄만 고치면 됩니다.
+const MIDSTREAM_FINISH: &str = "length";
 
 /// 로그 꼬리에 붙일 도구 관련 한 줄.
 ///
@@ -73,6 +97,69 @@ fn tool_meta(declared: usize, emulated: bool, calls: u32, rejects: u32) -> Optio
     Some(line)
 }
 
+/// 본문이 상한을 넘어 `Ctx` 를 만들기도 전에 끝난 호출의 로그 한 건.
+///
+/// 지금까지 이 실패는 axum 이 핸들러 밖에서 처리해 **로그에 흔적이 없었습니다**.
+/// 사용자에게는 원인 없는 실패였습니다.
+fn oversize_entry(
+    started: Instant,
+    client: Option<String>,
+    cfg: &crate::config::Config,
+    envelope: &ErrorEnvelope,
+) -> LogEntry {
+    LogEntry {
+        id: Uuid::new_v4().to_string(),
+        ts: state::now_hm(),
+        ts_full: state::now_iso(),
+        kind: Kind::Chat,
+        method: Kind::Chat.method(),
+        path: Kind::Chat.path().into(),
+        status: 413,
+        latency_ms: started.elapsed().as_millis() as u64,
+        stream: false,
+        cached: false,
+        model_requested: None,
+        model_alias: None,
+        model_id: None,
+        model_label: None,
+        client,
+        note: Some("본문이 너무 큼".into()),
+        summary: Some("본문이 너무 큼".into()),
+        is_error: true,
+        req_openai: "(본문이 상한을 넘어 읽지 않았습니다)".into(),
+        req_fabrix: "(사내 호출을 하지 않았습니다)".into(),
+        req_fabrix_headers: fabrix_headers_line(cfg),
+        fabrix_url: format!("{}{MESSAGES_PATH}", cfg.normalized_base_url()),
+        resp_body: envelope.error.message.clone(),
+        resp_meta: "거부 · HTTP 413".into(),
+    }
+}
+
+/// 로그 꼬리에 붙일 "반영하지 못한 것" 줄들.
+///
+/// 조용히 버리는 것과 버렸다고 말하는 것의 차이가 이 함수의 존재 이유입니다 —
+/// `tool_meta` 가 "도구를 버렸다"와 "모델이 안 썼다"를 가르는 것과 같은 이유입니다.
+fn plan_meta(ctx: &Ctx) -> Vec<String> {
+    let plan = &ctx.plan;
+    let mut out = Vec::new();
+    if ctx.model_defaulted {
+        out.push("model 미지정 → 기본 모델".to_string());
+    }
+    if !plan.ignored.is_empty() {
+        out.push(format!("무시된 파라미터: {}", plan.ignored.join(" · ")));
+    }
+    if plan.images_dropped > 0 {
+        out.push(format!(
+            "이미지 파트 {}개는 사내 채팅 API 가 받지 못해 버렸습니다",
+            plan.images_dropped
+        ));
+    }
+    if !plan.unknown.is_empty() {
+        out.push(format!("스펙에 없는 키: {}", plan.unknown.join(" · ")));
+    }
+    out
+}
+
 impl Ctx {
     #[allow(clippy::too_many_arguments)]
     fn entry(
@@ -90,7 +177,7 @@ impl Ctx {
             ts_full: state::now_iso(),
             kind: Kind::Chat,
             method: Kind::Chat.method(),
-            path: Kind::Chat.path(),
+            path: Kind::Chat.path().into(),
             status,
             latency_ms: self.started.elapsed().as_millis() as u64,
             stream: self.stream,
@@ -134,11 +221,22 @@ impl Ctx {
     }
 }
 
-pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
+pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Body) -> Response {
     let started = Instant::now();
     let cfg = state.config();
 
     let ua = headers.get("user-agent").and_then(|v| v.to_str().ok());
+    let client = logstore::short_client(ua);
+
+    // 본문 상한을 우리가 겁니다 — 레이어에 맡기면 초과가 로그에 남지 않습니다.
+    let body = match read_body(&headers, body, CHAT_BODY_LIMIT).await {
+        Ok(bytes) => bytes,
+        Err(envelope) => {
+            state.record(oversize_entry(started, client, &cfg, &envelope));
+            return error_response(413, envelope);
+        }
+    };
+
     // 인바운드 Authorization: 키발급없이 허용 모드면 값과 무관하게 통과,
     // 토큰 사용 모드면 발행 토큰과 일치할 때만 통과합니다. (아래 authorize 에서 검사)
     let incoming: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
@@ -146,7 +244,7 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Bytes
     let mut ctx = Ctx {
         started,
         stream: false,
-        client: logstore::short_client(ua),
+        client,
         model_requested: None,
         model_alias: None,
         model_id: None,
@@ -161,6 +259,9 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Bytes
         fabrix_url: format!("{}{MESSAGES_PATH}", cfg.normalized_base_url()),
         tools_declared: 0,
         tools_emulated: false,
+        plan: validate::Plan::default(),
+        model_defaulted: false,
+        prompt_text: String::new(),
     };
 
     // ── 토큰 검증 ───────────────────────────────────────────
@@ -181,20 +282,49 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Bytes
     let req: ChatRequest = match serde_json::from_slice(&body) {
         Ok(req) => req,
         Err(err) => {
-            let msg = format!("요청 본문을 해석하지 못했습니다: {err}");
+            // 응답에는 위치만 알려 줍니다. serde 의 원문에는 파싱하다 만 **요청 본문
+            // 조각**이 섞여 나올 수 있어, 그대로 되돌려주면 클라이언트 로그로 흘러갑니다.
+            // 진단에 필요한 전문은 로그 ③ 칸에만 담습니다.
+            let msg = format!(
+                "요청 본문을 JSON 으로 해석하지 못했습니다 (line {}, column {}).",
+                err.line(),
+                err.column()
+            );
             state.record(ctx.entry(
                 400,
                 true,
                 Some("잘못된 요청".into()),
                 Some("잘못된 요청".into()),
-                msg.clone(),
+                format!("{msg}\n\n{err}"),
                 "요청 파싱 실패".into(),
             ));
-            return error_response(400, ErrorEnvelope::new(msg, "invalid_request_error", None));
+            return error_response(
+                400,
+                ErrorEnvelope::new(msg, openai_type(400), Some("invalid_json".into())),
+            );
         }
     };
     ctx.stream = req.is_stream();
     ctx.model_requested = req.model.clone();
+
+    // ── 요청 검증 ───────────────────────────────────────────
+    // 규약 위반은 **사내 호출 전에** 걸러냅니다. 잘못된 요청이 사내 쿼터를 쓰거나
+    // 사내 서버에 도달할 이유가 없습니다.
+    let plan = match validate::plan(&req, &incoming) {
+        Ok(plan) => plan,
+        Err(invalid) => {
+            state.record(ctx.entry(
+                invalid.status,
+                true,
+                Some(invalid.note()),
+                Some(invalid.note()),
+                invalid.message.clone(),
+                format!("요청 검증 실패 · HTTP {}", invalid.status),
+            ));
+            return error_response(invalid.status, invalid.envelope());
+        }
+    };
+    ctx.plan = plan.clone();
 
     // ── 모델 해석 ───────────────────────────────────────────
     let models = match ensure_models(&state).await {
@@ -212,25 +342,50 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Bytes
                     state.record(ctx.fail(&err));
                     return error_response(
                         err.status(),
-                        ErrorEnvelope::new(err.message(), err.kind(), None),
+                        err.envelope(),
                     );
                 }
             }
         }
     };
 
-    let Some(model) = resolve_model(&models, req.model.as_deref(), &cfg.default_model_alias) else {
-        let msg = "사내 모델 목록이 비어 있어 요청을 보낼 수 없습니다.".to_string();
+    // 요청한 이름이 실제로 있는가. **폴백하지 않습니다** — 예전에는 없는 이름을
+    // 조용히 기본 모델로 바꿔 주어, 오타가 성공처럼 보였습니다. 그 조용한 실패가
+    // 규약 위반보다 나쁩니다.
+    let requested = req.model.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let resolved = match requested {
+        Some(name) => find_model(&models, name),
+        // `model` 을 아예 안 보낸 요청에는 설정의 기본 모델을 씁니다.
+        None => default_model(&models, &cfg.default_model_alias),
+    };
+
+    let Some(model) = resolved else {
+        // 404 문구는 `/v1/models/{id}` 와 **같은 함수**를 씁니다 — 두 경로에서 다른 말을
+        // 하면 사용자가 원인을 두 번 찾습니다.
+        let (status, envelope) = match requested {
+            Some(name) => (404, super::models::not_found_envelope(name)),
+            None => (
+                502,
+                ErrorEnvelope::new(
+                    "사내 모델 목록이 비어 있어 요청을 보낼 수 없습니다.",
+                    openai_type(502),
+                    Some("upstream_bad_response".into()),
+                ),
+            ),
+        };
         state.record(ctx.entry(
-            502,
+            status,
             true,
             Some("모델 없음".into()),
             Some("모델 없음".into()),
-            msg.clone(),
-            "실패 · 모델 목록 없음".into(),
+            envelope.error.message.clone(),
+            format!("실패 · HTTP {status} · 모델 없음"),
         ));
-        return error_response(502, ErrorEnvelope::new(msg, "upstream_error", None));
+        return error_response(status, envelope);
     };
+    if requested.is_none() {
+        ctx.model_defaulted = true;
+    }
     ctx.model_alias = Some(model.alias.clone());
     ctx.model_id = Some(model.model_id.clone());
     ctx.model_label = Some(model.label.clone());
@@ -274,7 +429,11 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Bytes
                 msg.clone(),
                 "요청 검증 실패".into(),
             ));
-            return error_response(400, ErrorEnvelope::new(msg, "invalid_request_error", None));
+            return error_response(
+                400,
+                ErrorEnvelope::new(msg, openai_type(400), Some("invalid_value".into()))
+                    .with_param("messages"),
+            );
         }
     }
 
@@ -286,18 +445,27 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Bytes
         llm_config: LlmConfig::from_request(&req),
     };
     ctx.req_fabrix = serde_json::to_string_pretty(&payload).unwrap_or_default();
+    // 토큰 추정의 입력 — 클라이언트가 보낸 messages 가 아니라 **모델이 실제로 본 글**
+    // 입니다(주입된 도구 규약 포함).
+    ctx.prompt_text = payload
+        .system_prompt
+        .iter()
+        .map(String::as_str)
+        .chain(payload.contents.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join("\n\n");
 
     let Some(client) = state.fabrix_client() else {
         let err = FabrixError::NotConfigured;
         state.record(ctx.fail(&err));
-        return error_response(err.status(), ErrorEnvelope::new(err.message(), err.kind(), None));
+        return error_response(err.status(), err.envelope());
     };
 
     let res = match client.messages(&payload).await {
         Ok(res) => res,
         Err(err) => {
             state.record(ctx.fail(&err));
-            return error_response(err.status(), ErrorEnvelope::new(err.message(), err.kind(), None));
+            return error_response(err.status(), err.envelope());
         }
     };
 
@@ -315,10 +483,15 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Bytes
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| model.alias.clone());
+
+    // 지문은 **실제로 나간** modelId 로 만듭니다 — echo 되는 이름이 아니라 답한 모델이
+    // 무엇인지가 이 필드의 뜻입니다.
+    let fingerprint = Some(super::system_fingerprint(&payload.model_ids[0]));
+
     if payload.is_stream {
-        stream_response(state, ctx, res, echo_model, tool_names)
+        stream_response(state, ctx, res, echo_model, tool_names, fingerprint, plan.include_usage)
     } else {
-        collect_response(state, ctx, res, echo_model, tool_names).await
+        collect_response(state, ctx, res, echo_model, tool_names, fingerprint).await
     }
 }
 
@@ -379,6 +552,25 @@ fn scan_events(
         .collect()
 }
 
+/// `scan_events` + 생성 텍스트 누적. 토큰 추정의 completion 쪽 입력을 모으기 위한
+/// 것으로, 산문뿐 아니라 도구 호출 이름·인자까지 더합니다 — 그것도 모델이 만든
+/// 토큰이라, 빼면 도구를 쓰는 요청의 출력이 통째로 0 이 됩니다.
+fn scan_events_counting(
+    id: &str,
+    created: i64,
+    model: &str,
+    out: tools::ScanOut,
+    sent_role: &mut bool,
+    generated: &mut String,
+) -> Vec<Event> {
+    generated.push_str(&out.text);
+    for call in &out.calls {
+        generated.push_str(&call.name);
+        generated.push_str(&call.arguments);
+    }
+    scan_events(id, created, model, out, sent_role)
+}
+
 /// 스트리밍 한 건의 로그를 `Drop` 에서 남깁니다.
 ///
 /// 클라이언트가 도중에 연결을 끊으면 제너레이터가 통째로 버려지므로, 마지막
@@ -397,6 +589,13 @@ struct StreamLog {
     drained: bool,
     tool_calls: u32,
     tool_rejects: u32,
+    /// 실제로 클라이언트에 내보낸 `finish_reason`. 상위가 준 원문(`finish`)과 다를 수
+    /// 있고, 그 차이가 로그에 보여야 합니다.
+    emitted_finish: Option<&'static str>,
+    /// 도구 호출 인자까지 더한 생성 텍스트 — 토큰 추정의 completion 쪽 입력.
+    generated: String,
+    /// 이 스트림에서 계산한 usage. 로그 꼬리 한 줄에 씁니다.
+    counted: Option<usage::Counted>,
 }
 
 impl Drop for StreamLog {
@@ -408,13 +607,23 @@ impl Drop for StreamLog {
         if let Some(first) = self.first_token {
             meta.push(format!("첫 토큰 {:.1}s", first.as_secs_f64()));
         }
-        meta.push(format!(
-            "finish_reason: {}",
-            self.finish.clone().unwrap_or_else(|| if aborted { "abort".into() } else { "stop".into() })
-        ));
+        let emitted = self
+            .emitted_finish
+            .unwrap_or(if aborted { "(없음 · 클라이언트가 끊음)" } else { "stop" });
+        meta.push(match self.finish.as_deref() {
+            // 상위가 준 값이 그대로 안 나갔으면 원문을 함께 적습니다 — 준수와 진단을
+            // 동시에 만족시키는 자리입니다.
+            Some(raw) if raw != emitted => format!("finish_reason: {emitted} (사내: {raw})"),
+            _ => format!("finish_reason: {emitted}"),
+        });
         meta.push(format!("SSE {}프레임", self.frames));
         meta.push(format!("{}자", text.chars().count()));
-        meta.push("사내 응답에 토큰 수 없음".into());
+        meta.push(match &self.counted {
+            Some(counted) => usage::meta_line(counted),
+            // include_usage 를 안 켠 스트림은 usage 를 계산하지 않습니다 — 규약대로
+            // 청크를 안 보내므로 지어낸 숫자를 로그에만 남길 이유가 없습니다.
+            None => "usage 미계산 (stream_options.include_usage 를 켜면 계산합니다)".to_string(),
+        });
         if let Some(line) = tool_meta(
             self.ctx.tools_declared,
             self.ctx.tools_emulated,
@@ -423,6 +632,7 @@ impl Drop for StreamLog {
         ) {
             meta.push(line);
         }
+        meta.extend(plan_meta(&self.ctx));
 
         let note = match (aborted, self.failure.is_some()) {
             (true, _) => Some("클라이언트가 연결을 끊음".to_string()),
@@ -469,6 +679,8 @@ fn stream_response(
     res: reqwest::Response,
     model: String,
     tool_names: HashSet<String>,
+    fingerprint: Option<String>,
+    include_usage: bool,
 ) -> Response {
     let id = format!("chatcmpl-{}", Uuid::new_v4().simple());
     let created = state::epoch_secs();
@@ -488,10 +700,19 @@ fn stream_response(
             drained: false,
             tool_calls: 0,
             tool_rejects: 0,
+            emitted_finish: None,
+            generated: String::new(),
+            counted: None,
         };
 
         let mut bytes = res.bytes_stream();
-        let mut sent_role = false;
+
+        // OpenAI 처럼 롤만 담은 청크를 **맨 앞에** 하나 흘립니다. 이후 청크에는 role 을
+        // 넣지 않으므로 `sent_role` 은 참으로 시작합니다.
+        yield Ok::<Event, Infallible>(sse_json(&ChatChunk::opening(
+            &id, created, &model, fingerprint.clone(),
+        )));
+        let mut sent_role = true;
 
         'pump: loop {
             let Some(item) = bytes.next().await else { break };
@@ -510,8 +731,10 @@ fn stream_response(
                         let started = log.ctx.started;
                         log.first_token.get_or_insert_with(|| started.elapsed());
                         let out = scanner.push(&text);
-                        for event in scan_events(&id, created, &model, out, &mut sent_role) {
-                            yield Ok::<Event, Infallible>(event);
+                        for event in scan_events_counting(
+                            &id, created, &model, out, &mut sent_role, &mut log.generated,
+                        ) {
+                            yield Ok(event);
                         }
                     }
                     StreamEvent::Reasoning(text) => {
@@ -542,7 +765,9 @@ fn stream_response(
                     let started = log.ctx.started;
                     log.first_token.get_or_insert_with(|| started.elapsed());
                     let out = scanner.push(&text);
-                    for event in scan_events(&id, created, &model, out, &mut sent_role) {
+                    for event in scan_events_counting(
+                        &id, created, &model, out, &mut sent_role, &mut log.generated,
+                    ) {
                         yield Ok(event);
                     }
                 }
@@ -562,7 +787,9 @@ fn stream_response(
             }
         }
         // 스캐너가 붙들고 있던 미완성 꼬리를 흘려보냅니다 — 절대 버리지 않습니다.
-        for event in scan_events(&id, created, &model, scanner.finish(), &mut sent_role) {
+        for event in scan_events_counting(
+            &id, created, &model, scanner.finish(), &mut sent_role, &mut log.generated,
+        ) {
             yield Ok(event);
         }
         log.drained = true;
@@ -570,25 +797,60 @@ fn stream_response(
         log.tool_rejects = scanner.rejected;
 
         if let Some(msg) = log.failure.clone() {
-            yield Ok(sse_json(&ErrorEnvelope::new(msg, "upstream_error", None)));
+            yield Ok(sse_json(&ErrorEnvelope::new(msg, openai_type(502), Some("upstream_error".into()))));
+            // 오류 프레임 뒤에도 finish 청크를 넣습니다 — 없으면 종료 사유를 기다리는
+            // 클라이언트가 [DONE] 을 받고도 스트림을 미완으로 남깁니다.
+            log.emitted_finish = Some(MIDSTREAM_FINISH);
+            yield Ok(sse_json(&ChatChunk::new(
+                &id, created, &model, Delta::default(), Some(MIDSTREAM_FINISH.into()),
+            ).with_fingerprint(fingerprint.clone())));
         } else {
             // 도구 호출이 하나라도 나왔으면 그 사실이 상위 사유보다 우선합니다 —
             // 클라이언트는 이 값으로 에이전트 루프를 계속할지 정합니다. 그다음이
             // 절단(length), 마지막이 상위가 준 사유입니다.
             let reason = if scanner.saw_call() {
-                "tool_calls".to_string()
+                "tool_calls"
             } else {
-                map_finish_reason(log.finish.as_deref(), log.decoder.truncated)
-                    .unwrap_or_else(|| "stop".into())
+                // 상위가 모르는 값을 줬어도 와이어에는 열거값만 나갑니다.
+                clamp_finish_reason(
+                    map_finish_reason(log.finish.as_deref(), log.decoder.truncated).as_deref(),
+                )
             };
-            yield Ok(sse_json(&ChatChunk::new(&id, created, &model, Delta::default(), Some(reason))));
+            log.emitted_finish = Some(reason);
+            yield Ok(sse_json(&ChatChunk::new(
+                &id, created, &model, Delta::default(), Some(reason.into()),
+            ).with_fingerprint(fingerprint.clone())));
+        }
+        // 규약 순서: finish 청크 → usage 청크(choices: []) → [DONE].
+        // 클라이언트가 include_usage 로 **명시적으로 옵트인**했을 때만 보냅니다.
+        if include_usage {
+            let counted = usage::build(
+                log.decoder.upstream_tokens,
+                &log.ctx.prompt_text,
+                &log.generated,
+            );
+            yield Ok(sse_json(&ChatChunk::usage_only(
+                &id, created, &model, counted.usage.clone(),
+            )));
+            log.counted = Some(counted);
         }
         yield Ok(Event::default().data("[DONE]"));
     };
 
     // keep-alive 주석은 붙이지 않습니다 — 로컬호스트에는 중간 프록시가 없고,
     // 일부 OpenAI 호환 클라이언트가 주석 프레임을 다루지 못합니다.
-    Sse::new(body).into_response()
+    let mut response = Sse::new(body).into_response();
+    if include_usage {
+        // 헤더는 첫 바이트와 함께 나가므로 스트림이 끝나기 전에 정해야 합니다.
+        // 사내가 토큰 수를 주기 시작하면 이 값이 `upstream` 이 되어야 하지만, 그건
+        // 마지막 프레임을 읽어야 알 수 있어 여기서는 추정으로 표기합니다 — 실제 출처는
+        // 로그 ③ 칸 꼬리가 정확히 말합니다.
+        response.headers_mut().insert(
+            "x-fabrix-usage",
+            HeaderValue::from_static(usage::Source::Estimated.header_value()),
+        );
+    }
+    response
 }
 
 /// 비스트리밍 응답을 `chat.completion` 하나로 조립합니다.
@@ -598,13 +860,14 @@ async fn collect_response(
     res: reqwest::Response,
     model: String,
     tool_names: HashSet<String>,
+    fingerprint: Option<String>,
 ) -> Response {
     let raw = match res.text().await {
         Ok(text) => text,
         Err(err) => {
             let err = FabrixError::from(err);
             state.record(ctx.fail(&err));
-            return error_response(err.status(), ErrorEnvelope::new(err.message(), err.kind(), None));
+            return error_response(err.status(), err.envelope());
         }
     };
 
@@ -617,7 +880,7 @@ async fn collect_response(
                 state.record(ctx.fail(&err));
                 return error_response(
                     err.status(),
-                    ErrorEnvelope::new(err.message(), err.kind(), None),
+                    err.envelope(),
                 );
             }
             // content 가 비어도 플러그인/RAG 답변이 contentReferences 등에 올 수 있어 폴백합니다.
@@ -630,7 +893,7 @@ async fn collect_response(
                     state.record(ctx.fail(&err));
                     return error_response(
                         err.status(),
-                        ErrorEnvelope::new(err.message(), err.kind(), None),
+                        err.envelope(),
                     );
                 }
             }
@@ -638,6 +901,8 @@ async fn collect_response(
                 content,
                 reasoning,
                 truncated: chunk.truncated == Some(true),
+                looks_successful: chunk.looks_successful(),
+                upstream_tokens: chunk.upstream_tokens(),
                 finish: chunk.finish_reason,
                 via_stream_decoder: false,
             }
@@ -652,6 +917,9 @@ async fn collect_response(
                 reasoning: Some(decoder.reasoning().to_string()).filter(|s| !s.is_empty()),
                 finish: decoder.finish_reason.clone(),
                 truncated: decoder.truncated,
+                // 스트림 디코더까지 태워 프레임을 읽어 냈다면 응답 자체는 성립했습니다.
+                looks_successful: decoder.finish_reason.is_some(),
+                upstream_tokens: decoder.upstream_tokens,
                 via_stream_decoder: true,
             }
         }
@@ -666,18 +934,31 @@ async fn collect_response(
     let has_calls = !scanned.calls.is_empty();
 
     // 도구 호출만 있고 산문이 없는 답변은 정상입니다 — 빈 응답으로 502 내면 안 됩니다.
-    if parsed.content.is_empty() && parsed.reasoning.is_none() && !has_calls {
+    //
+    // 답변이 정말 비었을 때도 상위 응답에 성공 표지가 있으면 200 + `content: ""` 입니다.
+    // 모델이 짧은 max_tokens 등으로 빈 답을 줄 수 있고, 그걸 502 로 부르면 사내 잘못이
+    // 아닌 것을 사내 오류로 보고하는 셈입니다. 아무 표지도 없으면 애초에 우리가 못
+    // 알아본 본문이라 502 가 맞습니다.
+    let empty = parsed.content.is_empty() && parsed.reasoning.is_none() && !has_calls;
+    if empty && !parsed.looks_successful {
         let err = FabrixError::BadPayload(format!("본문 앞부분: {}", logstore::preview(&raw, 200)));
         state.record(ctx.fail(&err));
-        return error_response(err.status(), ErrorEnvelope::new(err.message(), err.kind(), None));
+        return error_response(err.status(), err.envelope());
     }
 
     let reason = if has_calls {
-        "tool_calls".to_string()
+        "tool_calls"
     } else {
-        map_finish_reason(parsed.finish.as_deref(), parsed.truncated)
-            .unwrap_or_else(|| "stop".into())
+        // 상위가 모르는 값을 줬어도 와이어에는 열거값만 나갑니다.
+        clamp_finish_reason(
+            map_finish_reason(parsed.finish.as_deref(), parsed.truncated).as_deref(),
+        )
     };
+    // 비스트림 응답에는 `usage` 를 **항상** 채웁니다 — 규약이 요구하는 필드입니다.
+    // 사내가 실측을 주지 않으므로 추정치이고, 추정임은 헤더·로그·README 가 말합니다.
+    let answer_for_usage = completion_text_for_usage(&parsed.content, &scanned);
+    let counted = usage::build(parsed.upstream_tokens, &ctx.prompt_text, &answer_for_usage);
+
     let completion = ChatCompletion {
         id: format!("chatcmpl-{}", Uuid::new_v4().simple()),
         object: "chat.completion",
@@ -687,26 +968,25 @@ async fn collect_response(
             index: 0,
             message: AssistantMessage {
                 role: "assistant",
-                // 도구 호출만 있는 턴은 `content: null` 이 규약입니다.
-                content: if has_calls {
-                    Some(scanned.text.clone()).filter(|s| !s.trim().is_empty())
-                } else {
-                    Some(parsed.content.clone())
-                },
+                content: assistant_content(&scanned.text, &parsed.content, has_calls),
                 reasoning_content: parsed.reasoning.clone(),
                 tool_calls: has_calls
                     .then(|| scanned.calls.iter().map(ToolCall::from).collect()),
             },
-            finish_reason: Some(reason.clone()),
+            finish_reason: Some(reason.to_string()),
+            logprobs: None,
         }],
-        // FabriX 가 토큰 수를 주지 않으므로 추정치를 지어내지 않고 생략합니다.
-        usage: None,
+        usage: Some(counted.usage.clone()),
+        system_fingerprint: fingerprint,
     };
 
     let mut meta = vec![
-        format!("finish_reason: {reason}"),
+        match parsed.finish.as_deref() {
+            Some(raw) if raw != reason => format!("finish_reason: {reason} (사내: {raw})"),
+            _ => format!("finish_reason: {reason}"),
+        },
         format!("{}자", parsed.content.chars().count()),
-        "사내 응답에 토큰 수 없음".to_string(),
+        usage::meta_line(&counted),
     ];
     if parsed.via_stream_decoder {
         meta.push("SSE 본문을 합쳐 해석".into());
@@ -719,6 +999,7 @@ async fn collect_response(
     ) {
         meta.push(line);
     }
+    meta.extend(plan_meta(&ctx));
 
     let note = (ctx.tools_emulated && !has_calls).then(|| "도구 미사용".to_string());
 
@@ -733,7 +1014,22 @@ async fn collect_response(
         meta.join(" · "),
     ));
 
-    Json(completion).into_response()
+    let mut response = Json(completion).into_response();
+    response
+        .headers_mut()
+        .insert("x-fabrix-usage", HeaderValue::from_static(counted.source.header_value()));
+    response
+}
+
+/// usage 의 completion 쪽 입력 — 산문에 도구 호출 `arguments` 까지 더합니다.
+/// 그것도 모델이 생성한 토큰이라, 빼면 도구를 쓰는 요청의 출력이 통째로 0 이 됩니다.
+fn completion_text_for_usage(content: &str, scanned: &tools::ScanOut) -> String {
+    let mut out = String::from(content);
+    for call in &scanned.calls {
+        out.push_str(&call.name);
+        out.push_str(&call.arguments);
+    }
+    out
 }
 
 struct Parsed {
@@ -741,7 +1037,24 @@ struct Parsed {
     reasoning: Option<String>,
     finish: Option<String>,
     truncated: bool,
+    /// 상위 응답이 성공 표지를 가졌는가 — 빈 답변을 200 으로 볼지 502 로 볼지 가릅니다.
+    looks_successful: bool,
+    /// 사내가 준 토큰 수. 오늘은 항상 `None` 입니다.
+    upstream_tokens: Option<(u32, u32)>,
     via_stream_decoder: bool,
+}
+
+/// `message.content` 의 null / 빈 문자열 규칙을 한 곳에 못박습니다.
+///
+/// 도구 호출만 있는 턴은 `null` 이 규약입니다. 그 밖에는 빈 문자열이라도 **문자열**
+/// 입니다 — 모델이 정말 빈 답을 준 경우가 `content: ""` 이고, 그걸 null 로 바꾸면
+/// 도구 호출 턴과 구분되지 않습니다.
+fn assistant_content(scanned_text: &str, full_text: &str, has_calls: bool) -> Option<String> {
+    if has_calls {
+        Some(scanned_text.to_string()).filter(|s| !s.trim().is_empty())
+    } else {
+        Some(full_text.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -774,6 +1087,80 @@ mod tests {
         let line = tool_meta(3, true, 1, 2).unwrap();
         assert!(line.contains("호출 1건"), "{line}");
         assert!(line.contains("형식 오류 2건"), "{line}");
+    }
+
+    fn ctx_with(plan: validate::Plan, model_defaulted: bool) -> Ctx {
+        Ctx {
+            started: Instant::now(),
+            stream: false,
+            client: None,
+            model_requested: None,
+            model_alias: None,
+            model_id: None,
+            model_label: None,
+            req_openai: String::new(),
+            req_fabrix: String::new(),
+            req_fabrix_headers: String::new(),
+            fabrix_url: String::new(),
+            tools_declared: 0,
+            tools_emulated: false,
+            plan,
+            model_defaulted,
+            prompt_text: String::new(),
+        }
+    }
+
+    #[test]
+    fn plan_meta_is_silent_for_a_plain_request() {
+        assert!(plan_meta(&ctx_with(validate::Plan::default(), false)).is_empty());
+    }
+
+    #[test]
+    fn plan_meta_names_what_was_not_honored() {
+        let plan = validate::Plan {
+            include_usage: false,
+            images_dropped: 2,
+            ignored: vec!["stop", "presence_penalty"],
+            unknown: vec!["래빗홀".into()],
+        };
+        let lines = plan_meta(&ctx_with(plan, true));
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[0], "model 미지정 → 기본 모델");
+        assert_eq!(lines[1], "무시된 파라미터: stop · presence_penalty");
+        assert!(lines[2].contains("이미지 파트 2개"), "{}", lines[2]);
+        assert!(lines[3].contains("래빗홀"), "{}", lines[3]);
+    }
+
+    /// 도구 호출만 있는 턴만 `null` 입니다. 빈 답변은 `""` 로 남아야 도구 턴과
+    /// 구분됩니다.
+    #[test]
+    fn assistant_content_is_null_only_for_tool_only_turns() {
+        assert_eq!(assistant_content("", "", true), None);
+        assert_eq!(assistant_content("   ", "", true), None);
+        assert_eq!(assistant_content("만들겠습니다", "만들겠습니다\n<tool_call>…", true).as_deref(), Some("만들겠습니다"));
+        // 도구가 없으면 빈 문자열도 문자열입니다.
+        assert_eq!(assistant_content("", "", false).as_deref(), Some(""));
+        assert_eq!(assistant_content("", "안녕", false).as_deref(), Some("안녕"));
+    }
+
+    /// 도구 호출 인자도 모델이 생성한 토큰입니다 — 빼면 도구를 쓰는 요청의 출력이
+    /// 통째로 0 이 됩니다.
+    #[test]
+    fn usage_counts_tool_call_arguments_as_output() {
+        let scanned = tools::ScanOut {
+            text: "만들겠습니다.".into(),
+            calls: vec![call(0, "write", r#"{"filePath":"index.html"}"#)],
+        };
+        let counted = completion_text_for_usage("만들겠습니다.", &scanned);
+        assert!(counted.contains("만들겠습니다."), "{counted}");
+        assert!(counted.contains("write"), "{counted}");
+        assert!(counted.contains("index.html"), "{counted}");
+
+        // 도구가 없으면 산문 그대로입니다.
+        assert_eq!(
+            completion_text_for_usage("안녕", &tools::ScanOut::default()),
+            "안녕"
+        );
     }
 
     // ── 클라이언트가 실제로 보는 청크 ──

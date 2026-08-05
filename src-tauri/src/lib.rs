@@ -25,7 +25,6 @@ pub fn run() {
             commands::clear_logs,
             commands::check_port,
             commands::test_connection,
-            commands::list_models,
             commands::save_config,
             commands::issue_token,
             commands::start_proxy,
@@ -35,6 +34,10 @@ pub fn run() {
             commands::open_log_window,
             commands::open_main_window,
             commands::quit_app,
+            commands::list_models,
+            commands::set_default_model,
+            commands::open_models_window,
+            commands::open_settings_window,
         ])
         .setup(|app| {
             let handle = app.handle().clone();

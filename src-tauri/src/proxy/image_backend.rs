@@ -69,11 +69,23 @@ impl ImageError {
         }
     }
 
-    pub fn kind(&self) -> &'static str {
+    /// 기계가 분기하는 값. `type` 은 상태 코드에서 유도됩니다(`proxy::openai_type`)
+    /// — 예전 `kind()` 가 `type` 자리에 넣던 비표준 `not_implemented` 가 여기로 왔습니다.
+    pub fn code(&self) -> &'static str {
         match self {
-            ImageError::BadRequest(_) => "invalid_request_error",
-            ImageError::Backend(inner) => inner.kind(),
+            // `NotImplemented` 변형은 사라졌습니다 — 이미지 업스트림이 실제로 붙었으므로
+            // 더 이상 501 을 낼 일이 없습니다.
+            ImageError::BadRequest(_) => "invalid_value",
+            ImageError::Backend(inner) => inner.code(),
         }
+    }
+
+    pub fn envelope(&self) -> crate::openai::ErrorEnvelope {
+        crate::openai::ErrorEnvelope::new(
+            self.message(),
+            crate::proxy::openai_type(self.status()),
+            Some(self.code().to_string()),
+        )
     }
 }
 
@@ -331,10 +343,26 @@ mod tests {
         assert_eq!(ImageError::Backend(FabrixError::NotConfigured).status(), 503);
     }
 
+    /// `type` 은 상태 코드에서 유도되므로(`proxy::openai_type`) 여기서 보는 것은 `code` 입니다.
     #[test]
-    fn image_error_kind() {
-        assert_eq!(ImageError::BadRequest("x".into()).kind(), "invalid_request_error");
-        assert_eq!(ImageError::Backend(FabrixError::Quota("q".into())).kind(), "rate_limit_error");
+    fn image_error_code_and_envelope_type() {
+        assert_eq!(ImageError::BadRequest("x".into()).code(), "invalid_value");
+        assert_eq!(
+            ImageError::Backend(FabrixError::Quota("q".into())).code(),
+            "rate_limit_exceeded"
+        );
+
+        // 봉투의 type 은 상태 코드가 정합니다 — 400 → invalid_request_error,
+        // 429 → rate_limit_error, 503(Unreachable 오버라이드) → api_error.
+        assert_eq!(ImageError::BadRequest("x".into()).envelope().error.kind, "invalid_request_error");
+        assert_eq!(
+            ImageError::Backend(FabrixError::Quota("q".into())).envelope().error.kind,
+            "rate_limit_error"
+        );
+        assert_eq!(
+            ImageError::Backend(FabrixError::Unreachable("u".into())).envelope().error.kind,
+            "api_error"
+        );
     }
 
     #[test]

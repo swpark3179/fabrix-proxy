@@ -94,15 +94,30 @@ export interface Config {
   toolEmulation: boolean
 }
 
-/** `list_models` 커맨드 결과 — 설정 화면 모델 드롭다운용. Rust ResolvedModel 과 대응. */
-export interface ModelInfo {
+/** 모델 목록 한 줄. Rust `commands::ModelRow` 와 1:1. */
+export interface ModelRow {
+  /** 클라이언트가 `model` 칸에 넣는 값 — 복사 대상. */
   alias: string
+  /** 실제로 사내에 보내는 UUID — 사내 담당자와 대조용. */
   modelId: string
+  /** 사람이 읽는 이름 (예: `챗 4`). */
   label: string
   description: string | null
+  isDefault: boolean
+}
+
+export interface ModelListResult {
+  models: ModelRow[]
+  cached: boolean
+  /** 로컬 RFC3339 — 화면이 "n초 전 조회" 를 계산합니다. */
+  fetchedAt: string
+  /** 빈 문자열이면 목록의 첫 모델이 기본입니다. */
+  defaultAlias: string
+  sourceUrl: string
+  cacheTtlSecs: number
 }
 
 export interface TestResult {
   modelCount: number
-  sample: string[]
+  models: ModelRow[]
 }

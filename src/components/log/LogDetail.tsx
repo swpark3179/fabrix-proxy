@@ -114,16 +114,18 @@ export function LogDetail({ entry, baseUrl, onCopyCurl }: Props) {
 
       {!chat && !entry.isError && (
         <div className="footnote">
-          클라이언트가 <code>gpt-4o</code> 처럼 사내에 없는 이름을 보내면 기본 모델로 처리하고,
-          로그 2번 칸에 어떤 <code>modelId</code> 로 나갔는지 남깁니다.
+          여기 나온 <code>id</code> 가 클라이언트의 <code>model</code> 칸에 넣는 값입니다.
+          사내에 없는 이름을 보내면 <code>404 model_not_found</code> 로 돌려줍니다.
         </div>
       )}
 
+      {/* 요청 이름과 해석된 alias 가 다른 경우 — 이제 폴백이 아니라 UUID·대소문자
+          매칭이 걸린 경우입니다. 없는 이름은 404 라 여기까지 오지 않습니다. */}
       {chat && entry.modelRequested && entry.modelAlias && entry.modelRequested !== entry.modelAlias && (
         <div className="footnote">
-          클라이언트가 보낸 <code>{entry.modelRequested}</code> 는 사내에 없는 이름이라{' '}
+          클라이언트가 보낸 <code>{entry.modelRequested}</code> 는{' '}
           <code>{entry.modelAlias}</code>
-          {entry.modelLabel ? ` (${entry.modelLabel})` : ''} 로 처리했습니다.
+          {entry.modelLabel ? ` (${entry.modelLabel})` : ''} 로 해석했습니다.
           {entry.modelId && (
             <>
               {' '}
@@ -170,6 +172,28 @@ function MappingTags({ entry }: { entry: LogEntry }) {
     if (from in request) tags.push({ text: `${from} → llmConfig.${to}`, muted: true })
   }
 
+  // 사내로 보낼 자리가 없어 **반영하지 않은** 필드들. 조용히 사라지는 것과
+  // 사라졌다고 말하는 것의 차이라 흐리게라도 반드시 보여줍니다.
+  if ('stream_options' in request) {
+    tags.push({ text: 'stream_options.include_usage → usage 청크(추정)', muted: true })
+  }
+  const ignored: [string, string][] = [
+    ['stop', 'stop → 무시(사내에 대응 없음)'],
+    ['presence_penalty', 'presence_penalty → 무시(페널티 키가 하나뿐)'],
+    ['logit_bias', 'logit_bias → 무시(토크나이저 없음)'],
+    ['user', 'user → 무시'],
+    ['response_format', 'response_format → 무시'],
+    ['metadata', 'metadata → 무시'],
+  ]
+  for (const [key, text] of ignored) {
+    if (key in request && request[key] !== null) tags.push({ text, muted: true })
+  }
+  // 이미지 파트는 사내 채팅 API 가 받지 못해 버립니다. 몇 개를 버렸는지는 ③ 칸
+  // 꼬리의 메타 줄에 있습니다.
+  if (hasImageParts(request)) {
+    tags.push({ text: 'image_url → 제외(사내 미지원)', muted: true })
+  }
+
   return (
     <div className="tags">
       {tags.map((tag) => (
@@ -179,6 +203,26 @@ function MappingTags({ entry }: { entry: LogEntry }) {
       ))}
     </div>
   )
+}
+
+/** `messages[].content` 배열 안에 이미지 파트가 있는가 (Rust `Message::image_parts` 와 같은 기준). */
+function hasImageParts(request: Record<string, unknown>): boolean {
+  const messages = request.messages
+  if (!Array.isArray(messages)) return false
+  return messages.some((m) => {
+    const content = (m as { content?: unknown }).content
+    if (!Array.isArray(content)) return false
+    return content.some((part) => {
+      if (typeof part !== 'object' || part === null) return false
+      const p = part as Record<string, unknown>
+      if (typeof p.type === 'string' && ['image_url', 'input_image', 'image'].includes(p.type)) {
+        return true
+      }
+      if ('image_url' in p) return true
+      const media = p.mediaType ?? p.media_type
+      return typeof media === 'string' && media.startsWith('image/')
+    })
+  })
 }
 
 function hostOf(url: string): string {

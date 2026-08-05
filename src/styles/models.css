@@ -1,0 +1,265 @@
+/* 모델 목록 창 (900×600, 크기 조절 가능).
+ *
+ * 목업에는 없는 네 번째 창입니다 — 720×560 고정인 메인 창에 4열 표가 들어가지 않고,
+ * 모델 ID 와 사내 UUID 를 나란히 놓고 복사하려면 폭이 필요합니다.
+ * 클래스 이름은 main.css / log.css 의 BEM 관례를 따릅니다. */
+
+.models-app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background: var(--surface-1);
+}
+
+/* ── 도구줄 ──────────────────────────────────────────────── */
+
+.models__bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 14px;
+  height: 52px;
+  flex: none;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--surface);
+}
+
+.models__search {
+  width: 260px;
+  flex: none;
+  padding: 7px 10px;
+  font-size: 12px;
+}
+
+.models__meta {
+  font: 400 11.5px var(--font-sans);
+  color: var(--ink-5);
+  white-space: nowrap;
+  margin-right: 4px;
+}
+
+/* 도구줄과 표 안에 들어가는 작은 버튼 — 기본 .btn-ghost 는 44px 줄 높이에 너무 큽니다. */
+.btn-ghost--mini {
+  font-size: 11.5px;
+  padding: 5px 9px;
+  border-radius: 6px;
+}
+
+.models__alert {
+  margin: 10px 14px 0;
+  flex: none;
+  align-items: center;
+}
+
+/* ── 표 ─────────────────────────────────────────────────── */
+
+.modeltable {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  margin: 12px 14px;
+  border: 1px solid var(--border-soft);
+  border-radius: 9px;
+  background: var(--surface);
+  overflow: hidden;
+}
+
+/* 조회 중 · 실패 후 남아 있는 이전 목록. 지우지 않고 흐리게만 합니다. */
+.modeltable--stale {
+  opacity: 0.55;
+}
+
+.modeltable__head,
+.modeltable__row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 12px;
+}
+
+.modeltable__head {
+  height: 34px;
+  flex: none;
+  font: 500 11px var(--font-sans);
+  color: var(--ink-6);
+  background: var(--surface-3);
+  border-bottom: 1px solid var(--border-faint);
+}
+
+.modeltable__scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.modeltable__row {
+  height: 40px;
+  border-bottom: 1px solid var(--border-faint);
+}
+
+.modeltable__row:last-child {
+  border-bottom: none;
+}
+
+.modeltable__row:hover {
+  background: var(--surface-2);
+}
+
+.modeltable__row--default {
+  background: var(--accent-tint);
+}
+
+.modeltable__row--default:hover {
+  background: var(--accent-soft);
+}
+
+/* 열 폭 — 최소 폭 780 에서 딱 맞고, 창을 넓히면 설명 칸만 늘어납니다. */
+.col-label {
+  width: 150px;
+  flex: none;
+}
+
+.col-alias {
+  width: 190px;
+  flex: none;
+}
+
+.col-uuid {
+  width: 260px;
+  flex: none;
+}
+
+.col-desc {
+  flex: 1;
+  min-width: 0;
+}
+
+.col-act {
+  width: 172px;
+  flex: none;
+  display: flex;
+  justify-content: flex-end;
+  gap: 5px;
+}
+
+.modeltable__label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font: 500 12.5px var(--font-sans);
+  color: var(--ink);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.modeltable__badge {
+  font: 500 10px var(--font-sans);
+  color: var(--accent);
+  background: var(--surface);
+  border: 1px solid var(--accent-border);
+  border-radius: 4px;
+  padding: 1px 5px;
+  flex: none;
+}
+
+.modeltable__alias {
+  font: 400 12px var(--font-mono);
+  color: var(--ink-2);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.modeltable__uuid {
+  font: 400 11px var(--font-mono);
+  color: var(--ink-mono);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.modeltable__desc {
+  font: 400 11.5px var(--font-sans);
+  color: var(--ink-5);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.modeltable__act {
+  /* 행마다 버튼 세 개가 붙지만 평소에는 조용해야 하므로 hover 에서만 진해집니다. */
+  opacity: 0.68;
+}
+
+.modeltable__row:hover .modeltable__act {
+  opacity: 1;
+}
+
+.modeltable__empty {
+  padding: 40px 16px;
+  text-align: center;
+  font: 400 12px/1.7 var(--font-sans);
+  color: var(--ink-6);
+}
+
+/* ── 꼬리말 ──────────────────────────────────────────────── */
+
+.models__foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 16px 12px;
+  flex: none;
+}
+
+.models__foot-hint {
+  font: 400 11px/1.6 var(--font-sans);
+  color: var(--ink-6);
+}
+
+.models__foot-hint b {
+  font-weight: 500;
+  color: var(--ink-4);
+}
+
+.models__foot-hint code {
+  font: 400 10.5px var(--font-mono);
+  color: var(--ink-4);
+  background: var(--surface-4);
+  border-radius: 3px;
+  padding: 1px 4px;
+}
+
+.models__foot-src {
+  font: 400 10.5px var(--font-mono);
+  color: var(--ink-off);
+  white-space: nowrap;
+}
+
+/* ── 미설정 안내 ─────────────────────────────────────────── */
+
+.models__blank {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 24px;
+  text-align: center;
+}
+
+.models__blank-title {
+  margin: 0;
+  font: 500 14px var(--font-sans);
+  color: var(--ink-2);
+}
+
+.models__blank-body {
+  margin: 0 0 6px;
+  max-width: 420px;
+  font: 400 12px/1.7 var(--font-sans);
+  color: var(--ink-5);
+}

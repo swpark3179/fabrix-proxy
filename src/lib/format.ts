@@ -1,4 +1,4 @@
-import type { LogEntry } from '../types'
+import type { LogEntry, ModelRow } from '../types'
 
 /** 목업 표기: `1.2s` · `0.2s` · `30s` */
 export function latency(ms: number): string {
@@ -55,4 +55,30 @@ export function toCurl(entry: LogEntry, baseUrl: string): string {
 export async function copyText(text: string): Promise<void> {
   const { writeText } = await import('@tauri-apps/plugin-clipboard-manager')
   await writeText(text)
+}
+
+/**
+ * 모델 목록을 채팅창·설정 파일에 그대로 붙일 수 있는 평문으로.
+ *
+ * `label` 을 **맨 끝**에 두는 이유: 한글은 모노 폰트에서도 두 칸을 먹어 `padEnd` 정렬이
+ * 깨집니다. 마지막 칸이면 깨질 것이 없습니다.
+ *
+ * 넘겨받은 행만 담습니다 — 화면이 필터를 걸었으면 보이는 것만 복사되는 것이 맞습니다.
+ */
+export function modelsToPlainText(rows: ModelRow[], sourceUrl: string, fetchedAt: string): string {
+  const when = fetchedAt.replace('T', ' ').slice(0, 16)
+  const head = [
+    `# fabrix-proxy 모델 ${rows.length}개 · ${when} · ${sourceUrl || '(주소 미설정)'}`,
+    '# alias 를 클라이언트의 model 칸에 넣으세요.',
+  ]
+  const width = Math.max(5, ...rows.map((m) => m.alias.length))
+  const body = rows.map(
+    (m) => `${m.alias.padEnd(width)}  ${m.modelId}  ${m.label}`,
+  )
+  return [...head, `${'alias'.padEnd(width)}  ${'modelId'.padEnd(36)}  label`, ...body].join('\n')
+}
+
+/** 클라이언트 설정의 `models` 배열에 통째로 붙일 alias 목록. */
+export function modelsToAliasList(rows: ModelRow[]): string {
+  return rows.map((m) => m.alias).join('\n')
 }

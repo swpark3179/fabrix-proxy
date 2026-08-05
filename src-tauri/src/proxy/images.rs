@@ -7,7 +7,7 @@
 
 use std::time::Instant;
 
-use axum::body::Bytes;
+use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue};
 use axum::response::{IntoResponse, Response};
@@ -25,7 +25,9 @@ use crate::proxy::fabrix::FabrixError;
 use crate::proxy::image_backend::{self, ImageError};
 use crate::state::{self, Shared};
 
-use super::{authorize, error_response, fabrix_headers_line, pretty};
+use super::{
+    authorize, error_response, fabrix_headers_line, pretty, read_body, IMAGE_BODY_LIMIT,
+};
 
 /// 기본 대체 프롬프트 — 스펙의 빈 프롬프트 처리와 맞춥니다.
 const FALLBACK_PROMPT: &str = "A high-quality reference image.";
@@ -66,7 +68,7 @@ impl Ctx {
             ts_full: state::now_iso(),
             kind: Kind::Images,
             method: Kind::Images.method(),
-            path: self.path,
+            path: self.path.into(),
             status,
             latency_ms: self.started.elapsed().as_millis() as u64,
             stream: false,
@@ -117,7 +119,10 @@ fn bad_request(state: &Shared, ctx: &Ctx, msg: String) -> Response {
         msg.clone(),
         "요청 검증 실패".into(),
     ));
-    error_response(400, ErrorEnvelope::new(msg, "invalid_request_error", None))
+    error_response(
+        400,
+        ErrorEnvelope::new(msg, super::openai_type(400), Some("invalid_value".into())),
+    )
 }
 
 /// 파이프라인 오류를 상태코드에 맞춰 기록하고 돌려줍니다.
@@ -131,7 +136,7 @@ fn image_err_response(state: &Shared, ctx: &Ctx, err: ImageError) -> Response {
         err.message(),
         format!("실패 · HTTP {status}"),
     ));
-    error_response(status, ErrorEnvelope::new(err.message(), err.kind(), None))
+    error_response(status, err.envelope())
 }
 
 /// 생성된 이미지 바이트들을 `b64_json` 응답으로 마무리하고 성공 로그를 남깁니다.
@@ -165,9 +170,14 @@ fn finish(state: &Shared, ctx: Ctx, images: Vec<Vec<u8>>) -> Response {
 
 // ─────────────────────────── generations (t2i) ───────────────────────────
 
-pub async fn generations(State(state): State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
+pub async fn generations(State(state): State<Shared>, headers: HeaderMap, body: Body) -> Response {
     let cfg = state.config();
     let ua = headers.get("user-agent").and_then(|v| v.to_str().ok());
+    // 상한은 우리가 겁니다 — 레이어에 맡기면 초과가 로그에 남지 않습니다.
+    let body = match read_body(&headers, body, IMAGE_BODY_LIMIT).await {
+        Ok(bytes) => bytes,
+        Err(envelope) => return error_response(413, envelope),
+    };
     let incoming: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
 
     let mut ctx = Ctx {
@@ -273,9 +283,13 @@ async fn generate_n(
 
 // ─────────────────────────── edits (i2i · gemma → FLUX) ───────────────────────────
 
-pub async fn edits(State(state): State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
+pub async fn edits(State(state): State<Shared>, headers: HeaderMap, body: Body) -> Response {
     let cfg = state.config();
     let ua = headers.get("user-agent").and_then(|v| v.to_str().ok());
+    let body = match read_body(&headers, body, IMAGE_BODY_LIMIT).await {
+        Ok(bytes) => bytes,
+        Err(envelope) => return error_response(413, envelope),
+    };
     let incoming: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
 
     let mut ctx = Ctx {

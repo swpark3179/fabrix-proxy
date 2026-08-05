@@ -44,6 +44,108 @@ pub struct ChatRequest {
     /// `tools` 이전 세대의 이름. 같은 것으로 취급합니다.
     #[serde(default)]
     pub functions: Option<Vec<FunctionDef>>,
+
+    // ── 규약에는 있으나 사내 API 에 대응이 없는 필드들 ──
+    //
+    // 예전에는 이들을 아예 받지 않아 **조용히 사라졌습니다**. 클라이언트는 반영됐다고
+    // 믿었고, 로그 ① 칸에도 흔적이 남지 않았습니다. 받아 두는 이유는 두 가지입니다 —
+    // (1) 범위 검증을 해서 규약 위반은 400 으로 걸러내고, (2) 반영하지 못하는 것은
+    // 로그에 "무시했다"고 적기 위해서입니다. `proxy::validate` 가 그 두 일을 합니다.
+    //
+    // 타입이 느슨한 것은 의도입니다. `deny_unknown_fields` 를 켜거나 타입을 좁히면
+    // SDK 가 필드를 하나 붙일 때마다 요청 전체가 400 이 되어 클라이언트가 다음
+    // 릴리스에서 깨집니다.
+    #[serde(default)]
+    pub n: Option<u32>,
+    #[serde(default)]
+    pub stop: Option<Stop>,
+    #[serde(default)]
+    pub presence_penalty: Option<f64>,
+    /// 토크나이저가 없어 해석할 수 없습니다 — 로그 표기용.
+    #[serde(default)]
+    pub logit_bias: Option<Value>,
+    /// 스펙은 문자열이지만 객체를 보내는 클라이언트가 있어 `Value` 로 받습니다.
+    #[serde(default)]
+    pub user: Option<Value>,
+    #[serde(default)]
+    pub response_format: Option<ResponseFormat>,
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
+    /// 구형 클라이언트는 bool 이 아니라 개수(정수)를 보냅니다.
+    #[serde(default)]
+    pub logprobs: Option<LogProbsFlag>,
+    #[serde(default)]
+    pub top_logprobs: Option<u32>,
+    #[serde(default)]
+    pub metadata: Option<Value>,
+    #[serde(default)]
+    pub store: Option<Value>,
+    #[serde(default)]
+    pub service_tier: Option<Value>,
+}
+
+/// `stop` — 문자열 하나 또는 최대 4개의 배열. 모르는 모양이 와도 파싱은 성공해야 합니다.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum Stop {
+    One(String),
+    Many(Vec<String>),
+    Other(Value),
+}
+
+impl Stop {
+    /// 실제로 쓸 수 있는 시퀀스들 — 공백만 있는 항목은 버립니다.
+    pub fn list(&self) -> Vec<String> {
+        match self {
+            Stop::One(s) => vec![s.clone()],
+            Stop::Many(v) => v.clone(),
+            Stop::Other(_) => Vec::new(),
+        }
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect()
+    }
+
+    /// 규약 상한(4개) 검사용 — 빈 항목을 걸러내기 **전** 개수입니다.
+    pub fn raw_len(&self) -> usize {
+        match self {
+            Stop::One(_) => 1,
+            Stop::Many(v) => v.len(),
+            Stop::Other(_) => 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StreamOptions {
+    #[serde(default)]
+    pub include_usage: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResponseFormat {
+    #[serde(default, rename = "type")]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub json_schema: Option<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum LogProbsFlag {
+    Flag(bool),
+    Count(u32),
+    Other(Value),
+}
+
+impl LogProbsFlag {
+    pub fn wants(&self) -> bool {
+        match self {
+            LogProbsFlag::Flag(b) => *b,
+            LogProbsFlag::Count(n) => *n > 0,
+            LogProbsFlag::Other(_) => false,
+        }
+    }
 }
 
 impl ChatRequest {
@@ -73,6 +175,12 @@ impl ChatRequest {
     /// 이 요청에 도구 에뮬레이션을 걸어야 하는가.
     pub fn wants_tools(&self) -> bool {
         !self.declared_tools().is_empty() && self.tool_mode() != ToolChoiceMode::None
+    }
+
+    /// 스트림 꼬리에 usage 청크를 넣어야 하는가. 클라이언트가 명시적으로 옵트인했을
+    /// 때만 참입니다 — 규약이 그렇게 정해 두었습니다.
+    pub fn wants_usage_chunk(&self) -> bool {
+        self.stream_options.as_ref().and_then(|o| o.include_usage) == Some(true)
     }
 }
 
@@ -222,6 +330,23 @@ impl Message {
         }
     }
 
+    /// 사내가 받지 못해 **버려지는** 이미지 파트의 개수.
+    ///
+    /// `text()` 가 조용히 걸러내던 것을 세기만 합니다. 프롬프트는 한 글자도 바꾸지
+    /// 않습니다 — 자리표시자를 끼워 넣으면 기존 모든 요청의 프롬프트가 달라집니다.
+    /// 세는 이유는 로그에 "몇 개를 버렸다"를 적기 위해서입니다.
+    pub fn image_parts(&self) -> usize {
+        let Some(Content::Parts(parts)) = &self.content else {
+            return 0;
+        };
+        parts.iter().filter(|p| is_image_part(p)).count()
+    }
+
+    /// 본문에 쓸 만한 텍스트가 있는가 (`fold_messages` 의 공백 드롭과 같은 기준).
+    pub fn has_text(&self) -> bool {
+        !self.text().trim().is_empty()
+    }
+
     /// `role:"tool"` 결과 본문.
     ///
     /// AI SDK v5 는 도구 결과를 `[{"type":"tool-result","output":{…}}]` 처럼 보냅니다.
@@ -242,6 +367,26 @@ impl Message {
             _ => String::new(),
         }
     }
+}
+
+/// 파트 하나가 이미지인가. 모양이 여럿이라 넓게 봅니다 —
+/// OpenAI 는 `{"type":"image_url",…}`, Responses 계열은 `input_image`,
+/// AI SDK v5 는 `{"type":"file","mediaType":"image/png"}` 를 씁니다.
+fn is_image_part(part: &Value) -> bool {
+    let Value::Object(map) = part else {
+        return false;
+    };
+    let kind = map.get("type").and_then(Value::as_str).unwrap_or("");
+    if matches!(kind, "image_url" | "input_image" | "image") {
+        return true;
+    }
+    if map.contains_key("image_url") {
+        return true;
+    }
+    map.get("mediaType")
+        .or_else(|| map.get("media_type"))
+        .and_then(Value::as_str)
+        .is_some_and(|m| m.starts_with("image/"))
 }
 
 /// 파트 하나에서 텍스트를 꺼냅니다. 문자열 파트(`["a","b"]`)도 받아 줍니다.
@@ -289,6 +434,10 @@ pub struct ChatCompletion {
     pub choices: Vec<Choice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
+    /// 백엔드 구성 지문. FabriX 가 주지 않으므로 우리가 재현 가능한 값을 만듭니다
+    /// (`proxy::system_fingerprint`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -296,6 +445,10 @@ pub struct Choice {
     pub index: u32,
     pub message: AssistantMessage,
     pub finish_reason: Option<String>,
+    /// OpenAI 는 요청하지 않아도 이 키를 `null` 로 내보냅니다. 키 자체가 없으면
+    /// `choices[0].logprobs` 를 무조건 읽는 클라이언트가 죽으므로 `skip` 하지 않습니다.
+    /// (요청에 `logprobs: true` 가 오면 400 입니다 — `proxy::validate`.)
+    pub logprobs: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -327,6 +480,11 @@ pub struct ChatChunk {
     pub created: i64,
     pub model: String,
     pub choices: Vec<ChunkChoice>,
+    /// 마지막 usage 청크에만 담깁니다 (`stream_options.include_usage`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -334,6 +492,7 @@ pub struct ChunkChoice {
     pub index: u32,
     pub delta: Delta,
     pub finish_reason: Option<String>,
+    pub logprobs: Option<Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -394,8 +553,54 @@ impl ChatChunk {
             object: "chat.completion.chunk",
             created,
             model: model.to_string(),
-            choices: vec![ChunkChoice { index: 0, delta, finish_reason: finish }],
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta,
+                finish_reason: finish,
+                logprobs: None,
+            }],
+            usage: None,
+            system_fingerprint: None,
         }
+    }
+
+    /// 스트림의 **첫 청크**. OpenAI 는 내용 없이 롤만 담은 청크를 먼저 보냅니다.
+    ///
+    /// 예전에는 `role` 을 첫 내용 청크에 얹어 보냈습니다. 그러면 (a) 규약과 순서가
+    /// 다르고, (b) 답변이 빈 응답에서는 finish 청크 전까지 **아무 청크도** 나가지
+    /// 않아 클라이언트가 assistant 턴이 시작된 것조차 몰랐습니다.
+    pub fn opening(id: &str, created: i64, model: &str, fingerprint: Option<String>) -> Self {
+        let mut chunk = Self::new(
+            id,
+            created,
+            model,
+            Delta {
+                role: Some("assistant"),
+                content: Some(String::new()),
+                ..Delta::default()
+            },
+            None,
+        );
+        chunk.system_fingerprint = fingerprint;
+        chunk
+    }
+
+    /// 스트림 꼬리의 usage 청크 — `choices` 는 빈 배열입니다(규약).
+    pub fn usage_only(id: &str, created: i64, model: &str, usage: Usage) -> Self {
+        Self {
+            id: id.to_string(),
+            object: "chat.completion.chunk",
+            created,
+            model: model.to_string(),
+            choices: Vec::new(),
+            usage: Some(usage),
+            system_fingerprint: None,
+        }
+    }
+
+    pub fn with_fingerprint(mut self, fingerprint: Option<String>) -> Self {
+        self.system_fingerprint = fingerprint;
+        self
     }
 }
 
@@ -406,18 +611,28 @@ pub struct ErrorEnvelope {
     pub error: ErrorBody,
 }
 
+/// OpenAI 는 `param` 과 `code` 를 **없으면 null 로** 내보냅니다. 키 자체가 없으면
+/// `error.param` 을 무조건 읽는 클라이언트가 죽으므로 `skip_serializing_if` 를 두지
+/// 않습니다.
 #[derive(Debug, Clone, Serialize)]
 pub struct ErrorBody {
     pub message: String,
     #[serde(rename = "type")]
     pub kind: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// 어느 파라미터가 문제인지 (예: `temperature`, `messages[2].role`).
+    pub param: Option<String>,
     pub code: Option<String>,
 }
 
 impl ErrorEnvelope {
     pub fn new(message: impl Into<String>, kind: &'static str, code: Option<String>) -> Self {
-        Self { error: ErrorBody { message: message.into(), kind, code } }
+        Self { error: ErrorBody { message: message.into(), kind, param: None, code } }
+    }
+
+    /// 문제가 된 파라미터 이름을 붙입니다.
+    pub fn with_param(mut self, param: impl Into<String>) -> Self {
+        self.error.param = Some(param.into());
+        self
     }
 }
 
@@ -643,6 +858,102 @@ mod tests {
         assert_eq!(tool.tool_result_text(), "wrote 12 bytes");
     }
 
+    // ── 규약 필드 수용 ──
+
+    #[test]
+    fn stop_accepts_string_array_and_garbage() {
+        let of = |raw: &str| serde_json::from_str::<Stop>(raw).unwrap();
+        assert_eq!(of(r#""\n\n""#).list(), vec!["\n\n"]);
+        assert_eq!(of(r#"["a","b"]"#).list(), vec!["a", "b"]);
+        // 빈 항목은 버리지만 상한 검사용 개수에는 남습니다.
+        let many = of(r#"["a","","b"]"#);
+        assert_eq!(many.list(), vec!["a", "b"]);
+        assert_eq!(many.raw_len(), 3);
+        // 모르는 모양이 와도 요청 전체가 400 이 되면 안 됩니다.
+        assert!(of("{}").list().is_empty());
+        assert_eq!(of("{}").raw_len(), 0);
+    }
+
+    #[test]
+    fn logprobs_accepts_bool_and_count() {
+        let of = |raw: &str| serde_json::from_str::<LogProbsFlag>(raw).unwrap();
+        assert!(!of("false").wants());
+        assert!(of("true").wants());
+        assert!(of("3").wants());
+        assert!(!of("0").wants());
+        assert!(!of(r#""nope""#).wants());
+    }
+
+    #[test]
+    fn stream_options_and_response_format_parse() {
+        let req: ChatRequest = serde_json::from_str(
+            r#"{"messages":[],"stream":true,"stream_options":{"include_usage":true},
+                "response_format":{"type":"json_schema","json_schema":{"name":"x"}}}"#,
+        )
+        .unwrap();
+        assert!(req.wants_usage_chunk());
+        assert_eq!(req.response_format.as_ref().unwrap().kind.as_deref(), Some("json_schema"));
+        assert!(req.response_format.as_ref().unwrap().json_schema.is_some());
+
+        // 키가 없으면 usage 청크를 넣지 않습니다.
+        let bare: ChatRequest = serde_json::from_str(r#"{"messages":[]}"#).unwrap();
+        assert!(!bare.wants_usage_chunk());
+        // include_usage: false 도 명시적 거절입니다.
+        let off: ChatRequest =
+            serde_json::from_str(r#"{"messages":[],"stream_options":{"include_usage":false}}"#)
+                .unwrap();
+        assert!(!off.wants_usage_chunk());
+    }
+
+    #[test]
+    fn image_parts_counts_every_shape() {
+        let count = |content: &str| -> usize {
+            let m: Message =
+                serde_json::from_str(&format!(r#"{{"role":"user","content":{content}}}"#)).unwrap();
+            m.image_parts()
+        };
+        assert_eq!(count(r#"[{"type":"image_url","image_url":{"url":"data:…"}}]"#), 1);
+        assert_eq!(count(r#"[{"type":"input_image","image_url":"data:…"}]"#), 1);
+        assert_eq!(count(r#"[{"type":"file","mediaType":"image/png","data":"AAAA"}]"#), 1);
+        assert_eq!(count(r#"[{"type":"file","mediaType":"application/pdf"}]"#), 0);
+        assert_eq!(count(r#"[{"type":"text","text":"안녕"}]"#), 0);
+        assert_eq!(count(r#""그냥 문자열""#), 0);
+        assert_eq!(
+            count(r#"[{"type":"text","text":"이거 뭐야"},{"type":"image_url","image_url":{}}]"#),
+            1
+        );
+    }
+
+    #[test]
+    fn has_text_follows_the_fold_whitespace_rule() {
+        let m = |content: &str| -> Message {
+            serde_json::from_str(&format!(r#"{{"role":"user","content":{content}}}"#)).unwrap()
+        };
+        assert!(m(r#""안녕""#).has_text());
+        assert!(!m(r#""   ""#).has_text());
+        assert!(!m(r#"null"#).has_text());
+        assert!(!m(r#"[{"type":"image_url","image_url":{}}]"#).has_text());
+        assert!(m(r#"[{"type":"text","text":"안녕"},{"type":"image_url","image_url":{}}]"#).has_text());
+    }
+
+    /// 새 필드를 얹어도 실제 에이전트 요청이 그대로 파싱돼야 합니다.
+    #[test]
+    fn new_fields_do_not_break_a_real_request() {
+        let req: ChatRequest = serde_json::from_str(
+            r#"{"model":"fabrix-chat-4","stream":true,
+                "messages":[{"role":"user","content":"hi"}],
+                "n":1,"stop":null,"stream_options":null,"user":"kim","logit_bias":null,
+                "presence_penalty":0.0,"logprobs":false,"metadata":{"a":1},"store":false,
+                "service_tier":"auto","무슨키":"몰라도 통과"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.n, Some(1));
+        assert!(req.stop.is_none());
+        assert!(!req.wants_usage_chunk());
+        assert_eq!(req.user.as_ref().unwrap().as_str(), Some("kim"));
+        assert!(!req.logprobs.as_ref().unwrap().wants());
+    }
+
     #[test]
     fn explicit_nulls_do_not_break_parsing() {
         // `Vec` + `#[serde(default)]` 였다면 여기서 요청 전체가 400 이 됩니다.
@@ -777,6 +1088,73 @@ mod tests {
             json,
             r#"{"index":0,"id":"call_x","type":"function","function":{"name":"read","arguments":"{\"filePath\":\"a\"}"}}"#
         );
+    }
+
+    /// OpenAI 는 요청하지 않아도 `logprobs: null` 을 내보냅니다. 키가 빠지면
+    /// `choices[0].logprobs` 를 무조건 읽는 클라이언트가 죽습니다.
+    #[test]
+    fn choices_always_carry_a_logprobs_key() {
+        let completion = ChatCompletion {
+            id: "chatcmpl-x".into(),
+            object: "chat.completion",
+            created: 1,
+            model: "m".into(),
+            choices: vec![Choice {
+                index: 0,
+                message: AssistantMessage {
+                    role: "assistant",
+                    content: Some("안녕".into()),
+                    reasoning_content: None,
+                    tool_calls: None,
+                },
+                finish_reason: Some("stop".into()),
+                logprobs: None,
+            }],
+            usage: None,
+            system_fingerprint: Some("fp_abc".into()),
+        };
+        let json = serde_json::to_value(&completion).unwrap();
+        assert!(json["choices"][0].as_object().unwrap().contains_key("logprobs"));
+        assert!(json["choices"][0]["logprobs"].is_null());
+        assert_eq!(json["system_fingerprint"], "fp_abc");
+        // usage 가 없으면 키 자체를 빼는 기존 동작은 유지합니다.
+        assert!(!json.as_object().unwrap().contains_key("usage"));
+
+        let chunk = ChatChunk::new("chatcmpl-x", 1, "m", Delta::default(), Some("stop".into()));
+        let cj = serde_json::to_value(&chunk).unwrap();
+        assert!(cj["choices"][0].as_object().unwrap().contains_key("logprobs"));
+        assert!(cj["choices"][0]["logprobs"].is_null());
+    }
+
+    /// 스트림의 첫 청크는 OpenAI 와 **바이트 단위로** 같은 모양이어야 합니다 —
+    /// `@ai-sdk/openai-compatible` 이 가장 엄격하게 보는 자리입니다.
+    #[test]
+    fn opening_chunk_matches_the_openai_wire_shape() {
+        let json = serde_json::to_string(&ChatChunk::opening(
+            "chatcmpl-x",
+            1,
+            "fabrix-chat-4",
+            Some("fp_1".into()),
+        ))
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":"chatcmpl-x","object":"chat.completion.chunk","created":1,"model":"fabrix-chat-4","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null,"logprobs":null}],"system_fingerprint":"fp_1"}"#
+        );
+    }
+
+    #[test]
+    fn usage_chunk_has_empty_choices() {
+        let chunk = ChatChunk::usage_only(
+            "chatcmpl-x",
+            1,
+            "m",
+            Usage { prompt_tokens: 10, completion_tokens: 3, total_tokens: 13 },
+        );
+        let json = serde_json::to_value(&chunk).unwrap();
+        assert!(json["choices"].as_array().unwrap().is_empty());
+        assert_eq!(json["usage"]["total_tokens"], 13);
+        assert_eq!(json["object"], "chat.completion.chunk");
     }
 
     #[test]

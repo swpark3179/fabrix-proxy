@@ -28,11 +28,21 @@ pub struct ServerHandle {
 
 pub struct ModelsCache {
     pub fetched_at: Instant,
+    /// TTL 판정은 `fetched_at`(단조 시계)이 하고, 이 값은 화면에 "12초 전 조회" 를
+    /// 띄우기 위한 벽시계입니다. `Instant` 는 사람이 읽는 시각으로 되돌릴 수 없습니다.
+    pub fetched_at_iso: String,
     pub models: Vec<ResolvedModel>,
 }
 
 pub struct AppState {
-    pub app: AppHandle,
+    /// 프런트로 이벤트를 흘릴 통로.
+    ///
+    /// `Option` 인 이유: HTTP 표면 통합 테스트(`tests/proxy_http.rs`)는 창이 없는 상태로
+    /// 프록시만 띄웁니다. `tauri::test::mock_app()` 의 핸들은 `AppHandle<MockRuntime>` 이라
+    /// 이 자리(`AppHandle<Wry>`)에 넣을 수 없고, 그 하나 때문에 `AppState` 를 런타임에
+    /// 제네릭하게 만들면 커맨드·트레이·창 코드까지 전부 번집니다. 이벤트를 받을 프런트가
+    /// 없으면 흘릴 곳도 없다는 뜻이라, 없을 수 있는 값으로 두는 편이 정직합니다.
+    app: Option<AppHandle>,
     pub config: Mutex<Config>,
     pub stats: Mutex<Stats>,
     pub logs: Mutex<LogStore>,
@@ -73,6 +83,15 @@ pub struct Snapshot {
 
 impl AppState {
     pub fn new(app: AppHandle, cfg: Config, first_run: bool) -> Shared {
+        Self::build(Some(app), cfg, first_run)
+    }
+
+    /// 창 없이 프록시만 띄울 때 (통합 테스트). 이벤트는 아무 데도 가지 않습니다.
+    pub fn headless(cfg: Config, first_run: bool) -> Shared {
+        Self::build(None, cfg, first_run)
+    }
+
+    fn build(app: Option<AppHandle>, cfg: Config, first_run: bool) -> Shared {
         let mut stats = config::load_stats();
         stats.roll_over(&today());
         Arc::new(Self {
@@ -179,7 +198,9 @@ impl AppState {
     }
 
     pub fn emit_state(&self) {
-        let _ = self.app.emit("state:changed", self.snapshot());
+        if let Some(app) = &self.app {
+            let _ = app.emit("state:changed", self.snapshot());
+        }
     }
 
     /// 호출 한 건을 기록하고 두 창에 알립니다.
@@ -197,7 +218,9 @@ impl AppState {
         }
         self.logs.lock().unwrap().push(entry.clone());
 
-        let _ = self.app.emit("log:new", entry);
+        if let Some(app) = &self.app {
+            let _ = app.emit("log:new", entry);
+        }
         self.emit_state();
         self.flush_stats(false);
     }

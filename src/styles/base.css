@@ -1,5 +1,7 @@
 @import './fonts.css';
 @import './tokens.css';
+/* 창 여러 개가 공유하는 버튼·입력칸·배너. main.css 에서 그대로 옮겨온 것입니다. */
+@import './controls.css';
 
 *,
 *::before,
