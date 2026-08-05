@@ -11,7 +11,7 @@ use axum::Json;
 use uuid::Uuid;
 
 use crate::logstore::{self, Kind, LogEntry};
-use crate::openai::{ErrorEnvelope, ModelCard, ModelList};
+use crate::openai::{ModelCard, ModelList};
 use crate::state::{self, ModelsCache, Shared, MODELS_CACHE_TTL};
 
 use super::fabrix::{build_aliases, FabrixError, ResolvedModel, MODELS_PATH};
@@ -164,7 +164,7 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap) -> Response
                 resp_meta: format!("실패 · HTTP {status}"),
             });
 
-            error_response(status, ErrorEnvelope::new(err.message(), err.kind(), None))
+            error_response(status, err.envelope())
         }
     }
 }

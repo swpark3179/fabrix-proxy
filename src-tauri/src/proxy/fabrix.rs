@@ -706,12 +706,26 @@ impl FabrixError {
         }
     }
 
-    pub fn kind(&self) -> &'static str {
+    /// 기계가 분기하는 값. `type` 은 상태 코드에서 유도되므로(`proxy::openai_type`)
+    /// 우리 고유의 구분은 여기 담습니다 — 예전 `kind()` 가 `type` 자리에 넣던
+    /// 비표준 값(`upstream_error` · `configuration_error`)이 이쪽으로 옮겨온 것입니다.
+    pub fn code(&self) -> &'static str {
         match self {
-            FabrixError::Quota(_) => "rate_limit_error",
-            FabrixError::NotConfigured => "configuration_error",
-            _ => "upstream_error",
+            FabrixError::NotConfigured => "not_configured",
+            FabrixError::Unreachable(_) => "upstream_unreachable",
+            FabrixError::Quota(_) => "rate_limit_exceeded",
+            FabrixError::Upstream { .. } => "upstream_error",
+            FabrixError::BadPayload(_) => "upstream_bad_response",
         }
+    }
+
+    /// 응답 봉투 하나. 호출부가 `status`/`message`/`code` 를 따로 엮지 않게 모아 둡니다.
+    pub fn envelope(&self) -> crate::openai::ErrorEnvelope {
+        crate::openai::ErrorEnvelope::new(
+            self.message(),
+            super::openai_type(self.status()),
+            Some(self.code().to_string()),
+        )
     }
 }
 
@@ -1114,6 +1128,32 @@ mod tests {
                 description: vec![],
             },
         ])
+    }
+
+    /// 다섯 변형 모두 합법 `type` + 우리 고유의 `code` 를 내야 합니다.
+    #[test]
+    fn every_error_variant_maps_to_a_legal_type_and_a_code() {
+        let cases = [
+            (FabrixError::NotConfigured, 503, "api_error", "not_configured"),
+            (FabrixError::Unreachable("t".into()), 502, "api_error", "upstream_unreachable"),
+            (FabrixError::Quota("q".into()), 429, "rate_limit_error", "rate_limit_exceeded"),
+            (
+                FabrixError::Upstream { status: 418, message: "teapot".into() },
+                418,
+                "invalid_request_error",
+                "upstream_error",
+            ),
+            (FabrixError::BadPayload("p".into()), 502, "api_error", "upstream_bad_response"),
+        ];
+        for (err, status, kind, code) in cases {
+            assert_eq!(err.status(), status, "{err:?}");
+            assert_eq!(err.code(), code, "{err:?}");
+            let env = err.envelope();
+            assert_eq!(env.error.kind, kind, "{err:?}");
+            assert_eq!(env.error.code.as_deref(), Some(code), "{err:?}");
+            // 사람이 읽는 메시지는 한국어 그대로 남습니다.
+            assert!(!env.error.message.is_empty());
+        }
     }
 
     #[test]

@@ -114,7 +114,7 @@ async fn not_found() -> Response {
         404,
         ErrorEnvelope::new(
             "이 프록시는 /v1/chat/completions · /v1/models · /v1/images/generations · /v1/images/edits 를 제공합니다.",
-            "invalid_request_error",
+            openai_type(404),
             Some("unknown_endpoint".into()),
         ),
     )
@@ -160,9 +160,12 @@ pub fn authorize(cfg: &Config, headers: &HeaderMap) -> Result<(), (u16, ErrorEnv
         Some(tok) if !expected.is_empty() && tok == expected => Ok(()),
         _ => Err((
             401,
+            // 401 은 `authentication_error` 입니다 — 예전에는 `invalid_request_error`
+            // 였는데, 인증 실패와 잘못된 파라미터를 구분해 재시도/재인증을 결정하는
+            // 클라이언트가 그 둘을 가릴 수 없었습니다.
             ErrorEnvelope::new(
                 "토큰이 일치하지 않습니다. 발행된 토큰을 API 키로 입력하세요.",
-                "invalid_request_error",
+                openai_type(401),
                 Some("invalid_api_key".into()),
             ),
         )),
@@ -232,6 +235,53 @@ mod tests {
         // 발행 토큰이 비어 있으면 어떤 값도 통과하지 못합니다 (빈 토큰 우회 방지).
         let empty = Config { token_mode: true, issued_token: String::new(), ..Config::default() };
         assert_eq!(authorize(&empty, &with_auth("Bearer ")).unwrap_err().0, 401);
+    }
+
+    /// OpenAI 가 정의한 `type` 값만 나가야 합니다 — 예전에는 우리가 지은
+    /// `upstream_error` · `configuration_error` 가 이 자리에 들어갔습니다.
+    #[test]
+    fn openai_type_is_always_a_legal_openai_type() {
+        const LEGAL: &[&str] = &[
+            "invalid_request_error",
+            "authentication_error",
+            "permission_error",
+            "rate_limit_error",
+            "api_error",
+        ];
+        for status in [400u16, 401, 403, 404, 405, 413, 415, 422, 429, 500, 502, 503, 504] {
+            let kind = openai_type(status);
+            assert!(LEGAL.contains(&kind), "{status} → {kind}");
+        }
+        assert_eq!(openai_type(400), "invalid_request_error");
+        assert_eq!(openai_type(404), "invalid_request_error");
+        assert_eq!(openai_type(405), "invalid_request_error");
+        assert_eq!(openai_type(413), "invalid_request_error");
+        assert_eq!(openai_type(401), "authentication_error");
+        assert_eq!(openai_type(403), "permission_error");
+        assert_eq!(openai_type(429), "rate_limit_error");
+        assert_eq!(openai_type(502), "api_error");
+        assert_eq!(openai_type(503), "api_error");
+    }
+
+    /// OpenAI 는 없는 값을 `null` 로 내보냅니다. 키 자체가 빠지면 `error.param` 을
+    /// 무조건 읽는 클라이언트가 죽습니다.
+    #[test]
+    fn error_envelope_serializes_param_and_code_as_null() {
+        let json =
+            serde_json::to_value(ErrorEnvelope::new("나쁨", "invalid_request_error", None)).unwrap();
+        assert!(json["error"].as_object().unwrap().contains_key("param"));
+        assert!(json["error"].as_object().unwrap().contains_key("code"));
+        assert!(json["error"]["param"].is_null());
+        assert!(json["error"]["code"].is_null());
+    }
+
+    #[test]
+    fn token_rejection_is_an_authentication_error() {
+        let cfg = Config { token_mode: true, issued_token: "sk-abc".into(), ..Config::default() };
+        let (status, env) = authorize(&cfg, &HeaderMap::new()).unwrap_err();
+        assert_eq!(status, 401);
+        assert_eq!(env.error.kind, "authentication_error");
+        assert_eq!(env.error.code.as_deref(), Some("invalid_api_key"));
     }
 
     #[test]

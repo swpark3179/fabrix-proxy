@@ -71,12 +71,22 @@ impl ImageError {
         }
     }
 
-    pub fn kind(&self) -> &'static str {
+    /// 기계가 분기하는 값. `type` 은 상태 코드에서 유도됩니다(`proxy::openai_type`)
+    /// — 예전 `kind()` 가 `type` 자리에 넣던 비표준 `not_implemented` 가 여기로 왔습니다.
+    pub fn code(&self) -> &'static str {
         match self {
-            ImageError::BadRequest(_) => "invalid_request_error",
+            ImageError::BadRequest(_) => "invalid_value",
             ImageError::NotImplemented(_) => "not_implemented",
-            ImageError::Backend(inner) => inner.kind(),
+            ImageError::Backend(inner) => inner.code(),
         }
+    }
+
+    pub fn envelope(&self) -> crate::openai::ErrorEnvelope {
+        crate::openai::ErrorEnvelope::new(
+            self.message(),
+            crate::proxy::openai_type(self.status()),
+            Some(self.code().to_string()),
+        )
     }
 }
 
@@ -219,9 +229,12 @@ mod tests {
 
     #[test]
     fn image_error_kind() {
-        assert_eq!(ImageError::BadRequest("x".into()).kind(), "invalid_request_error");
-        assert_eq!(ImageError::NotImplemented("x".into()).kind(), "not_implemented");
-        assert_eq!(ImageError::Backend(FabrixError::Quota("q".into())).kind(), "rate_limit_error");
+        assert_eq!(ImageError::BadRequest("x".into()).code(), "invalid_value");
+        assert_eq!(ImageError::NotImplemented("x".into()).code(), "not_implemented");
+        assert_eq!(
+            ImageError::Backend(FabrixError::Quota("q".into())).code(),
+            "rate_limit_exceeded"
+        );
     }
 
     #[test]

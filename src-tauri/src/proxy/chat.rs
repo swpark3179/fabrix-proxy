@@ -31,7 +31,7 @@ use super::fabrix::{
 use super::models::ensure_models;
 use super::tools::{self, ToolCallScanner};
 use super::validate;
-use super::{authorize, error_response, fabrix_headers_line, pretty};
+use super::{authorize, error_response, fabrix_headers_line, openai_type, pretty};
 
 /// 로그 한 건을 조립하는 데 필요한 것들. 스트리밍 제너레이터 안으로 통째로
 /// 옮겨가므로 소유 값만 담습니다.
@@ -195,7 +195,10 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Bytes
                 msg.clone(),
                 "요청 파싱 실패".into(),
             ));
-            return error_response(400, ErrorEnvelope::new(msg, "invalid_request_error", None));
+            return error_response(
+                400,
+                ErrorEnvelope::new(msg, openai_type(400), Some("invalid_json".into())),
+            );
         }
     };
     ctx.stream = req.is_stream();
@@ -236,7 +239,7 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Bytes
                     state.record(ctx.fail(&err));
                     return error_response(
                         err.status(),
-                        ErrorEnvelope::new(err.message(), err.kind(), None),
+                        err.envelope(),
                     );
                 }
             }
@@ -258,7 +261,10 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Bytes
             msg.clone(),
             "실패 · 모델 목록 없음".into(),
         ));
-        return error_response(502, ErrorEnvelope::new(msg, "upstream_error", None));
+        return error_response(
+            502,
+            ErrorEnvelope::new(msg, openai_type(502), Some("upstream_bad_response".into())),
+        );
     };
     ctx.model_alias = Some(model.alias.clone());
     ctx.model_id = Some(model.model_id.clone());
@@ -303,7 +309,11 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Bytes
                 msg.clone(),
                 "요청 검증 실패".into(),
             ));
-            return error_response(400, ErrorEnvelope::new(msg, "invalid_request_error", None));
+            return error_response(
+                400,
+                ErrorEnvelope::new(msg, openai_type(400), Some("invalid_value".into()))
+                    .with_param("messages"),
+            );
         }
     }
 
@@ -319,14 +329,14 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Bytes
     let Some(client) = state.fabrix_client() else {
         let err = FabrixError::NotConfigured;
         state.record(ctx.fail(&err));
-        return error_response(err.status(), ErrorEnvelope::new(err.message(), err.kind(), None));
+        return error_response(err.status(), err.envelope());
     };
 
     let res = match client.messages(&payload).await {
         Ok(res) => res,
         Err(err) => {
             state.record(ctx.fail(&err));
-            return error_response(err.status(), ErrorEnvelope::new(err.message(), err.kind(), None));
+            return error_response(err.status(), err.envelope());
         }
     };
 
@@ -599,7 +609,7 @@ fn stream_response(
         log.tool_rejects = scanner.rejected;
 
         if let Some(msg) = log.failure.clone() {
-            yield Ok(sse_json(&ErrorEnvelope::new(msg, "upstream_error", None)));
+            yield Ok(sse_json(&ErrorEnvelope::new(msg, openai_type(502), Some("upstream_error".into()))));
         } else {
             // 도구 호출이 하나라도 나왔으면 그 사실이 상위 사유보다 우선합니다 —
             // 클라이언트는 이 값으로 에이전트 루프를 계속할지 정합니다. 그다음이
@@ -633,7 +643,7 @@ async fn collect_response(
         Err(err) => {
             let err = FabrixError::from(err);
             state.record(ctx.fail(&err));
-            return error_response(err.status(), ErrorEnvelope::new(err.message(), err.kind(), None));
+            return error_response(err.status(), err.envelope());
         }
     };
 
@@ -646,7 +656,7 @@ async fn collect_response(
                 state.record(ctx.fail(&err));
                 return error_response(
                     err.status(),
-                    ErrorEnvelope::new(err.message(), err.kind(), None),
+                    err.envelope(),
                 );
             }
             // content 가 비어도 플러그인/RAG 답변이 contentReferences 등에 올 수 있어 폴백합니다.
@@ -659,7 +669,7 @@ async fn collect_response(
                     state.record(ctx.fail(&err));
                     return error_response(
                         err.status(),
-                        ErrorEnvelope::new(err.message(), err.kind(), None),
+                        err.envelope(),
                     );
                 }
             }
@@ -698,7 +708,7 @@ async fn collect_response(
     if parsed.content.is_empty() && parsed.reasoning.is_none() && !has_calls {
         let err = FabrixError::BadPayload(format!("본문 앞부분: {}", logstore::preview(&raw, 200)));
         state.record(ctx.fail(&err));
-        return error_response(err.status(), ErrorEnvelope::new(err.message(), err.kind(), None));
+        return error_response(err.status(), err.envelope());
     }
 
     let reason = if has_calls {

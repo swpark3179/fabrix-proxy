@@ -117,7 +117,10 @@ fn bad_request(state: &Shared, ctx: &Ctx, msg: String) -> Response {
         msg.clone(),
         "요청 검증 실패".into(),
     ));
-    error_response(400, ErrorEnvelope::new(msg, "invalid_request_error", None))
+    error_response(
+        400,
+        ErrorEnvelope::new(msg, super::openai_type(400), Some("invalid_value".into())),
+    )
 }
 
 /// 파이프라인 오류를 상태코드에 맞춰 기록하고 돌려줍니다.
@@ -131,7 +134,7 @@ fn image_err_response(state: &Shared, ctx: &Ctx, err: ImageError) -> Response {
         err.message(),
         format!("실패 · HTTP {status}"),
     ));
-    error_response(status, ErrorEnvelope::new(err.message(), err.kind(), None))
+    error_response(status, err.envelope())
 }
 
 /// 생성된 이미지 바이트들을 `b64_json` 응답으로 마무리하고 성공 로그를 남깁니다.
