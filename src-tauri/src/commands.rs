@@ -7,9 +7,9 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 use crate::config::{self, Config};
 use crate::logstore::LogEntry;
 use crate::port::{self, PortStatus};
-use crate::proxy::fabrix::{build_aliases, build_http_client, FabrixClient};
+use crate::proxy::fabrix::{build_aliases, build_http_client, FabrixClient, ResolvedModel};
 use crate::proxy::{self};
-use crate::state::{Shared, Snapshot};
+use crate::state::{Shared, Snapshot, MODELS_CACHE_TTL};
 use crate::{tray, windows};
 
 #[tauri::command]
@@ -48,12 +48,124 @@ pub fn check_port(state: State<'_, Shared>, port: u16) -> PortStatus {
     port::inspect(port, state.running_port())
 }
 
+// ─────────────────────────── 모델 목록 ───────────────────────────
+
+/// 모델 목록 창과 설정 폼이 보는 한 줄.
+///
+/// `ResolvedModel` 을 그대로 내보내지 않는 이유: 화면이 필요로 하는 것(`isDefault`)이
+/// 프록시 내부 표현에 있을 이유가 없고, 여기 필드를 늘려도 `/v1/models` **HTTP 응답이
+/// 흔들리지 않아야** 합니다(그쪽은 OpenAI 의 4키를 지킵니다).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRow {
+    /// 클라이언트가 `model` 칸에 넣는 값 — 화면의 복사 대상입니다.
+    pub alias: String,
+    /// 실제로 사내에 보내는 UUID. 사내 담당자와 대조할 때 이 값이 필요합니다.
+    pub model_id: String,
+    /// 사람이 읽는 이름 (예: `챗 4`).
+    pub label: String,
+    pub description: Option<String>,
+    pub is_default: bool,
+}
+
+impl ModelRow {
+    fn from(m: &ResolvedModel, default_alias: &str) -> Self {
+        Self {
+            alias: m.alias.clone(),
+            model_id: m.model_id.clone(),
+            label: m.label.clone(),
+            description: m.description.clone(),
+            is_default: m.alias == default_alias,
+        }
+    }
+
+    pub fn rows(models: &[ResolvedModel], default_alias: &str) -> Vec<Self> {
+        models.iter().map(|m| Self::from(m, default_alias)).collect()
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelListResult {
+    pub models: Vec<ModelRow>,
+    pub cached: bool,
+    /// 로컬 RFC3339. 화면이 이 값으로 "n초 전 조회" 를 계산합니다.
+    pub fetched_at: String,
+    /// 빈 문자열이면 목록의 첫 모델이 기본입니다.
+    pub default_alias: String,
+    /// 어느 서버에서 가져온 목록인지 — 설정을 바꿔 두고 헷갈리는 일이 많습니다.
+    pub source_url: String,
+    pub cache_ttl_secs: u64,
+}
+
+/// 모델 목록. `refresh: true` 면 60초 캐시를 무시하고 새로 받습니다.
+///
+/// 커맨드를 둘로 나누지 않은 이유: IPC 표면은 `lib.rs` 와 `ipc.ts` **두 곳**에 이름을
+/// 적어야 하고, 화면에는 "다시 조회" 버튼 하나뿐이라 나누면 잘못 부르기만 쉬워집니다.
+///
+/// 사내에서 새로 가져왔을 때만 `emit_state()` 를 부릅니다 — 그래야 메인 창의
+/// `/v1/models` 카드가 `사내 모델 목록 중계` → `사내 모델 7개 노출` 로 따라옵니다
+/// (`Snapshot.model_count` 는 캐시가 따뜻할 때만 채워집니다). 매번 부르면 스냅샷
+/// 이벤트가 불필요하게 퍼집니다.
+#[tauri::command]
+pub async fn list_models(app: AppHandle, refresh: bool) -> Result<ModelListResult, String> {
+    // 가드가 await 를 넘지 못하므로 Arc 를 복사해 나옵니다 (state.rs 머리말 참고).
+    let state = app.state::<Shared>().inner().clone();
+    let cfg = state.config();
+
+    let (models, cached, fetched_at) = proxy::models::load_models(&state, refresh)
+        .await
+        .map_err(|err| err.message())?;
+
+    if !cached {
+        state.emit_state();
+    }
+
+    Ok(ModelListResult {
+        models: ModelRow::rows(&models, &cfg.default_model_alias),
+        cached,
+        fetched_at,
+        default_alias: cfg.default_model_alias.clone(),
+        source_url: cfg.normalized_base_url(),
+        cache_ttl_secs: MODELS_CACHE_TTL.as_secs(),
+    })
+}
+
+/// 목록 창에서 기본 모델을 바꿉니다.
+///
+/// 프런트가 `Config` 를 통째로 `save_config` 에 넘기지 않는 이유: 목록 창은 나머지
+/// 설정을 화면에 들고 있지 않아, 설정 창에 초안이 열려 있는 동안 저장하면 다른 필드를
+/// 예전 값으로 덮어씁니다. 여기서 읽고-바꿔-쓰기 합니다.
+#[tauri::command]
+pub async fn set_default_model(app: AppHandle, alias: String) -> Result<Snapshot, String> {
+    let state = app.state::<Shared>().inner().clone();
+    let mut cfg = state.config();
+    cfg.default_model_alias = alias.trim().to_string();
+
+    config::save_config(&cfg).map_err(|err| format!("설정을 저장하지 못했습니다: {err}"))?;
+    state.replace_config(cfg);
+    state.emit_state();
+    Ok(state.snapshot())
+}
+
+#[tauri::command]
+pub fn open_models_window(app: AppHandle) {
+    windows::show_models(&app);
+}
+
+/// 미설정 안내의 버튼이 대시보드가 아니라 설정 폼에 떨어지게 합니다.
+#[tauri::command]
+pub fn open_settings_window(app: AppHandle) {
+    windows::show_settings(&app);
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TestResult {
     pub model_count: usize,
-    /// 앞의 몇 개만 — 연결이 됐다는 증거로 보여줍니다.
-    pub sample: Vec<String>,
+    /// 시험한 서버의 모델 전체. 설정 폼이 이걸로 기본 모델 선택기를 채웁니다 —
+    /// 저장 전이라 공유 캐시에는 없는 목록입니다.
+    pub models: Vec<ModelRow>,
 }
 
 /// 온보딩/설정의 "연결 확인". 저장하지 않고 주어진 값으로만 시험합니다.
@@ -85,11 +197,9 @@ pub async fn test_connection(
     let models = build_aliases(&raw);
     Ok(TestResult {
         model_count: models.len(),
-        sample: models
-            .iter()
-            .take(4)
-            .map(|m| format!("{} · {}", m.alias, m.label))
-            .collect(),
+        // `"{alias} · {label}"` 포맷을 Rust 에 둘 이유가 없어졌습니다 — 화면이 목록을
+        // 통째로 받아 문구도 만들고 기본 모델 선택기도 채웁니다.
+        models: ModelRow::rows(&models, &probe.default_model_alias),
     })
 }
 

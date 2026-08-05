@@ -60,10 +60,11 @@ export function ConnectionForm({ initial, variant, busy, onSave, onCancel }: Pro
         openapiToken: draft.openapiToken,
         insecureSkipVerify: draft.insecureSkipVerify,
       })
-      setProbe({
-        state: 'ok',
-        text: `연결됨 · 모델 ${result.modelCount}개 — ${result.sample.join(', ')}`,
-      })
+      const sample = result.models
+        .slice(0, 4)
+        .map((m) => `${m.alias} · ${m.label}`)
+        .join(', ')
+      setProbe({ state: 'ok', text: `연결됨 · 모델 ${result.modelCount}개 — ${sample}` })
     } catch (err) {
       setProbe({ state: 'error', text: errText(err) })
     }

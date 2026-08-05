@@ -82,6 +82,38 @@ pub fn show_log(app: &AppHandle) {
     }
 }
 
+const MODELS_W: f64 = 900.0;
+const MODELS_H: f64 = 600.0;
+
+/// models — 모델 목록. **처음 열 때 만듭니다.**
+///
+/// 다른 세 창과 달리 [`create_all`] 에 넣지 않은 이유: 이 창은 푸시 이벤트를 기다릴
+/// 필요가 없고(마운트 때 스스로 조회합니다), 대부분의 실행에서 한 번도 열리지
+/// 않습니다. 시작할 때 webview 를 하나 더 띄우는 값을 내지 않습니다. 한 번 만들면
+/// 닫기(✕)가 숨김이라 두 번째부터는 `show` 만 합니다.
+pub fn show_models(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("models") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+        return;
+    }
+    match WebviewWindowBuilder::new(app, "models", WebviewUrl::App("models.html".into()))
+        .title("모델 목록")
+        .inner_size(MODELS_W, MODELS_H)
+        .min_inner_size(780.0, 420.0)
+        .resizable(true)
+        .decorations(false)
+        .center()
+        .build()
+    {
+        Ok(window) => {
+            let _ = window.set_focus();
+        }
+        Err(err) => eprintln!("[windows] 모델 목록 창을 열지 못했습니다: {err}"),
+    }
+}
+
 /// 메인 창을 띄우면서 설정 화면을 열라고 알립니다.
 pub fn show_settings(app: &AppHandle) {
     show_main(app);

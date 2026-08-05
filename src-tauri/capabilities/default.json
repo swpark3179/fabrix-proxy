@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "메인 · 로그 · 토스트 창에 필요한 기본 권한",
-  "windows": ["main", "log", "toast"],
+  "description": "메인 · 로그 · 모델 목록 · 토스트 창에 필요한 기본 권한",
+  "windows": ["main", "log", "models", "toast"],
   "permissions": [
     "core:default",
     "core:event:default",

@@ -1,7 +1,14 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 
-import type { Config, LogEntry, PortStatus, Snapshot, TestResult } from '../types'
+import type {
+  Config,
+  LogEntry,
+  ModelListResult,
+  PortStatus,
+  Snapshot,
+  TestResult,
+} from '../types'
 
 export const getSnapshot = () => invoke<Snapshot>('get_snapshot')
 export const getConfig = () => invoke<Config>('get_config')
@@ -28,6 +35,14 @@ export const toggleProxy = () => invoke<Snapshot>('toggle_proxy')
 export const copyEndpoint = () => invoke<string>('copy_endpoint')
 export const openLogWindow = () => invoke<void>('open_log_window')
 export const quitApp = () => invoke<void>('quit_app')
+
+/** `refresh: true` 면 60초 캐시를 무시하고 사내에서 새로 받습니다. */
+export const listModels = (refresh = false) =>
+  invoke<ModelListResult>('list_models', { refresh })
+export const setDefaultModel = (alias: string) =>
+  invoke<Snapshot>('set_default_model', { alias })
+export const openModelsWindow = () => invoke<void>('open_models_window')
+export const openSettingsWindow = () => invoke<void>('open_settings_window')
 
 // ── 이벤트 ────────────────────────────────────────────────────
 
