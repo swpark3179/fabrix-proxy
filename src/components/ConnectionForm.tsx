@@ -1,12 +1,33 @@
 import { writeText } from '@tauri-apps/plugin-clipboard-manager'
 import { useEffect, useState } from 'react'
 
-import { errText, getConfigPath, issueToken, testConnection } from '../lib/ipc'
-import type { Config } from '../types'
+import {
+  errText,
+  getConfigPath,
+  issueToken,
+  listModels,
+  openModelsWindow,
+  testConnection,
+} from '../lib/ipc'
+import type { Config, ModelRow } from '../types'
 
-// 사내 이미지/비전 모델 후보. 실제 목록은 파이썬 샘플(이미지 분석/생성) 확정 시 갱신합니다.
+// 사내 이미지/비전 모델 후보.
+//
+// 채팅 모델과 달리 하드코딩입니다 — 사내에 이미지/비전 모델을 나열하는 엔드포인트가
+// 없습니다. 파이썬 샘플(이미지 분석/생성) 확정 시 갱신합니다.
 const IMAGE_MODELS = ['flux-2.0', 'flux-1.1-pro', 'flux-dev']
 const VISION_MODELS = ['gemma-4', 'gemma-3']
+
+/** `직접 입력…` 을 고른 상태를 나타내는 센티널. 실제 alias 와 겹칠 수 없는 값입니다. */
+const MANUAL = '\u0000manual'
+
+/** 기본 모델 선택기를 채울 목록의 상태. */
+type Choices =
+  | { s: 'off' }
+  | { s: 'loading' }
+  | { s: 'ready'; rows: ModelRow[] }
+  /** 미설정·오프라인·조회 실패 — 자유 입력으로 되돌립니다. */
+  | { s: 'unavailable' }
 
 /** 현재 저장된 값이 후보 목록에 없더라도 드롭다운에서 사라지지 않게 앞에 끼워 줍니다. */
 function withCurrent(list: string[], current: string): string[] {
@@ -38,10 +59,29 @@ export function ConnectionForm({ initial, variant, busy, onSave, onCancel }: Pro
   const [configPath, setConfigPath] = useState('')
   const [saveError, setSaveError] = useState('')
   const [tokenCopied, setTokenCopied] = useState(false)
+  const [choices, setChoices] = useState<Choices>({ s: 'off' })
+  const [manual, setManual] = useState(false)
 
   useEffect(() => {
     void getConfigPath().then(setConfigPath)
   }, [])
+
+  // 저장된 설정이 있는 설정 화면에서만 목록을 미리 받아 둡니다. 온보딩에는 아직 시험할
+  // 대상이 없으므로 `연결 확인` 이 목록을 채워 줍니다(아래 runProbe).
+  //
+  // 실패는 **조용히** unavailable 로 내립니다 — 설정 화면을 열었을 뿐인데 오류 배너가
+  // 뜨면 안 됩니다. 자유 입력으로 되돌아가므로 오프라인에서도 막히지 않습니다.
+  useEffect(() => {
+    if (variant !== 'settings') return
+    let alive = true
+    setChoices({ s: 'loading' })
+    void listModels(false)
+      .then((result) => alive && setChoices({ s: 'ready', rows: result.models }))
+      .catch(() => alive && setChoices({ s: 'unavailable' }))
+    return () => {
+      alive = false
+    }
+  }, [variant])
 
   const set = <K extends keyof Config>(key: K, value: Config[K]) =>
     setDraft((prev) => ({ ...prev, [key]: value }))
@@ -65,6 +105,8 @@ export function ConnectionForm({ initial, variant, busy, onSave, onCancel }: Pro
         .map((m) => `${m.alias} · ${m.label}`)
         .join(', ')
       setProbe({ state: 'ok', text: `연결됨 · 모델 ${result.modelCount}개 — ${sample}` })
+      // 초안 값으로 시험한 **그 서버**의 목록이라 저장 전에는 이게 가장 정확합니다.
+      setChoices({ s: 'ready', rows: result.models })
     } catch (err) {
       setProbe({ state: 'error', text: errText(err) })
     }
@@ -188,15 +230,69 @@ export function ConnectionForm({ initial, variant, busy, onSave, onCancel }: Pro
                 onChange={(e) => set('port', Number(e.target.value.replace(/\D/g, '')) || 0)}
               />
             </div>
+            {/* 예전 라벨은 "모르는 모델명이 오면 이걸로" 였습니다. 이제 모르는 이름은
+                404 model_not_found 이므로, 이 값이 쓰이는 곳은 model 을 아예 안 보낸
+                요청뿐입니다. */}
             <div className="field">
-              <span className="field__label">기본 모델 alias — 모르는 모델명이 오면 이걸로</span>
-              <input
-                className="text-input"
-                placeholder="비우면 목록의 첫 모델"
-                value={draft.defaultModelAlias}
-                onChange={(e) => set('defaultModelAlias', e.target.value)}
-                spellCheck={false}
-              />
+              <span className="field__label">기본 모델 — model 을 안 보낸 요청에 쓸 모델</span>
+              {manual || choices.s !== 'ready' ? (
+                <input
+                  className="text-input"
+                  placeholder="비우면 목록의 첫 모델"
+                  value={draft.defaultModelAlias}
+                  onChange={(e) => set('defaultModelAlias', e.target.value)}
+                  spellCheck={false}
+                />
+              ) : (
+                <select
+                  className="text-input"
+                  value={draft.defaultModelAlias}
+                  onChange={(e) => {
+                    if (e.target.value === MANUAL) {
+                      // 값은 그대로 두고 입력칸으로만 바꿉니다 — 고르자마자 지워지면
+                      // 직전 값을 다시 타이핑해야 합니다.
+                      setManual(true)
+                      return
+                    }
+                    set('defaultModelAlias', e.target.value)
+                  }}
+                >
+                  <option value="">— 목록의 첫 모델 —</option>
+                  {choices.rows.map((m) => (
+                    <option key={m.alias} value={m.alias}>
+                      {m.label} · {m.alias}
+                    </option>
+                  ))}
+                  {/* 저장된 값이 목록에 없어도 드롭다운에서 사라지지 않게 —
+                      withCurrent() 와 같은 규칙입니다. */}
+                  {draft.defaultModelAlias !== '' &&
+                    !choices.rows.some((m) => m.alias === draft.defaultModelAlias) && (
+                      <option value={draft.defaultModelAlias}>
+                        {draft.defaultModelAlias} (목록에 없음)
+                      </option>
+                    )}
+                  <option value={MANUAL}>직접 입력…</option>
+                </select>
+              )}
+              <span className="field__row">
+                {choices.s === 'loading' && (
+                  <span className="field__label field__label--muted">목록을 불러오는 중…</span>
+                )}
+                {choices.s === 'unavailable' && (
+                  <span className="field__label field__label--muted">
+                    목록을 못 받았습니다 — 이름을 직접 넣거나 연결 확인을 눌러 보세요.
+                  </span>
+                )}
+                <span className="spacer" style={{ flex: 1 }} />
+                <button
+                  type="button"
+                  className="link"
+                  onClick={() => void openModelsWindow()}
+                  title="쓸 수 있는 모델과 각 ID 를 보고 복사합니다"
+                >
+                  모델 목록 보기 →
+                </button>
+              </span>
             </div>
           </div>
 
