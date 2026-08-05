@@ -7,7 +7,7 @@
 
 use std::time::Instant;
 
-use axum::body::Bytes;
+use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue};
 use axum::response::{IntoResponse, Response};
@@ -25,7 +25,9 @@ use crate::proxy::fabrix::FabrixError;
 use crate::proxy::image_backend::{self, ImageError};
 use crate::state::{self, Shared};
 
-use super::{authorize, error_response, fabrix_headers_line, pretty};
+use super::{
+    authorize, error_response, fabrix_headers_line, pretty, read_body, IMAGE_BODY_LIMIT,
+};
 
 /// 기본 대체 프롬프트 — 스펙의 빈 프롬프트 처리와 맞춥니다.
 const FALLBACK_PROMPT: &str = "A high-quality reference image.";
@@ -168,9 +170,14 @@ fn finish(state: &Shared, ctx: Ctx, images: Vec<Vec<u8>>) -> Response {
 
 // ─────────────────────────── generations (t2i) ───────────────────────────
 
-pub async fn generations(State(state): State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
+pub async fn generations(State(state): State<Shared>, headers: HeaderMap, body: Body) -> Response {
     let cfg = state.config();
     let ua = headers.get("user-agent").and_then(|v| v.to_str().ok());
+    // 상한은 우리가 겁니다 — 레이어에 맡기면 초과가 로그에 남지 않습니다.
+    let body = match read_body(&headers, body, IMAGE_BODY_LIMIT).await {
+        Ok(bytes) => bytes,
+        Err(envelope) => return error_response(413, envelope),
+    };
     let incoming: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
 
     let mut ctx = Ctx {
@@ -268,9 +275,13 @@ async fn generate_n(
 
 // ─────────────────────────── edits (i2i · gemma → FLUX) ───────────────────────────
 
-pub async fn edits(State(state): State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
+pub async fn edits(State(state): State<Shared>, headers: HeaderMap, body: Body) -> Response {
     let cfg = state.config();
     let ua = headers.get("user-agent").and_then(|v| v.to_str().ok());
+    let body = match read_body(&headers, body, IMAGE_BODY_LIMIT).await {
+        Ok(bytes) => bytes,
+        Err(envelope) => return error_response(413, envelope),
+    };
     let incoming: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
 
     let mut ctx = Ctx {

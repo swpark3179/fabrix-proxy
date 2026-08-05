@@ -60,46 +60,35 @@ pub fn stop(state: &Shared) {
 }
 
 /// 이미지 요청 본문 상한. i2i 의 base64 data URL 은 axum 기본값(2MiB)을 쉽게 넘깁니다.
-const IMAGE_BODY_LIMIT: usize = 25 * 1024 * 1024;
+pub const IMAGE_BODY_LIMIT: usize = 25 * 1024 * 1024;
 
 /// 채팅 요청 본문 상한.
 ///
 /// axum 기본값은 2MiB 인데, 에이전트 클라이언트는 도구 스키마 여러 벌에 더해 읽은
 /// 파일 내용을 `role:"tool"` 결과로 되먹이기 때문에 긴 세션에서 이를 넘길 수 있습니다.
-/// 넘기면 axum 이 **핸들러에 들어오기 전에** 413 을 내므로 로그 창에 아무 흔적도
-/// 남지 않습니다 — 사용자 입장에서는 원인 없는 실패입니다.
-const CHAT_BODY_LIMIT: usize = 16 * 1024 * 1024;
+pub const CHAT_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
 fn router(state: Shared) -> Router {
     Router::new()
+        // 본문 상한은 `DefaultBodyLimit` 레이어가 아니라 **핸들러 안에서** 겁니다
+        // (`read_body`). 레이어에 맡기면 초과가 핸들러에 들어오기 전에 axum 의 평문
+        // 413 으로 끝나 로그 창에 아무 흔적도 남지 않습니다 — 사용자 입장에서는
+        // 원인 없는 실패였습니다.
         .route("/v1/models", get(models::handle))
-        .route(
-            "/v1/chat/completions",
-            post(chat::handle).layer(DefaultBodyLimit::max(CHAT_BODY_LIMIT)),
-        )
-        .route(
-            "/v1/images/generations",
-            post(images::generations).layer(DefaultBodyLimit::max(IMAGE_BODY_LIMIT)),
-        )
-        .route(
-            "/v1/images/edits",
-            post(images::edits).layer(DefaultBodyLimit::max(IMAGE_BODY_LIMIT)),
-        )
+        .route("/v1/chat/completions", post(chat::handle))
+        .route("/v1/images/generations", post(images::generations))
+        .route("/v1/images/edits", post(images::edits))
         // Base URL 에 `/v1` 을 빼먹고 넣는 클라이언트도 받아 줍니다.
         .route("/models", get(models::handle))
-        .route(
-            "/chat/completions",
-            post(chat::handle).layer(DefaultBodyLimit::max(CHAT_BODY_LIMIT)),
-        )
-        .route(
-            "/images/generations",
-            post(images::generations).layer(DefaultBodyLimit::max(IMAGE_BODY_LIMIT)),
-        )
-        .route(
-            "/images/edits",
-            post(images::edits).layer(DefaultBodyLimit::max(IMAGE_BODY_LIMIT)),
-        )
+        .route("/chat/completions", post(chat::handle))
+        .route("/images/generations", post(images::generations))
+        .route("/images/edits", post(images::edits))
         .route("/health", get(health))
+        .layer(DefaultBodyLimit::disable())
+        // 아는 경로에 잘못된 메서드가 오면 axum 기본값은 **본문 없는 405** 입니다.
+        // `.fallback` 은 모르는 경로만 잡으므로 따로 답니다. 라우트를 다 등록한 뒤에
+        // 불러야 그 시점의 라우트들에 적용됩니다.
+        .method_not_allowed_fallback(method_not_allowed)
         .fallback(not_found)
         .layer(CorsLayer::permissive())
         .with_state(state)
@@ -134,6 +123,54 @@ pub fn openai_type(status: u16) -> &'static str {
         s if s >= 500 => "api_error",
         _ => "invalid_request_error",
     }
+}
+
+fn method_not_allowed_envelope() -> ErrorEnvelope {
+    ErrorEnvelope::new(
+        "이 경로가 받지 않는 메서드입니다. 채팅·이미지는 POST, 모델 목록은 GET 입니다.",
+        openai_type(405),
+        Some("method_not_allowed".into()),
+    )
+}
+
+async fn method_not_allowed() -> Response {
+    error_response(405, method_not_allowed_envelope())
+}
+
+/// 요청 본문을 상한까지 읽습니다. 초과면 OpenAI 봉투를 돌려줄 수 있도록 `Err` 입니다.
+///
+/// `DefaultBodyLimit` 레이어에 맡기지 않는 이유: 그러면 초과가 핸들러에 **들어오기
+/// 전에** axum 의 평문 413 으로 끝나 로그에 한 줄도 남지 않습니다. 우리가 읽으면
+/// 봉투도 주고 로그도 남깁니다.
+///
+/// `content-length` 를 먼저 보는 이유는 한 바이트도 받지 않고 거절할 수 있기 때문입니다.
+/// 그 헤더가 없는(chunked) 요청은 `to_bytes` 의 상한이 잡습니다 — 상한을 두 겹으로
+/// 겁니다.
+pub async fn read_body(
+    headers: &HeaderMap,
+    body: axum::body::Body,
+    limit: usize,
+) -> Result<axum::body::Bytes, ErrorEnvelope> {
+    let declared = headers
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok());
+    if declared.is_some_and(|n| n > limit) {
+        return Err(too_large(limit));
+    }
+    axum::body::to_bytes(body, limit).await.map_err(|_| too_large(limit))
+}
+
+fn too_large(limit: usize) -> ErrorEnvelope {
+    ErrorEnvelope::new(
+        format!(
+            "요청 본문이 상한({} MiB)을 넘었습니다. 에이전트 세션이 길어지면 도구 결과가 \
+             쌓여 이 값을 넘길 수 있습니다 — 대화를 새로 시작하거나 첨부를 줄이세요.",
+            limit / (1024 * 1024)
+        ),
+        openai_type(413),
+        Some("request_too_large".into()),
+    )
 }
 
 pub fn error_response(status: u16, envelope: ErrorEnvelope) -> Response {
@@ -282,6 +319,49 @@ mod tests {
         assert_eq!(status, 401);
         assert_eq!(env.error.kind, "authentication_error");
         assert_eq!(env.error.code.as_deref(), Some("invalid_api_key"));
+    }
+
+    /// 예전에는 axum 이 **본문 없는** 405 를 냈습니다 — 봉투로 분기하는 클라이언트에는
+    /// 원인 없는 실패였습니다.
+    #[test]
+    fn method_not_allowed_is_an_envelope() {
+        let env = method_not_allowed_envelope();
+        assert_eq!(env.error.kind, "invalid_request_error");
+        assert_eq!(env.error.code.as_deref(), Some("method_not_allowed"));
+        assert!(env.error.message.contains("POST"));
+    }
+
+    /// 예전에는 axum 이 핸들러 밖에서 **평문** 413 을 냈습니다.
+    #[test]
+    fn oversized_body_is_an_envelope_that_names_the_limit() {
+        let env = too_large(CHAT_BODY_LIMIT);
+        assert_eq!(env.error.kind, "invalid_request_error");
+        assert_eq!(env.error.code.as_deref(), Some("request_too_large"));
+        assert!(env.error.message.contains("16 MiB"), "{}", env.error.message);
+        assert!(too_large(IMAGE_BODY_LIMIT).error.message.contains("25 MiB"));
+    }
+
+    #[tokio::test]
+    async fn read_body_rejects_by_declared_content_length_without_reading() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-length", (CHAT_BODY_LIMIT + 1).to_string().parse().unwrap());
+        // 본문은 비어 있지만 선언된 길이만으로 거절해야 합니다 — 한 바이트도 받지 않습니다.
+        let err = read_body(&headers, axum::body::Body::empty(), CHAT_BODY_LIMIT)
+            .await
+            .expect_err("413 이 나야 합니다");
+        assert_eq!(err.error.code.as_deref(), Some("request_too_large"));
+    }
+
+    /// `content-length` 가 없는(chunked) 요청도 상한이 잡아야 합니다 — 상한 두 겹의 두 번째.
+    #[tokio::test]
+    async fn read_body_rejects_oversized_chunked_body() {
+        let err = read_body(&HeaderMap::new(), axum::body::Body::from(vec![0u8; 64]), 8)
+            .await
+            .expect_err("413 이 나야 합니다");
+        assert_eq!(err.error.code.as_deref(), Some("request_too_large"));
+
+        let ok = read_body(&HeaderMap::new(), axum::body::Body::from(vec![0u8; 8]), 8).await;
+        assert_eq!(ok.unwrap().len(), 8);
     }
 
     #[test]

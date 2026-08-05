@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::convert::Infallible;
 use std::time::{Duration, Instant};
 
-use axum::body::Bytes;
+use axum::body::Body;
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::sse::{Event, Sse};
@@ -31,7 +31,10 @@ use super::fabrix::{
 use super::models::ensure_models;
 use super::tools::{self, ToolCallScanner};
 use super::validate;
-use super::{authorize, error_response, fabrix_headers_line, openai_type, pretty};
+use super::{
+    authorize, error_response, fabrix_headers_line, openai_type, pretty, read_body,
+    CHAT_BODY_LIMIT,
+};
 
 /// 로그 한 건을 조립하는 데 필요한 것들. 스트리밍 제너레이터 안으로 통째로
 /// 옮겨가므로 소유 값만 담습니다.
@@ -56,6 +59,13 @@ struct Ctx {
     plan: validate::Plan,
 }
 
+/// 스트림이 중간에 끊겼을 때 마지막 청크에 넣는 `finish_reason`.
+///
+/// `stop` 은 쓰지 않습니다 — 끊긴 답변을 완성된 것처럼 부르는 거짓말이 됩니다
+/// (`d550bc4` 의 "절단은 length" 와 같은 판단). 이 값을 보고 자동으로 이어받기를
+/// 시도하는 클라이언트가 있다는 것이 대가입니다. 뒤집으려면 이 한 줄만 고치면 됩니다.
+const MIDSTREAM_FINISH: &str = "length";
+
 /// 로그 꼬리에 붙일 도구 관련 한 줄.
 ///
 /// "요청에 도구가 있었는데 프록시가 버렸다" 와 "도구는 전달됐는데 모델이 안 썼다" 를
@@ -75,6 +85,44 @@ fn tool_meta(declared: usize, emulated: bool, calls: u32, rejects: u32) -> Optio
         line.push_str(&format!(" · 형식 오류 {rejects}건은 텍스트로 되돌림"));
     }
     Some(line)
+}
+
+/// 본문이 상한을 넘어 `Ctx` 를 만들기도 전에 끝난 호출의 로그 한 건.
+///
+/// 지금까지 이 실패는 axum 이 핸들러 밖에서 처리해 **로그에 흔적이 없었습니다**.
+/// 사용자에게는 원인 없는 실패였습니다.
+fn oversize_entry(
+    started: Instant,
+    client: Option<String>,
+    cfg: &crate::config::Config,
+    envelope: &ErrorEnvelope,
+) -> LogEntry {
+    LogEntry {
+        id: Uuid::new_v4().to_string(),
+        ts: state::now_hm(),
+        ts_full: state::now_iso(),
+        kind: Kind::Chat,
+        method: Kind::Chat.method(),
+        path: Kind::Chat.path().into(),
+        status: 413,
+        latency_ms: started.elapsed().as_millis() as u64,
+        stream: false,
+        cached: false,
+        model_requested: None,
+        model_alias: None,
+        model_id: None,
+        model_label: None,
+        client,
+        note: Some("본문이 너무 큼".into()),
+        summary: Some("본문이 너무 큼".into()),
+        is_error: true,
+        req_openai: "(본문이 상한을 넘어 읽지 않았습니다)".into(),
+        req_fabrix: "(사내 호출을 하지 않았습니다)".into(),
+        req_fabrix_headers: fabrix_headers_line(cfg),
+        fabrix_url: format!("{}{MESSAGES_PATH}", cfg.normalized_base_url()),
+        resp_body: envelope.error.message.clone(),
+        resp_meta: "거부 · HTTP 413".into(),
+    }
 }
 
 impl Ctx {
@@ -138,11 +186,22 @@ impl Ctx {
     }
 }
 
-pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
+pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Body) -> Response {
     let started = Instant::now();
     let cfg = state.config();
 
     let ua = headers.get("user-agent").and_then(|v| v.to_str().ok());
+    let client = logstore::short_client(ua);
+
+    // 본문 상한을 우리가 겁니다 — 레이어에 맡기면 초과가 로그에 남지 않습니다.
+    let body = match read_body(&headers, body, CHAT_BODY_LIMIT).await {
+        Ok(bytes) => bytes,
+        Err(envelope) => {
+            state.record(oversize_entry(started, client, &cfg, &envelope));
+            return error_response(413, envelope);
+        }
+    };
+
     // 인바운드 Authorization: 키발급없이 허용 모드면 값과 무관하게 통과,
     // 토큰 사용 모드면 발행 토큰과 일치할 때만 통과합니다. (아래 authorize 에서 검사)
     let incoming: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
@@ -150,7 +209,7 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Bytes
     let mut ctx = Ctx {
         started,
         stream: false,
-        client: logstore::short_client(ua),
+        client,
         model_requested: None,
         model_alias: None,
         model_id: None,
@@ -186,13 +245,20 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Bytes
     let req: ChatRequest = match serde_json::from_slice(&body) {
         Ok(req) => req,
         Err(err) => {
-            let msg = format!("요청 본문을 해석하지 못했습니다: {err}");
+            // 응답에는 위치만 알려 줍니다. serde 의 원문에는 파싱하다 만 **요청 본문
+            // 조각**이 섞여 나올 수 있어, 그대로 되돌려주면 클라이언트 로그로 흘러갑니다.
+            // 진단에 필요한 전문은 로그 ③ 칸에만 담습니다.
+            let msg = format!(
+                "요청 본문을 JSON 으로 해석하지 못했습니다 (line {}, column {}).",
+                err.line(),
+                err.column()
+            );
             state.record(ctx.entry(
                 400,
                 true,
                 Some("잘못된 요청".into()),
                 Some("잘못된 요청".into()),
-                msg.clone(),
+                format!("{msg}\n\n{err}"),
                 "요청 파싱 실패".into(),
             ));
             return error_response(
@@ -610,6 +676,11 @@ fn stream_response(
 
         if let Some(msg) = log.failure.clone() {
             yield Ok(sse_json(&ErrorEnvelope::new(msg, openai_type(502), Some("upstream_error".into()))));
+            // 오류 프레임 뒤에도 finish 청크를 넣습니다 — 없으면 종료 사유를 기다리는
+            // 클라이언트가 [DONE] 을 받고도 스트림을 미완으로 남깁니다.
+            yield Ok(sse_json(&ChatChunk::new(
+                &id, created, &model, Delta::default(), Some(MIDSTREAM_FINISH.into()),
+            )));
         } else {
             // 도구 호출이 하나라도 나왔으면 그 사실이 상위 사유보다 우선합니다 —
             // 클라이언트는 이 값으로 에이전트 루프를 계속할지 정합니다. 그다음이
