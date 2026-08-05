@@ -17,29 +17,52 @@ use crate::state::{self, ModelsCache, Shared, MODELS_CACHE_TTL};
 use super::fabrix::{build_aliases, FabrixError, ResolvedModel, MODELS_PATH};
 use super::{authorize, error_response, fabrix_headers_line, inbound_auth_line};
 
-/// `(모델 목록, 캐시에서 나왔는지)`.
+/// `(모델 목록, 캐시에서 나왔는지)`. 60초 TTL 을 지킵니다.
+///
+/// 시그니처를 그대로 두는 이유: 호출부가 둘(`chat.rs`·아래 `handle`)이고 둘 다 강제
+/// 갱신을 쓰지 않습니다.
+pub async fn ensure_models(state: &Shared) -> Result<(Vec<ResolvedModel>, bool), FabrixError> {
+    load_models(state, false).await.map(|(models, cached, _)| (models, cached))
+}
+
+/// `(모델 목록, 캐시에서 나왔는지, 조회 시각 ISO)`.
+///
+/// `force` 면 60초 TTL 을 무시하고 사내에서 새로 받습니다.
+///
+/// 캐시를 **먼저 비우지 않는** 것이 중요합니다. 비우고 나서 조회가 실패하면 멀쩡했던
+/// 목록까지 잃고, 그러면 화면의 "다시 조회" 한 번이 진행 중인 `/v1/models` 호출과
+/// 채팅의 모델 해석까지 같이 깨뜨립니다. 성공한 뒤에만 덮어씁니다.
 ///
 /// 뮤텍스 가드를 `await` 너머로 들고 가지 않도록 잠금 구간을 블록으로 닫습니다.
-pub async fn ensure_models(state: &Shared) -> Result<(Vec<ResolvedModel>, bool), FabrixError> {
-    let cached = {
-        let guard = state.models_cache.lock().unwrap();
-        guard
-            .as_ref()
-            .filter(|c| c.fetched_at.elapsed() < MODELS_CACHE_TTL)
-            .map(|c| c.models.clone())
-    };
-    if let Some(models) = cached {
-        return Ok((models, true));
+pub async fn load_models(
+    state: &Shared,
+    force: bool,
+) -> Result<(Vec<ResolvedModel>, bool, String), FabrixError> {
+    if !force {
+        let cached = {
+            let guard = state.models_cache.lock().unwrap();
+            guard
+                .as_ref()
+                .filter(|c| c.fetched_at.elapsed() < MODELS_CACHE_TTL)
+                .map(|c| (c.models.clone(), c.fetched_at_iso.clone()))
+        };
+        if let Some((models, fetched_at)) = cached {
+            return Ok((models, true, fetched_at));
+        }
     }
 
     let client = state.fabrix_client().ok_or(FabrixError::NotConfigured)?;
     let raw = client.list_models().await?;
     let models = build_aliases(&raw);
+    let fetched_at = state::now_iso();
 
-    *state.models_cache.lock().unwrap() =
-        Some(ModelsCache { fetched_at: Instant::now(), models: models.clone() });
+    *state.models_cache.lock().unwrap() = Some(ModelsCache {
+        fetched_at: Instant::now(),
+        fetched_at_iso: fetched_at.clone(),
+        models: models.clone(),
+    });
 
-    Ok((models, false))
+    Ok((models, false, fetched_at))
 }
 
 pub async fn handle(State(state): State<Shared>, headers: HeaderMap) -> Response {

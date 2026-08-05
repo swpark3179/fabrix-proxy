@@ -28,6 +28,9 @@ pub struct ServerHandle {
 
 pub struct ModelsCache {
     pub fetched_at: Instant,
+    /// TTL 판정은 `fetched_at`(단조 시계)이 하고, 이 값은 화면에 "12초 전 조회" 를
+    /// 띄우기 위한 벽시계입니다. `Instant` 는 사람이 읽는 시각으로 되돌릴 수 없습니다.
+    pub fetched_at_iso: String,
     pub models: Vec<ResolvedModel>,
 }
 
