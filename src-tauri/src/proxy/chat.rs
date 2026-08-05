@@ -30,6 +30,7 @@ use super::fabrix::{
 };
 use super::models::ensure_models;
 use super::tools::{self, ToolCallScanner};
+use super::validate;
 use super::{authorize, error_response, fabrix_headers_line, pretty};
 
 /// 로그 한 건을 조립하는 데 필요한 것들. 스트리밍 제너레이터 안으로 통째로
@@ -50,6 +51,9 @@ struct Ctx {
     tools_declared: usize,
     /// 그 도구를 규약으로 접어 실제로 보냈는가(설정으로 끌 수 있습니다).
     tools_emulated: bool,
+    /// 검증을 통과한 요청에서 뽑아낸 실행 계획 — 무시한 필드와 버린 이미지 파트를
+    /// 로그 ③ 칸까지 들고 갑니다.
+    plan: validate::Plan,
 }
 
 /// 로그 꼬리에 붙일 도구 관련 한 줄.
@@ -161,6 +165,7 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Bytes
         fabrix_url: format!("{}{MESSAGES_PATH}", cfg.normalized_base_url()),
         tools_declared: 0,
         tools_emulated: false,
+        plan: validate::Plan::default(),
     };
 
     // ── 토큰 검증 ───────────────────────────────────────────
@@ -195,6 +200,25 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Bytes
     };
     ctx.stream = req.is_stream();
     ctx.model_requested = req.model.clone();
+
+    // ── 요청 검증 ───────────────────────────────────────────
+    // 규약 위반은 **사내 호출 전에** 걸러냅니다. 잘못된 요청이 사내 쿼터를 쓰거나
+    // 사내 서버에 도달할 이유가 없습니다.
+    let plan = match validate::plan(&req, &incoming) {
+        Ok(plan) => plan,
+        Err(invalid) => {
+            state.record(ctx.entry(
+                invalid.status,
+                true,
+                Some(invalid.note()),
+                Some(invalid.note()),
+                invalid.message.clone(),
+                format!("요청 검증 실패 · HTTP {}", invalid.status),
+            ));
+            return error_response(invalid.status, invalid.envelope());
+        }
+    };
+    ctx.plan = plan.clone();
 
     // ── 모델 해석 ───────────────────────────────────────────
     let models = match ensure_models(&state).await {

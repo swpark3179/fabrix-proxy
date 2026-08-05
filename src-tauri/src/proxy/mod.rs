@@ -8,6 +8,7 @@ pub mod image_backend;
 pub mod images;
 pub mod models;
 pub mod tools;
+pub mod validate;
 
 use axum::extract::DefaultBodyLimit;
 use axum::http::{HeaderMap, StatusCode};
@@ -117,6 +118,22 @@ async fn not_found() -> Response {
             Some("unknown_endpoint".into()),
         ),
     )
+}
+
+/// 상태 코드에서 OpenAI 오류 `type` 을 유도합니다.
+///
+/// 예전에는 `type` 에 우리가 지은 값(`upstream_error` · `configuration_error`)이
+/// 들어갔습니다. `error.type` 으로 분기하는 클라이언트는 그걸 모르는 값으로 봅니다.
+/// 상태 코드에서 기계적으로 유도하면 **언제나 합법값**이 나오고, 우리 고유의 구분은
+/// `code` 로 옮기면 하나도 잃지 않습니다.
+pub fn openai_type(status: u16) -> &'static str {
+    match status {
+        401 => "authentication_error",
+        403 => "permission_error",
+        429 => "rate_limit_error",
+        s if s >= 500 => "api_error",
+        _ => "invalid_request_error",
+    }
 }
 
 pub fn error_response(status: u16, envelope: ErrorEnvelope) -> Response {

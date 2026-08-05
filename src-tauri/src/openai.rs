@@ -551,18 +551,28 @@ pub struct ErrorEnvelope {
     pub error: ErrorBody,
 }
 
+/// OpenAI 는 `param` 과 `code` 를 **없으면 null 로** 내보냅니다. 키 자체가 없으면
+/// `error.param` 을 무조건 읽는 클라이언트가 죽으므로 `skip_serializing_if` 를 두지
+/// 않습니다.
 #[derive(Debug, Clone, Serialize)]
 pub struct ErrorBody {
     pub message: String,
     #[serde(rename = "type")]
     pub kind: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// 어느 파라미터가 문제인지 (예: `temperature`, `messages[2].role`).
+    pub param: Option<String>,
     pub code: Option<String>,
 }
 
 impl ErrorEnvelope {
     pub fn new(message: impl Into<String>, kind: &'static str, code: Option<String>) -> Self {
-        Self { error: ErrorBody { message: message.into(), kind, code } }
+        Self { error: ErrorBody { message: message.into(), kind, param: None, code } }
+    }
+
+    /// 문제가 된 파라미터 이름을 붙입니다.
+    pub fn with_param(mut self, param: impl Into<String>) -> Self {
+        self.error.param = Some(param.into());
+        self
     }
 }
 
