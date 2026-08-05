@@ -231,8 +231,7 @@ async fn non_stream_response_carries_usage_logprobs_and_fingerprint() {
 
 #[tokio::test]
 async fn upstream_token_counts_replace_the_estimate() {
-    let mut up = Upstream::answering("짧은 답");
-    up.tokens = Some((812, 240));
+    let up = Upstream { tokens: Some((812, 240)), ..Upstream::answering("짧은 답") };
     let (base, _state, _up) = harness(up).await;
 
     let res = client()
@@ -252,8 +251,7 @@ async fn upstream_token_counts_replace_the_estimate() {
 /// 상위가 규약 밖 값을 줘도 클라이언트에는 열거값만 나가야 합니다.
 #[tokio::test]
 async fn unknown_upstream_finish_reason_never_reaches_the_client() {
-    let mut up = Upstream::answering("답변");
-    up.finish = Some("weird".into());
+    let up = Upstream { finish: Some("weird".into()), ..Upstream::answering("답변") };
     let (base, _state, _up) = harness(up).await;
 
     let (status, body) = chat(
@@ -268,9 +266,7 @@ async fn unknown_upstream_finish_reason_never_reaches_the_client() {
 /// 모델이 정말 빈 답을 준 경우 — 사내 잘못이 아니므로 502 가 아닙니다.
 #[tokio::test]
 async fn empty_answer_with_success_markers_is_200_not_502() {
-    let mut up = Upstream::default();
-    up.empty = true;
-    up.finish = Some("stop".into());
+    let up = Upstream { empty: true, finish: Some("stop".into()), ..Default::default() };
     let (base, _state, _up) = harness(up).await;
 
     let (status, body) = chat(
