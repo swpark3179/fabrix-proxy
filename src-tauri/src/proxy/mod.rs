@@ -1,5 +1,9 @@
-//! 로컬 OpenAI 호환 엔드포인트. 노출 경로는 딱 둘 —
-//! `POST /v1/chat/completions` 와 `GET /v1/models`.
+//! 로컬 OpenAI 호환 엔드포인트.
+//!
+//! `POST /v1/chat/completions` · `GET /v1/models` · `GET /v1/models/{id}` ·
+//! `POST /v1/images/generations` · `POST /v1/images/edits`, 그리고 `/v1` 을 빼먹은
+//! 별칭들. 오류는 전부 OpenAI 봉투(`type`·`code`·`param`)를 타고,
+//! `type` 은 상태 코드에서 유도합니다([`openai_type`]).
 
 pub mod b64;
 pub mod chat;
@@ -76,11 +80,15 @@ fn router(state: Shared) -> Router {
         // 413 으로 끝나 로그 창에 아무 흔적도 남지 않습니다 — 사용자 입장에서는
         // 원인 없는 실패였습니다.
         .route("/v1/models", get(models::handle))
+        // axum 0.8 의 경로 파라미터 문법은 `{id}` 입니다 — 0.7 의 `:id` 를 쓰면 리터럴
+        // 경로가 되어 조용히 아무것도 맞지 않습니다.
+        .route("/v1/models/{id}", get(models::retrieve))
         .route("/v1/chat/completions", post(chat::handle))
         .route("/v1/images/generations", post(images::generations))
         .route("/v1/images/edits", post(images::edits))
         // Base URL 에 `/v1` 을 빼먹고 넣는 클라이언트도 받아 줍니다.
         .route("/models", get(models::handle))
+        .route("/models/{id}", get(models::retrieve))
         .route("/chat/completions", post(chat::handle))
         .route("/images/generations", post(images::generations))
         .route("/images/edits", post(images::edits))
@@ -108,7 +116,8 @@ async fn not_found() -> Response {
     error_response(
         404,
         ErrorEnvelope::new(
-            "이 프록시는 /v1/chat/completions · /v1/models · /v1/images/generations · /v1/images/edits 를 제공합니다.",
+            "이 프록시는 /v1/chat/completions · /v1/models · /v1/models/{id} · \
+             /v1/images/generations · /v1/images/edits 를 제공합니다.",
             openai_type(404),
             Some("unknown_endpoint".into()),
         ),

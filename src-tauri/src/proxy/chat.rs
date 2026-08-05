@@ -360,19 +360,17 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Body)
     };
 
     let Some(model) = resolved else {
-        let (status, msg, code) = match requested {
-            Some(name) => (
-                404,
-                format!(
-                    "모델 '{name}' 을 찾을 수 없습니다. 사용 가능한 모델은 GET /v1/models 또는 \
-                     앱의 [모델 목록] 창에서 확인하세요."
-                ),
-                "model_not_found",
-            ),
+        // 404 문구는 `/v1/models/{id}` 와 **같은 함수**를 씁니다 — 두 경로에서 다른 말을
+        // 하면 사용자가 원인을 두 번 찾습니다.
+        let (status, envelope) = match requested {
+            Some(name) => (404, super::models::not_found_envelope(name)),
             None => (
                 502,
-                "사내 모델 목록이 비어 있어 요청을 보낼 수 없습니다.".to_string(),
-                "upstream_bad_response",
+                ErrorEnvelope::new(
+                    "사내 모델 목록이 비어 있어 요청을 보낼 수 없습니다.",
+                    openai_type(502),
+                    Some("upstream_bad_response".into()),
+                ),
             ),
         };
         state.record(ctx.entry(
@@ -380,14 +378,9 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Body)
             true,
             Some("모델 없음".into()),
             Some("모델 없음".into()),
-            msg.clone(),
+            envelope.error.message.clone(),
             format!("실패 · HTTP {status} · 모델 없음"),
         ));
-        let mut envelope =
-            ErrorEnvelope::new(msg, openai_type(status), Some(code.to_string()));
-        if status == 404 {
-            envelope = envelope.with_param("model");
-        }
         return error_response(status, envelope);
     };
     if requested.is_none() {
