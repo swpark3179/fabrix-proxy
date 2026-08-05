@@ -25,7 +25,8 @@ use crate::openai::{
 use crate::state::{self, Shared};
 
 use super::fabrix::{
-    default_model, extract_object, find_model, fold_messages, map_finish_reason, FabrixChunk, FabrixError,
+    clamp_finish_reason, default_model, extract_object, find_model, fold_messages,
+    map_finish_reason, FabrixChunk, FabrixError,
     LlmConfig, MessagesRequest, ResolvedModel, StreamDecoder, StreamEvent, MESSAGES_PATH,
 };
 use super::models::ensure_models;
@@ -473,10 +474,15 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Body)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| model.alias.clone());
+
+    // 지문은 **실제로 나간** modelId 로 만듭니다 — echo 되는 이름이 아니라 답한 모델이
+    // 무엇인지가 이 필드의 뜻입니다.
+    let fingerprint = Some(super::system_fingerprint(&payload.model_ids[0]));
+
     if payload.is_stream {
-        stream_response(state, ctx, res, echo_model, tool_names)
+        stream_response(state, ctx, res, echo_model, tool_names, fingerprint)
     } else {
-        collect_response(state, ctx, res, echo_model, tool_names).await
+        collect_response(state, ctx, res, echo_model, tool_names, fingerprint).await
     }
 }
 
@@ -555,6 +561,9 @@ struct StreamLog {
     drained: bool,
     tool_calls: u32,
     tool_rejects: u32,
+    /// 실제로 클라이언트에 내보낸 `finish_reason`. 상위가 준 원문(`finish`)과 다를 수
+    /// 있고, 그 차이가 로그에 보여야 합니다.
+    emitted_finish: Option<&'static str>,
 }
 
 impl Drop for StreamLog {
@@ -566,10 +575,15 @@ impl Drop for StreamLog {
         if let Some(first) = self.first_token {
             meta.push(format!("첫 토큰 {:.1}s", first.as_secs_f64()));
         }
-        meta.push(format!(
-            "finish_reason: {}",
-            self.finish.clone().unwrap_or_else(|| if aborted { "abort".into() } else { "stop".into() })
-        ));
+        let emitted = self
+            .emitted_finish
+            .unwrap_or(if aborted { "(없음 · 클라이언트가 끊음)" } else { "stop" });
+        meta.push(match self.finish.as_deref() {
+            // 상위가 준 값이 그대로 안 나갔으면 원문을 함께 적습니다 — 준수와 진단을
+            // 동시에 만족시키는 자리입니다.
+            Some(raw) if raw != emitted => format!("finish_reason: {emitted} (사내: {raw})"),
+            _ => format!("finish_reason: {emitted}"),
+        });
         meta.push(format!("SSE {}프레임", self.frames));
         meta.push(format!("{}자", text.chars().count()));
         meta.push("사내 응답에 토큰 수 없음".into());
@@ -628,6 +642,7 @@ fn stream_response(
     res: reqwest::Response,
     model: String,
     tool_names: HashSet<String>,
+    fingerprint: Option<String>,
 ) -> Response {
     let id = format!("chatcmpl-{}", Uuid::new_v4().simple());
     let created = state::epoch_secs();
@@ -647,10 +662,17 @@ fn stream_response(
             drained: false,
             tool_calls: 0,
             tool_rejects: 0,
+            emitted_finish: None,
         };
 
         let mut bytes = res.bytes_stream();
-        let mut sent_role = false;
+
+        // OpenAI 처럼 롤만 담은 청크를 **맨 앞에** 하나 흘립니다. 이후 청크에는 role 을
+        // 넣지 않으므로 `sent_role` 은 참으로 시작합니다.
+        yield Ok::<Event, Infallible>(sse_json(&ChatChunk::opening(
+            &id, created, &model, fingerprint.clone(),
+        )));
+        let mut sent_role = true;
 
         'pump: loop {
             let Some(item) = bytes.next().await else { break };
@@ -670,7 +692,7 @@ fn stream_response(
                         log.first_token.get_or_insert_with(|| started.elapsed());
                         let out = scanner.push(&text);
                         for event in scan_events(&id, created, &model, out, &mut sent_role) {
-                            yield Ok::<Event, Infallible>(event);
+                            yield Ok(event);
                         }
                     }
                     StreamEvent::Reasoning(text) => {
@@ -732,20 +754,26 @@ fn stream_response(
             yield Ok(sse_json(&ErrorEnvelope::new(msg, openai_type(502), Some("upstream_error".into()))));
             // 오류 프레임 뒤에도 finish 청크를 넣습니다 — 없으면 종료 사유를 기다리는
             // 클라이언트가 [DONE] 을 받고도 스트림을 미완으로 남깁니다.
+            log.emitted_finish = Some(MIDSTREAM_FINISH);
             yield Ok(sse_json(&ChatChunk::new(
                 &id, created, &model, Delta::default(), Some(MIDSTREAM_FINISH.into()),
-            )));
+            ).with_fingerprint(fingerprint.clone())));
         } else {
             // 도구 호출이 하나라도 나왔으면 그 사실이 상위 사유보다 우선합니다 —
             // 클라이언트는 이 값으로 에이전트 루프를 계속할지 정합니다. 그다음이
             // 절단(length), 마지막이 상위가 준 사유입니다.
             let reason = if scanner.saw_call() {
-                "tool_calls".to_string()
+                "tool_calls"
             } else {
-                map_finish_reason(log.finish.as_deref(), log.decoder.truncated)
-                    .unwrap_or_else(|| "stop".into())
+                // 상위가 모르는 값을 줬어도 와이어에는 열거값만 나갑니다.
+                clamp_finish_reason(
+                    map_finish_reason(log.finish.as_deref(), log.decoder.truncated).as_deref(),
+                )
             };
-            yield Ok(sse_json(&ChatChunk::new(&id, created, &model, Delta::default(), Some(reason))));
+            log.emitted_finish = Some(reason);
+            yield Ok(sse_json(&ChatChunk::new(
+                &id, created, &model, Delta::default(), Some(reason.into()),
+            ).with_fingerprint(fingerprint.clone())));
         }
         yield Ok(Event::default().data("[DONE]"));
     };
@@ -762,6 +790,7 @@ async fn collect_response(
     res: reqwest::Response,
     model: String,
     tool_names: HashSet<String>,
+    fingerprint: Option<String>,
 ) -> Response {
     let raw = match res.text().await {
         Ok(text) => text,
@@ -802,6 +831,7 @@ async fn collect_response(
                 content,
                 reasoning,
                 truncated: chunk.truncated == Some(true),
+                looks_successful: chunk.looks_successful(),
                 finish: chunk.finish_reason,
                 via_stream_decoder: false,
             }
@@ -816,6 +846,8 @@ async fn collect_response(
                 reasoning: Some(decoder.reasoning().to_string()).filter(|s| !s.is_empty()),
                 finish: decoder.finish_reason.clone(),
                 truncated: decoder.truncated,
+                // 스트림 디코더까지 태워 프레임을 읽어 냈다면 응답 자체는 성립했습니다.
+                looks_successful: decoder.finish_reason.is_some(),
                 via_stream_decoder: true,
             }
         }
@@ -830,17 +862,25 @@ async fn collect_response(
     let has_calls = !scanned.calls.is_empty();
 
     // 도구 호출만 있고 산문이 없는 답변은 정상입니다 — 빈 응답으로 502 내면 안 됩니다.
-    if parsed.content.is_empty() && parsed.reasoning.is_none() && !has_calls {
+    //
+    // 답변이 정말 비었을 때도 상위 응답에 성공 표지가 있으면 200 + `content: ""` 입니다.
+    // 모델이 짧은 max_tokens 등으로 빈 답을 줄 수 있고, 그걸 502 로 부르면 사내 잘못이
+    // 아닌 것을 사내 오류로 보고하는 셈입니다. 아무 표지도 없으면 애초에 우리가 못
+    // 알아본 본문이라 502 가 맞습니다.
+    let empty = parsed.content.is_empty() && parsed.reasoning.is_none() && !has_calls;
+    if empty && !parsed.looks_successful {
         let err = FabrixError::BadPayload(format!("본문 앞부분: {}", logstore::preview(&raw, 200)));
         state.record(ctx.fail(&err));
         return error_response(err.status(), err.envelope());
     }
 
     let reason = if has_calls {
-        "tool_calls".to_string()
+        "tool_calls"
     } else {
-        map_finish_reason(parsed.finish.as_deref(), parsed.truncated)
-            .unwrap_or_else(|| "stop".into())
+        // 상위가 모르는 값을 줬어도 와이어에는 열거값만 나갑니다.
+        clamp_finish_reason(
+            map_finish_reason(parsed.finish.as_deref(), parsed.truncated).as_deref(),
+        )
     };
     let completion = ChatCompletion {
         id: format!("chatcmpl-{}", Uuid::new_v4().simple()),
@@ -851,24 +891,24 @@ async fn collect_response(
             index: 0,
             message: AssistantMessage {
                 role: "assistant",
-                // 도구 호출만 있는 턴은 `content: null` 이 규약입니다.
-                content: if has_calls {
-                    Some(scanned.text.clone()).filter(|s| !s.trim().is_empty())
-                } else {
-                    Some(parsed.content.clone())
-                },
+                content: assistant_content(&scanned.text, &parsed.content, has_calls),
                 reasoning_content: parsed.reasoning.clone(),
                 tool_calls: has_calls
                     .then(|| scanned.calls.iter().map(ToolCall::from).collect()),
             },
-            finish_reason: Some(reason.clone()),
+            finish_reason: Some(reason.to_string()),
+            logprobs: None,
         }],
         // FabriX 가 토큰 수를 주지 않으므로 추정치를 지어내지 않고 생략합니다.
         usage: None,
+        system_fingerprint: fingerprint,
     };
 
     let mut meta = vec![
-        format!("finish_reason: {reason}"),
+        match parsed.finish.as_deref() {
+            Some(raw) if raw != reason => format!("finish_reason: {reason} (사내: {raw})"),
+            _ => format!("finish_reason: {reason}"),
+        },
         format!("{}자", parsed.content.chars().count()),
         "사내 응답에 토큰 수 없음".to_string(),
     ];
@@ -906,7 +946,22 @@ struct Parsed {
     reasoning: Option<String>,
     finish: Option<String>,
     truncated: bool,
+    /// 상위 응답이 성공 표지를 가졌는가 — 빈 답변을 200 으로 볼지 502 로 볼지 가릅니다.
+    looks_successful: bool,
     via_stream_decoder: bool,
+}
+
+/// `message.content` 의 null / 빈 문자열 규칙을 한 곳에 못박습니다.
+///
+/// 도구 호출만 있는 턴은 `null` 이 규약입니다. 그 밖에는 빈 문자열이라도 **문자열**
+/// 입니다 — 모델이 정말 빈 답을 준 경우가 `content: ""` 이고, 그걸 null 로 바꾸면
+/// 도구 호출 턴과 구분되지 않습니다.
+fn assistant_content(scanned_text: &str, full_text: &str, has_calls: bool) -> Option<String> {
+    if has_calls {
+        Some(scanned_text.to_string()).filter(|s| !s.trim().is_empty())
+    } else {
+        Some(full_text.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -980,6 +1035,18 @@ mod tests {
         assert_eq!(lines[1], "무시된 파라미터: stop · presence_penalty");
         assert!(lines[2].contains("이미지 파트 2개"), "{}", lines[2]);
         assert!(lines[3].contains("래빗홀"), "{}", lines[3]);
+    }
+
+    /// 도구 호출만 있는 턴만 `null` 입니다. 빈 답변은 `""` 로 남아야 도구 턴과
+    /// 구분됩니다.
+    #[test]
+    fn assistant_content_is_null_only_for_tool_only_turns() {
+        assert_eq!(assistant_content("", "", true), None);
+        assert_eq!(assistant_content("   ", "", true), None);
+        assert_eq!(assistant_content("만들겠습니다", "만들겠습니다\n<tool_call>…", true).as_deref(), Some("만들겠습니다"));
+        // 도구가 없으면 빈 문자열도 문자열입니다.
+        assert_eq!(assistant_content("", "", false).as_deref(), Some(""));
+        assert_eq!(assistant_content("", "안녕", false).as_deref(), Some("안녕"));
     }
 
     // ── 클라이언트가 실제로 보는 청크 ──

@@ -125,6 +125,24 @@ pub fn openai_type(status: u16) -> &'static str {
     }
 }
 
+/// 백엔드 구성 지문. FabriX 는 이런 값을 주지 않으므로 **재현 가능한** 값을 만듭니다 —
+/// 프록시 버전과 실제로 나간 modelId 를 FNV-1a 로 접습니다. 같은 구성이면 앱을 다시
+/// 켜도 같은 값이고, 모델이나 프록시가 바뀌면 값이 바뀝니다. 그게 이 필드의 뜻입니다.
+///
+/// `DefaultHasher` 를 쓰지 않는 이유: 출력이 Rust 릴리스 간 안정하다는 보장이 없어,
+/// 컴파일러를 올리면 지문이 통째로 달라집니다. FNV-1a 는 10줄이라 직접 씁니다.
+pub fn system_fingerprint(model_id: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in env!("CARGO_PKG_VERSION").bytes().chain(b"/".iter().copied()).chain(model_id.bytes())
+    {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    // 하위 48비트만 씁니다 — OpenAI 의 `fp_…` 와 비슷한 길이로 맞추기 위한 것이고,
+    // 지문은 충돌 저항이 아니라 "구성이 같으면 같은 값" 만 만족하면 됩니다.
+    format!("fp_{:012x}", hash & 0xffff_ffff_ffff)
+}
+
 fn method_not_allowed_envelope() -> ErrorEnvelope {
     ErrorEnvelope::new(
         "이 경로가 받지 않는 메서드입니다. 채팅·이미지는 POST, 모델 목록은 GET 입니다.",
@@ -323,6 +341,17 @@ mod tests {
 
     /// 예전에는 axum 이 **본문 없는** 405 를 냈습니다 — 봉투로 분기하는 클라이언트에는
     /// 원인 없는 실패였습니다.
+    /// 같은 구성이면 같은 값, 모델이 다르면 다른 값 — 그게 이 필드의 뜻입니다.
+    #[test]
+    fn fingerprint_is_stable_and_model_sensitive() {
+        let a = system_fingerprint("0196f1fc-2858-70a9-a232-74dbddb971d0");
+        assert_eq!(a, system_fingerprint("0196f1fc-2858-70a9-a232-74dbddb971d0"));
+        assert_ne!(a, system_fingerprint("01970a3b-91d4-7c8e-9a11-2f3c4d5e6f70"));
+        assert!(a.starts_with("fp_"), "{a}");
+        assert_eq!(a.len(), 3 + 12);
+        assert!(a[3..].chars().all(|c| c.is_ascii_hexdigit()), "{a}");
+    }
+
     #[test]
     fn method_not_allowed_is_an_envelope() {
         let env = method_not_allowed_envelope();

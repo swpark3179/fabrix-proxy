@@ -434,6 +434,10 @@ pub struct ChatCompletion {
     pub choices: Vec<Choice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
+    /// 백엔드 구성 지문. FabriX 가 주지 않으므로 우리가 재현 가능한 값을 만듭니다
+    /// (`proxy::system_fingerprint`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -441,6 +445,10 @@ pub struct Choice {
     pub index: u32,
     pub message: AssistantMessage,
     pub finish_reason: Option<String>,
+    /// OpenAI 는 요청하지 않아도 이 키를 `null` 로 내보냅니다. 키 자체가 없으면
+    /// `choices[0].logprobs` 를 무조건 읽는 클라이언트가 죽으므로 `skip` 하지 않습니다.
+    /// (요청에 `logprobs: true` 가 오면 400 입니다 — `proxy::validate`.)
+    pub logprobs: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -472,6 +480,11 @@ pub struct ChatChunk {
     pub created: i64,
     pub model: String,
     pub choices: Vec<ChunkChoice>,
+    /// 마지막 usage 청크에만 담깁니다 (`stream_options.include_usage`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -479,6 +492,7 @@ pub struct ChunkChoice {
     pub index: u32,
     pub delta: Delta,
     pub finish_reason: Option<String>,
+    pub logprobs: Option<Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -539,8 +553,54 @@ impl ChatChunk {
             object: "chat.completion.chunk",
             created,
             model: model.to_string(),
-            choices: vec![ChunkChoice { index: 0, delta, finish_reason: finish }],
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta,
+                finish_reason: finish,
+                logprobs: None,
+            }],
+            usage: None,
+            system_fingerprint: None,
         }
+    }
+
+    /// 스트림의 **첫 청크**. OpenAI 는 내용 없이 롤만 담은 청크를 먼저 보냅니다.
+    ///
+    /// 예전에는 `role` 을 첫 내용 청크에 얹어 보냈습니다. 그러면 (a) 규약과 순서가
+    /// 다르고, (b) 답변이 빈 응답에서는 finish 청크 전까지 **아무 청크도** 나가지
+    /// 않아 클라이언트가 assistant 턴이 시작된 것조차 몰랐습니다.
+    pub fn opening(id: &str, created: i64, model: &str, fingerprint: Option<String>) -> Self {
+        let mut chunk = Self::new(
+            id,
+            created,
+            model,
+            Delta {
+                role: Some("assistant"),
+                content: Some(String::new()),
+                ..Delta::default()
+            },
+            None,
+        );
+        chunk.system_fingerprint = fingerprint;
+        chunk
+    }
+
+    /// 스트림 꼬리의 usage 청크 — `choices` 는 빈 배열입니다(규약).
+    pub fn usage_only(id: &str, created: i64, model: &str, usage: Usage) -> Self {
+        Self {
+            id: id.to_string(),
+            object: "chat.completion.chunk",
+            created,
+            model: model.to_string(),
+            choices: Vec::new(),
+            usage: Some(usage),
+            system_fingerprint: None,
+        }
+    }
+
+    pub fn with_fingerprint(mut self, fingerprint: Option<String>) -> Self {
+        self.system_fingerprint = fingerprint;
+        self
     }
 }
 
@@ -1028,6 +1088,73 @@ mod tests {
             json,
             r#"{"index":0,"id":"call_x","type":"function","function":{"name":"read","arguments":"{\"filePath\":\"a\"}"}}"#
         );
+    }
+
+    /// OpenAI 는 요청하지 않아도 `logprobs: null` 을 내보냅니다. 키가 빠지면
+    /// `choices[0].logprobs` 를 무조건 읽는 클라이언트가 죽습니다.
+    #[test]
+    fn choices_always_carry_a_logprobs_key() {
+        let completion = ChatCompletion {
+            id: "chatcmpl-x".into(),
+            object: "chat.completion",
+            created: 1,
+            model: "m".into(),
+            choices: vec![Choice {
+                index: 0,
+                message: AssistantMessage {
+                    role: "assistant",
+                    content: Some("안녕".into()),
+                    reasoning_content: None,
+                    tool_calls: None,
+                },
+                finish_reason: Some("stop".into()),
+                logprobs: None,
+            }],
+            usage: None,
+            system_fingerprint: Some("fp_abc".into()),
+        };
+        let json = serde_json::to_value(&completion).unwrap();
+        assert!(json["choices"][0].as_object().unwrap().contains_key("logprobs"));
+        assert!(json["choices"][0]["logprobs"].is_null());
+        assert_eq!(json["system_fingerprint"], "fp_abc");
+        // usage 가 없으면 키 자체를 빼는 기존 동작은 유지합니다.
+        assert!(!json.as_object().unwrap().contains_key("usage"));
+
+        let chunk = ChatChunk::new("chatcmpl-x", 1, "m", Delta::default(), Some("stop".into()));
+        let cj = serde_json::to_value(&chunk).unwrap();
+        assert!(cj["choices"][0].as_object().unwrap().contains_key("logprobs"));
+        assert!(cj["choices"][0]["logprobs"].is_null());
+    }
+
+    /// 스트림의 첫 청크는 OpenAI 와 **바이트 단위로** 같은 모양이어야 합니다 —
+    /// `@ai-sdk/openai-compatible` 이 가장 엄격하게 보는 자리입니다.
+    #[test]
+    fn opening_chunk_matches_the_openai_wire_shape() {
+        let json = serde_json::to_string(&ChatChunk::opening(
+            "chatcmpl-x",
+            1,
+            "fabrix-chat-4",
+            Some("fp_1".into()),
+        ))
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":"chatcmpl-x","object":"chat.completion.chunk","created":1,"model":"fabrix-chat-4","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null,"logprobs":null}],"system_fingerprint":"fp_1"}"#
+        );
+    }
+
+    #[test]
+    fn usage_chunk_has_empty_choices() {
+        let chunk = ChatChunk::usage_only(
+            "chatcmpl-x",
+            1,
+            "m",
+            Usage { prompt_tokens: 10, completion_tokens: 3, total_tokens: 13 },
+        );
+        let json = serde_json::to_value(&chunk).unwrap();
+        assert!(json["choices"].as_array().unwrap().is_empty());
+        assert_eq!(json["usage"]["total_tokens"], 13);
+        assert_eq!(json["object"], "chat.completion.chunk");
     }
 
     #[test]

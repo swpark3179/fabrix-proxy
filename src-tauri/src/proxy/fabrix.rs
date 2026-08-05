@@ -387,6 +387,21 @@ impl FabrixChunk {
             .unwrap_or_else(|| "사내 서버가 오류를 반환했습니다".into())
     }
 
+    /// 응답이 "제대로 온 것"인지 — 답변이 비었을 때 502 를 낼지 200 을 낼지 가릅니다.
+    ///
+    /// 모델이 정말 빈 답을 줄 수도 있습니다(짧은 max_tokens, 필터 직전 등). 그걸
+    /// 502 로 처리하면 사내 잘못이 아닌 것을 사내 오류로 보고하는 셈입니다. 성공
+    /// 표지(`status`/`responseCode`/`finish_reason`)가 하나라도 있으면 빈 답변도
+    /// 정상 응답으로 봅니다. 아무 표지도 없으면 애초에 우리가 못 알아본 본문이라
+    /// 502 가 맞습니다.
+    pub fn looks_successful(&self) -> bool {
+        if self.looks_like_error() {
+            return false;
+        }
+        let filled = |s: &Option<String>| s.as_deref().is_some_and(|v| !v.trim().is_empty());
+        filled(&self.status) || filled(&self.response_code) || filled(&self.finish_reason)
+    }
+
     /// 비스트리밍 답변 텍스트를 폴백 순서로 추출합니다.
     /// content → contentReferences[].answer(결합) → eventData.
     /// 순수 LLM 답변은 content 에, 플러그인/RAG 답변은 contentReferences 에 오기 때문입니다.
@@ -447,6 +462,28 @@ pub fn map_finish_reason(raw: Option<&str>, truncated: bool) -> Option<String> {
         }
         .to_string(),
     )
+}
+
+/// `map_finish_reason` 의 결과를 **와이어에 나가기 직전** OpenAI 열거값으로 접습니다.
+///
+/// `map_finish_reason` 이 모르는 값을 그대로 넘기는 것은 의도입니다 — 상위가 뭐라고
+/// 했는지는 로그에 남아야 합니다. 다만 그 값이 응답에까지 나가면 `finish_reason` 을
+/// 열거형으로 파싱하는 클라이언트가 깨집니다. 그래서 보존과 준수를 두 함수로 나누고,
+/// 이 함수는 직렬화 경계에서만 씁니다.
+///
+/// 중단 계열(`abort`·`timeout`·`error`…)은 `stop` 이 아니라 `length` 로 접습니다 —
+/// 끊긴 답변을 완성된 것처럼 부르면 안 됩니다.
+pub fn clamp_finish_reason(mapped: Option<&str>) -> &'static str {
+    match mapped.unwrap_or("stop").trim().to_ascii_lowercase().as_str() {
+        "stop" => "stop",
+        "length" => "length",
+        "tool_calls" => "tool_calls",
+        "content_filter" => "content_filter",
+        "function_call" => "function_call",
+        "abort" | "aborted" | "cancel" | "cancelled" | "canceled" | "error" | "timeout"
+        | "incomplete" => "length",
+        _ => "stop",
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1130,6 +1167,60 @@ mod tests {
         ])
     }
 
+    /// 클라이언트가 열거형으로 파싱하는 값이라 규약 밖 값이 절대 나가면 안 됩니다.
+    #[test]
+    fn clamp_never_leaks_a_non_openai_value() {
+        const LEGAL: &[&str] = &["stop", "length", "tool_calls", "content_filter", "function_call"];
+        for raw in [
+            Some("stop"),
+            Some("length"),
+            Some("tool_calls"),
+            Some("content_filter"),
+            Some("function_call"),
+            Some("weird"),
+            Some(""),
+            Some("   "),
+            Some("STOP"),
+            Some("사내값"),
+            None,
+        ] {
+            let out = clamp_finish_reason(raw);
+            assert!(LEGAL.contains(&out), "{raw:?} → {out}");
+        }
+        // 열거값은 그대로 통과합니다.
+        assert_eq!(clamp_finish_reason(Some("tool_calls")), "tool_calls");
+        assert_eq!(clamp_finish_reason(Some("content_filter")), "content_filter");
+        // 모르는 값과 없는 값은 stop.
+        assert_eq!(clamp_finish_reason(Some("weird")), "stop");
+        assert_eq!(clamp_finish_reason(None), "stop");
+    }
+
+    /// 중단은 `stop` 이 아닙니다 — 끊긴 답변을 완성된 것처럼 부르면 안 됩니다.
+    #[test]
+    fn abortish_values_clamp_to_length() {
+        for raw in ["abort", "aborted", "cancelled", "canceled", "error", "timeout", "incomplete"] {
+            assert_eq!(clamp_finish_reason(Some(raw)), "length", "{raw}");
+        }
+    }
+
+    /// 빈 답변을 200 으로 볼지 502 로 볼지 가르는 판단.
+    #[test]
+    fn looks_successful_distinguishes_an_empty_answer_from_garbage() {
+        let of = |raw: &str| {
+            serde_json::from_str::<FabrixChunk>(raw).unwrap().looks_successful()
+        };
+        // 성공 표지가 있으면 답변이 비어도 성공입니다.
+        assert!(of(r#"{"content":"","status":"SUCCESS"}"#));
+        assert!(of(r#"{"content":null,"finishReason":"stop"}"#));
+        assert!(of(r#"{"responseCode":"200"}"#));
+        // 표지가 하나도 없으면 우리가 못 알아본 본문입니다.
+        assert!(!of(r#"{}"#));
+        assert!(!of(r#"{"content":""}"#));
+        assert!(!of(r#"{"status":"   "}"#));
+        // 오류 표지가 있으면 성공이 아닙니다.
+        assert!(!of(r#"{"status":"ERROR","finishReason":"stop"}"#));
+    }
+
     /// 다섯 변형 모두 합법 `type` + 우리 고유의 `code` 를 내야 합니다.
     #[test]
     fn every_error_variant_maps_to_a_legal_type_and_a_code() {
@@ -1335,6 +1426,8 @@ mod tests {
     #[test]
     fn finish_reason_passes_unknown_values_through() {
         // 모르는 값을 "stop" 으로 지어내면 진짜 상태를 감추게 됩니다.
+        // 이 함수는 원문 보존용입니다 — 모르는 값을 그대로 넘깁니다.
+        // 와이어로 나가기 전에 `clamp_finish_reason` 이 접습니다.
         assert_eq!(map_finish_reason(Some("weird"), false).as_deref(), Some("weird"));
         assert_eq!(map_finish_reason(Some("   "), false), None);
         assert_eq!(map_finish_reason(None, false), None);
