@@ -125,6 +125,27 @@ fn oversize_entry(
     }
 }
 
+/// 로그 꼬리에 붙일 "반영하지 못한 것" 줄들.
+///
+/// 조용히 버리는 것과 버렸다고 말하는 것의 차이가 이 함수의 존재 이유입니다 —
+/// `tool_meta` 가 "도구를 버렸다"와 "모델이 안 썼다"를 가르는 것과 같은 이유입니다.
+fn plan_meta(plan: &validate::Plan) -> Vec<String> {
+    let mut out = Vec::new();
+    if !plan.ignored.is_empty() {
+        out.push(format!("무시된 파라미터: {}", plan.ignored.join(" · ")));
+    }
+    if plan.images_dropped > 0 {
+        out.push(format!(
+            "이미지 파트 {}개는 사내 채팅 API 가 받지 못해 버렸습니다",
+            plan.images_dropped
+        ));
+    }
+    if !plan.unknown.is_empty() {
+        out.push(format!("스펙에 없는 키: {}", plan.unknown.join(" · ")));
+    }
+    out
+}
+
 impl Ctx {
     #[allow(clippy::too_many_arguments)]
     fn entry(
@@ -528,6 +549,7 @@ impl Drop for StreamLog {
         ) {
             meta.push(line);
         }
+        meta.extend(plan_meta(&self.ctx.plan));
 
         let note = match (aborted, self.failure.is_some()) {
             (true, _) => Some("클라이언트가 연결을 끊음".to_string()),
@@ -829,6 +851,7 @@ async fn collect_response(
     ) {
         meta.push(line);
     }
+    meta.extend(plan_meta(&ctx.plan));
 
     let note = (ctx.tools_emulated && !has_calls).then(|| "도구 미사용".to_string());
 
@@ -884,6 +907,26 @@ mod tests {
         let line = tool_meta(3, true, 1, 2).unwrap();
         assert!(line.contains("호출 1건"), "{line}");
         assert!(line.contains("형식 오류 2건"), "{line}");
+    }
+
+    #[test]
+    fn plan_meta_is_silent_for_a_plain_request() {
+        assert!(plan_meta(&validate::Plan::default()).is_empty());
+    }
+
+    #[test]
+    fn plan_meta_names_what_was_not_honored() {
+        let plan = validate::Plan {
+            include_usage: false,
+            images_dropped: 2,
+            ignored: vec!["stop", "presence_penalty"],
+            unknown: vec!["래빗홀".into()],
+        };
+        let lines = plan_meta(&plan);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "무시된 파라미터: stop · presence_penalty");
+        assert!(lines[1].contains("이미지 파트 2개"), "{}", lines[1]);
+        assert!(lines[2].contains("래빗홀"), "{}", lines[2]);
     }
 
     // ── 클라이언트가 실제로 보는 청크 ──
