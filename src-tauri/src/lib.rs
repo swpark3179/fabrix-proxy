@@ -25,6 +25,7 @@ pub fn run() {
             commands::clear_logs,
             commands::check_port,
             commands::test_connection,
+            commands::list_models,
             commands::save_config,
             commands::issue_token,
             commands::start_proxy,

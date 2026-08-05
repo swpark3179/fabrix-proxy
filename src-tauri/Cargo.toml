@@ -26,7 +26,7 @@ tower-http = { version = "0.6", features = ["cors"] }
 
 # native-tls => schannel on Windows, so a corporate root CA already installed in the
 # Windows certificate store is trusted without extra configuration.
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "native-tls", "charset", "http2"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "native-tls", "charset", "http2", "multipart"] }
 
 futures-util = "0.3"
 async-stream = "0.3"

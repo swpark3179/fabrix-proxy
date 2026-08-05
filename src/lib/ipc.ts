@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 
-import type { Config, LogEntry, PortStatus, Snapshot, TestResult } from '../types'
+import type { Config, LogEntry, ModelInfo, PortStatus, Snapshot, TestResult } from '../types'
 
 export const getSnapshot = () => invoke<Snapshot>('get_snapshot')
 export const getConfig = () => invoke<Config>('get_config')
@@ -17,6 +17,8 @@ export const testConnection = (input: {
   openapiToken: string
   insecureSkipVerify: boolean
 }) => invoke<TestResult>('test_connection', input)
+
+export const listModels = () => invoke<ModelInfo[]>('list_models')
 
 export const saveConfig = (config: Config) => invoke<Snapshot>('save_config', { config })
 export const issueToken = () => invoke<string>('issue_token')
