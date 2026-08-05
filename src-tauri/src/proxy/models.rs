@@ -327,9 +327,9 @@ pub async fn retrieve(
 
 // ─────────────────────── 응답 조립 (순수 함수) ───────────────────────
 //
-// `AppState::new` 가 실제 `tauri::AppHandle` 을 요구해 핸들러 자체는 단위 테스트할 수
-// 없습니다. 그래서 봉투 조립을 핸들러에서 떼어내 여기 두고, 테스트는 이 함수들을 봅니다
-// (`proxy::mod` · `image_backend` 의 테스트가 `Config` 만으로 도는 것과 같은 규율).
+// 봉투 조립을 핸들러에서 떼어내 여기 둡니다. 인라인 테스트가 `AppState` 없이 모양을 볼 수
+// 있고(`proxy::mod` · `image_backend` 의 테스트가 `Config` 만으로 도는 것과 같은 규율),
+// 조립된 결과는 `tests/proxy_http.rs` 가 실제 HTTP 로 한 번 더 확인합니다.
 
 /// 모델 하나를 OpenAI 카드로.
 ///

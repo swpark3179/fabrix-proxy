@@ -20,6 +20,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures_util::StreamExt;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tower_http::cors::CorsLayer;
@@ -38,6 +39,14 @@ pub async fn start(state: Shared, port: u16) -> Result<u16, String> {
         .await
         .map_err(|err| format!("{port} 포트를 열지 못했습니다: {err}"))?;
 
+    // 인자가 아니라 **실제로 바인드된** 포트를 씁니다. 앱은 언제나 구체적인 포트를
+    // 주므로 두 값이 같지만, 포트 `0`(OS 자동 할당)을 넘기면 이 값만이 진짜입니다 —
+    // 통합 테스트가 고정 포트를 다투지 않고 서버를 띄울 수 있게 하기 위함입니다.
+    let bound = listener
+        .local_addr()
+        .map_err(|err| format!("포트를 확인하지 못했습니다: {err}"))?
+        .port();
+
     let (tx, rx) = oneshot::channel::<()>();
     let router = router(state.clone());
 
@@ -52,8 +61,8 @@ pub async fn start(state: Shared, port: u16) -> Result<u16, String> {
         }
     });
 
-    *state.server.lock().unwrap() = Some(ServerHandle { port, shutdown: tx });
-    Ok(port)
+    *state.server.lock().unwrap() = Some(ServerHandle { port: bound, shutdown: tx });
+    Ok(bound)
 }
 
 pub fn stop(state: &Shared) {
@@ -170,28 +179,62 @@ async fn method_not_allowed() -> Response {
     error_response(405, method_not_allowed_envelope())
 }
 
+/// 상한을 넘은 본문을 **버리면서 끝까지 읽어 줄** 최대 크기 (상한의 4배).
+///
+/// 여기까지는 읽어 주고 413 봉투를 돌려줍니다. 초과를 발견한 순간 연결을 닫으면
+/// 클라이언트는 아직 본문을 쓰던 중이라 `socket hang up` 만 보고, **정작 우리가 준비한
+/// 설명을 읽지 못합니다** — 그 설명이 이 코드의 존재 이유인데 말이죠. 그렇다고 무한히
+/// 받아 줄 수도 없으니 선을 긋습니다. 이 선을 넘는 요청은 어차피 도와줄 방법이 없습니다.
+const DRAIN_MULTIPLE: usize = 4;
+
 /// 요청 본문을 상한까지 읽습니다. 초과면 OpenAI 봉투를 돌려줄 수 있도록 `Err` 입니다.
 ///
 /// `DefaultBodyLimit` 레이어에 맡기지 않는 이유: 그러면 초과가 핸들러에 **들어오기
 /// 전에** axum 의 평문 413 으로 끝나 로그에 한 줄도 남지 않습니다. 우리가 읽으면
 /// 봉투도 주고 로그도 남깁니다.
-///
-/// `content-length` 를 먼저 보는 이유는 한 바이트도 받지 않고 거절할 수 있기 때문입니다.
-/// 그 헤더가 없는(chunked) 요청은 `to_bytes` 의 상한이 잡습니다 — 상한을 두 겹으로
-/// 겁니다.
 pub async fn read_body(
     headers: &HeaderMap,
     body: axum::body::Body,
     limit: usize,
 ) -> Result<axum::body::Bytes, ErrorEnvelope> {
+    let drain_cap = limit.saturating_mul(DRAIN_MULTIPLE);
+
+    // 선언된 길이가 배수 상한마저 넘으면 한 바이트도 받지 않고 거절합니다.
     let declared = headers
         .get("content-length")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<usize>().ok());
-    if declared.is_some_and(|n| n > limit) {
+    if declared.is_some_and(|n| n > drain_cap) {
         return Err(too_large(limit));
     }
-    axum::body::to_bytes(body, limit).await.map_err(|_| too_large(limit))
+
+    let mut stream = body.into_data_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut total = 0usize;
+    let mut over = false;
+
+    while let Some(chunk) = stream.next().await {
+        // 전송이 끊긴 것은 상한 초과와 다릅니다 — 이 경우는 본문이 없는 것으로 넘기고
+        // 파싱 단계가 400 을 내게 합니다.
+        let Ok(chunk) = chunk else { break };
+        total = total.saturating_add(chunk.len());
+        if total > limit {
+            // 넘은 순간부터 모으지 않고 버리기만 합니다 — 상한의 4배까지 받아 주는 것은
+            // 클라이언트가 응답을 읽을 수 있게 하려는 것뿐이고, 그 내용은 쓰지 않습니다.
+            over = true;
+            buf = Vec::new();
+        } else {
+            buf.extend_from_slice(&chunk);
+        }
+        if total > drain_cap {
+            break;
+        }
+    }
+
+    if over {
+        return Err(too_large(limit));
+    }
+    Ok(axum::body::Bytes::from(buf))
 }
 
 fn too_large(limit: usize) -> ErrorEnvelope {
@@ -385,27 +428,35 @@ mod tests {
         assert!(too_large(IMAGE_BODY_LIMIT).error.message.contains("25 MiB"));
     }
 
+    /// 터무니없이 큰 본문은 한 바이트도 받지 않고 거절합니다 — 어차피 응답을 읽게
+    /// 해 줄 수 없는 크기입니다.
     #[tokio::test]
-    async fn read_body_rejects_by_declared_content_length_without_reading() {
+    async fn read_body_rejects_absurd_declared_length_without_reading() {
         let mut headers = HeaderMap::new();
-        headers.insert("content-length", (CHAT_BODY_LIMIT + 1).to_string().parse().unwrap());
-        // 본문은 비어 있지만 선언된 길이만으로 거절해야 합니다 — 한 바이트도 받지 않습니다.
+        let absurd = CHAT_BODY_LIMIT * DRAIN_MULTIPLE + 1;
+        headers.insert("content-length", absurd.to_string().parse().unwrap());
         let err = read_body(&headers, axum::body::Body::empty(), CHAT_BODY_LIMIT)
             .await
             .expect_err("413 이 나야 합니다");
         assert_eq!(err.error.code.as_deref(), Some("request_too_large"));
     }
 
-    /// `content-length` 가 없는(chunked) 요청도 상한이 잡아야 합니다 — 상한 두 겹의 두 번째.
+    /// 상한을 조금 넘은 본문은 **끝까지 받아 준 뒤** 413 을 돌려줍니다. 초과를 발견한
+    /// 순간 닫으면 클라이언트가 응답 대신 broken pipe 를 봅니다.
     #[tokio::test]
-    async fn read_body_rejects_oversized_chunked_body() {
-        let err = read_body(&HeaderMap::new(), axum::body::Body::from(vec![0u8; 64]), 8)
+    async fn read_body_drains_a_slightly_oversized_body_then_rejects() {
+        let err = read_body(&HeaderMap::new(), axum::body::Body::from(vec![0u8; 20]), 8)
             .await
             .expect_err("413 이 나야 합니다");
         assert_eq!(err.error.code.as_deref(), Some("request_too_large"));
+    }
 
+    #[tokio::test]
+    async fn read_body_accepts_a_body_at_the_limit() {
         let ok = read_body(&HeaderMap::new(), axum::body::Body::from(vec![0u8; 8]), 8).await;
         assert_eq!(ok.unwrap().len(), 8);
+        let ok = read_body(&HeaderMap::new(), axum::body::Body::empty(), 8).await;
+        assert_eq!(ok.unwrap().len(), 0);
     }
 
     #[test]

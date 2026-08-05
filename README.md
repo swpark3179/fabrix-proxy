@@ -34,6 +34,18 @@ npm run mock          # 개발용 FabriX 스텁 :9900  (별도 터미널)
 npm run tauri dev
 ```
 
+### 테스트
+
+```bash
+cd src-tauri && cargo test    # 단위 + HTTP 표면 통합 테스트
+npm run build                 # tsc --noEmit + vite build
+```
+
+통합 테스트(`src-tauri/tests/proxy_http.rs`)는 가짜 사내 서버를 띄우고 프록시를 그쪽으로
+가리켜 **진짜 HTTP 로** 규약을 확인합니다 — 404 `model_not_found` · 405/413 봉투 ·
+파라미터 검증 · SSE 청크 순서(첫 role 청크 → 내용 → finish → usage → `[DONE]`) ·
+도구 호출 왕복. 사내 서버도 목업 프로세스도 필요 없고, 창을 띄우지 않으므로 CI 에서도 돕니다.
+
 첫 실행이면 온보딩 화면이 뜹니다. 목업 서버로 시험하려면 —
 
 - 사내 AI 주소 `http://127.0.0.1:9900`
@@ -89,7 +101,8 @@ src-tauri/src/
   logstore.rs          최근 50건 링버퍼 (본문은 메모리 전용)
   port.rs              포트 가용성 · 점유 PID 조회 · 빈 포트 추천
   tray.rs windows.rs   트레이 메뉴 · 창 4개 관리 (모델 목록은 처음 열 때 생성)
-  tests/proxy_http.rs  HTTP 표면 통합 테스트 — 가짜 사내 서버를 띄워 규약을 확인
+src-tauri/tests/
+  proxy_http.rs        HTTP 표면 통합 테스트 — 가짜 사내 서버를 띄워 규약을 확인
 mock-fabrix/server.mjs 개발용 FabriX 스텁 (의존성 0)
 ```
 
@@ -268,6 +281,12 @@ FabriX 요청 스키마에는 도구 필드가 **없습니다**. 그래서 `tool
 413 은 **핸들러 안에서** 잡습니다. axum 의 `DefaultBodyLimit` 레이어에 맡기면 초과가
 핸들러에 들어오기 전에 평문 413 으로 끝나 로그 창에 아무 흔적도 남지 않습니다 —
 사용자에게는 원인 없는 실패였습니다. 지금은 봉투도 주고 로그에도 한 건 남습니다.
+
+상한(16MiB)을 넘은 본문은 **상한의 4배까지 받아 주고 나서** 413 을 돌려줍니다. 초과를
+발견한 순간 연결을 닫으면 클라이언트는 아직 본문을 쓰던 중이라 `socket hang up` 만 보고
+우리가 준비한 설명을 읽지 못합니다 — 설명을 주는 것이 이 처리의 목적이라 그러면 의미가
+없습니다. 받은 내용은 쓰지 않고 버립니다. 4배마저 넘는 요청은 어차피 도와줄 방법이 없어
+한 바이트도 읽지 않고 끊습니다.
 
 **스트림 중간 오류**는 헤더가 이미 200 으로 나간 뒤라 상태 코드를 바꿀 수 없습니다.
 오류 봉투를 SSE 프레임으로 흘리고, `finish_reason: "length"` 청크를 넣은 뒤 `[DONE]` 로

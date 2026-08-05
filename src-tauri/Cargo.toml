@@ -37,6 +37,12 @@ uuid = { version = "1", features = ["v4"] }
 # 이미지 data URL 디코드 / b64_json 인코드. 이진 이미지 왕복은 정확성이 중요해 표준 크레이트를 씁니다.
 base64 = "0.22"
 
+# `tauri::test::mock_app()` 이 디스플레이 없이 진짜 AppHandle 을 주므로 AppState 를 만들 수
+# 있고, 그래야 tests/proxy_http.rs 가 실제 라우터를 띄워 HTTP 표면을 검증할 수 있습니다.
+# dev-dependencies 라 배포 바이너리에는 들어가지 않습니다.
+[dev-dependencies]
+tauri = { version = "2", features = ["test"] }
+
 [profile.release]
 codegen-units = 1
 lto = true
