@@ -7,7 +7,7 @@ export default defineConfig({
   plugins: [react()],
   // 배포 exe 는 dist 를 Tauri 커스텀 프로토콜(http://tauri.localhost/)로 서빙합니다.
   // 절대경로(/assets/…)가 이 프로토콜에서 해석되지 않아 흰 화면이 나던 문제를
-  // 상대경로로 못박아 피합니다. 세 HTML 이 모두 dist 루트라 './' 로 안전합니다.
+  // 상대경로로 못박아 피합니다. 네 HTML 이 모두 dist 루트라 './' 로 안전합니다.
   base: './',
   clearScreen: false,
   server: {
@@ -27,6 +27,7 @@ export default defineConfig({
       input: {
         main: resolve(__dirname, 'index.html'),
         log: resolve(__dirname, 'log.html'),
+        models: resolve(__dirname, 'models.html'),
         toast: resolve(__dirname, 'toast.html'),
       },
     },
