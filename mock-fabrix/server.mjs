@@ -22,10 +22,24 @@
 //                            llm    = content 에 답변
 //                            rag    = content 는 null, 답변을 contentReferences[].answer 에
 //                            filter = content 는 null, filterBlockReason 에 차단 사유
+//   MOCK_ECHO=1             답변으로 **받은 payload 를 그대로** 돌려줍니다.
+//                            systemPrompt·contents·llmConfig 가 어떻게 접혀 나갔는지 눈으로
+//                            봅니다 — 멀티턴 fold 충실도와 도구 규약 주입을 확인하는 용도.
+//                            도구와 같이 쓰지 마세요: 에코된 규약 안의 <tool_call> 을 프록시가
+//                            다시 스캔합니다.
+//   MOCK_USAGE=1            토큰 수를 실어 보냅니다 (inputTokens·outputTokens).
+//                            ⚠️ 스펙에 없는 **가정된 모양**입니다. 프록시가 실측을 받으면
+//                            추정을 버리고 그 값을 쓰는지(x-fabrix-usage: upstream) 봅니다.
+//   MOCK_FINISH=<값>        마지막 프레임의 finishReason. `weird` 처럼 규약 밖 값을 주어
+//                            프록시가 그것을 그대로 흘리지 않는지 봅니다.
+//   MOCK_EMPTY=1            답변을 빈 문자열로 주면서 성공 표지는 남깁니다.
+//                            모델이 정말 빈 답을 준 경우 — 502 가 아니라 200 content:"" 여야 합니다.
 //
 // 조합 예시:
 //   MOCK_CASE=camel MOCK_STREAM=cumulative npm run mock
 //   MOCK_NOSTREAM=rag npm run mock
+//   MOCK_ECHO=1 npm run mock
+//   MOCK_FINISH=weird npm run mock
 
 import { createServer } from 'node:http'
 
@@ -102,6 +116,29 @@ const TOOL_CALL_BODIES = {
 const BODY = (TOOL_CALL_BODIES[process.env.MOCK_TOOLCALL] ?? TOOL_CALL_BODIES.off)()
 const CHUNK = Math.max(1, Number(process.env.MOCK_CHUNK ?? 7))
 const SPLITBYTES = process.env.MOCK_SPLITBYTES === '1'
+const ECHO = process.env.MOCK_ECHO === '1'
+const USAGE = process.env.MOCK_USAGE === '1'
+const EMPTY = process.env.MOCK_EMPTY === '1'
+const FINISH = process.env.MOCK_FINISH ?? ''
+
+/** 프록시가 실제로 보낸 것을 답변으로 되돌려줍니다 — fold 결과를 눈으로 보는 용도. */
+function echoBody(body) {
+  return [
+    '=== 프록시가 보낸 것 ===',
+    `modelIds: ${JSON.stringify(body.modelIds)}`,
+    `isStream: ${body.isStream}`,
+    `llmConfig: ${JSON.stringify(body.llmConfig ?? null)}`,
+    '--- systemPrompt ---',
+    body.systemPrompt ?? '(없음)',
+    '--- contents ---',
+    ...(body.contents ?? []).map((c, i) => `[${i}] ${c}`),
+  ].join('\n')
+}
+
+/** 사내가 토큰 수를 준다면 이런 모양일 것이라는 **가정**. 스펙에 없습니다. */
+function usageFields(prompt, completion) {
+  return USAGE ? { inputTokens: prompt, outputTokens: completion } : {}
+}
 
 const log = (...args) => console.log('[mock-fabrix]', ...args)
 
@@ -194,6 +231,9 @@ async function handleMessages(req, res) {
 
   const modelType = MODELS.find((m) => m.id === body.modelIds?.[0])?.en ?? 'unknown'
 
+  // 답변 본문. MOCK_EMPTY 는 빈 문자열(성공 표지는 그대로), MOCK_ECHO 는 받은 payload.
+  const answer = EMPTY ? '' : ECHO ? echoBody(body) : BODY
+
   if (!body.isStream) {
     // 실제 FabriX 비스트림 응답 스키마를 재현합니다(mock 이 그동안 흉내 내지 않던 필드 포함).
     // 순수 LLM 답변은 content 에, 플러그인/RAG 답변은 contentReferences[].answer 에 옵니다.
@@ -212,14 +252,15 @@ async function handleMessages(req, res) {
     return json(res, 200, {
       userId: '00000000-0000-0000-0000-000000000000',
       modelType,
-      content: isRag || isFilter ? null : BODY,
+      content: isRag || isFilter ? null : answer,
       reasoningContent: null,
       processingContent: [],
       contentReferences: isRag
         ? [{ plugin: 'RAG', answer: BODY, references: [], argumented_standalone_queries: '' }]
         : [],
       truncated: false,
-      finishReason: null,
+      // MOCK_FINISH 로 규약 밖 값을 넣어 프록시가 그것을 유출하지 않는지 봅니다.
+      finishReason: FINISH || null,
       filterBlockReason,
       status: 'SUCCESS',
       responseCode: 'R20000',
@@ -228,6 +269,7 @@ async function handleMessages(req, res) {
       actions: [],
       eventStatus: 'CHUNK',
       eventData: '',
+      ...usageFields(812, 240),
     })
   }
 
@@ -245,7 +287,7 @@ async function handleMessages(req, res) {
   // 의도적으로 한글 경계를 무시하고 잘라, 멀티바이트가 청크 경계에 걸리게 합니다.
   // MOCK_CHUNK 를 낮추면 <tool_call> 센티널도 여러 프레임에 걸쳐 쪼개집니다.
   const pieces = []
-  for (let i = 0; i < BODY.length; i += CHUNK) pieces.push(BODY.slice(i, i + CHUNK))
+  for (let i = 0; i < answer.length; i += CHUNK) pieces.push(answer.slice(i, i + CHUNK))
 
   const send = (obj) => {
     const line = JSON.stringify(obj)
@@ -273,7 +315,15 @@ async function handleMessages(req, res) {
     }
 
     if (index >= pieces.length) {
-      send(shape({ modelType, content: '', finishReason: 'stop', status: 'SUCCESS' }))
+      send(
+        shape({
+          modelType,
+          content: '',
+          finishReason: FINISH || 'stop',
+          status: 'SUCCESS',
+          ...usageFields(812, 240),
+        }),
+      )
       if (!RAW) res.write('data: [DONE]\n\n')
       res.end()
       log(`스트림 종료 · ${pieces.length}프레임 · ${CASE}/${MODE}${RAW ? '/raw' : ''}`)
