@@ -1,6 +1,7 @@
 import { writeText } from '@tauri-apps/plugin-clipboard-manager'
 import { useState } from 'react'
 
+import { openModelsWindow } from '../lib/ipc'
 import type { Snapshot } from '../types'
 
 /** 노출 엔드포인트는 둘뿐입니다 — 목업의 카드 2장을 그대로 옮겼습니다. */
@@ -46,6 +47,15 @@ export function EndpointCards({ snapshot }: { snapshot: Snapshot }) {
           </span>
         </div>
         {running && <span className="endpoint__count">{stats.models}건</span>}
+        {/* 프록시가 꺼져 있어도 목록은 볼 수 있습니다 — 사내 조회는 프록시 서버와
+            무관하게 설정만 있으면 됩니다. */}
+        <button
+          className="btn-ghost"
+          onClick={() => void openModelsWindow()}
+          title="쓸 수 있는 모델과 각 ID 를 보고 복사합니다"
+        >
+          목록 보기
+        </button>
       </div>
 
       {tokenMode && issuedToken !== '' && (

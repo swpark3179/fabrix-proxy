@@ -60,6 +60,7 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
     let copy = MenuItem::with_id(app, "copy", "엔드포인트 주소 복사", false, None::<&str>)?;
     let open = MenuItem::with_id(app, "open", "창 열기", true, None::<&str>)?;
     let logs = MenuItem::with_id(app, "logs", "호출 로그 보기", true, None::<&str>)?;
+    let models = MenuItem::with_id(app, "models", "모델 목록 보기", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "사내 연결 설정", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "종료", true, None::<&str>)?;
 
@@ -74,6 +75,7 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
             &PredefinedMenuItem::separator(app)?,
             &open,
             &logs,
+            &models,
             &settings,
             &PredefinedMenuItem::separator(app)?,
             &quit,
@@ -157,6 +159,7 @@ fn on_menu(app: &AppHandle, event: MenuEvent) {
         // 상태 줄을 눌러도 창을 엽니다 (활성 항목이라 클릭이 들어옵니다).
         "status" | "open" => windows::show_main(app),
         "logs" => windows::show_log(app),
+        "models" => windows::show_models(app),
         "settings" => windows::show_settings(app),
         "quit" => crate::commands::shutdown(app),
         _ => {}
