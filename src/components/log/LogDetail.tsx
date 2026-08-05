@@ -114,16 +114,18 @@ export function LogDetail({ entry, baseUrl, onCopyCurl }: Props) {
 
       {!chat && !entry.isError && (
         <div className="footnote">
-          클라이언트가 <code>gpt-4o</code> 처럼 사내에 없는 이름을 보내면 기본 모델로 처리하고,
-          로그 2번 칸에 어떤 <code>modelId</code> 로 나갔는지 남깁니다.
+          여기 나온 <code>id</code> 가 클라이언트의 <code>model</code> 칸에 넣는 값입니다.
+          사내에 없는 이름을 보내면 <code>404 model_not_found</code> 로 돌려줍니다.
         </div>
       )}
 
+      {/* 요청 이름과 해석된 alias 가 다른 경우 — 이제 폴백이 아니라 UUID·대소문자
+          매칭이 걸린 경우입니다. 없는 이름은 404 라 여기까지 오지 않습니다. */}
       {chat && entry.modelRequested && entry.modelAlias && entry.modelRequested !== entry.modelAlias && (
         <div className="footnote">
-          클라이언트가 보낸 <code>{entry.modelRequested}</code> 는 사내에 없는 이름이라{' '}
+          클라이언트가 보낸 <code>{entry.modelRequested}</code> 는{' '}
           <code>{entry.modelAlias}</code>
-          {entry.modelLabel ? ` (${entry.modelLabel})` : ''} 로 처리했습니다.
+          {entry.modelLabel ? ` (${entry.modelLabel})` : ''} 로 해석했습니다.
           {entry.modelId && (
             <>
               {' '}

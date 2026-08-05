@@ -57,6 +57,9 @@ struct Ctx {
     /// 검증을 통과한 요청에서 뽑아낸 실행 계획 — 무시한 필드와 버린 이미지 파트를
     /// 로그 ③ 칸까지 들고 갑니다.
     plan: validate::Plan,
+    /// `model` 을 아예 안 보내 기본 모델로 처리했는가. 없는 이름을 보낸 것과 구분해야
+    /// 하므로(그건 이제 404 입니다) 따로 들고 있습니다.
+    model_defaulted: bool,
 }
 
 /// 스트림이 중간에 끊겼을 때 마지막 청크에 넣는 `finish_reason`.
@@ -129,8 +132,12 @@ fn oversize_entry(
 ///
 /// 조용히 버리는 것과 버렸다고 말하는 것의 차이가 이 함수의 존재 이유입니다 —
 /// `tool_meta` 가 "도구를 버렸다"와 "모델이 안 썼다"를 가르는 것과 같은 이유입니다.
-fn plan_meta(plan: &validate::Plan) -> Vec<String> {
+fn plan_meta(ctx: &Ctx) -> Vec<String> {
+    let plan = &ctx.plan;
     let mut out = Vec::new();
+    if ctx.model_defaulted {
+        out.push("model 미지정 → 기본 모델".to_string());
+    }
     if !plan.ignored.is_empty() {
         out.push(format!("무시된 파라미터: {}", plan.ignored.join(" · ")));
     }
@@ -246,6 +253,7 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Body)
         tools_declared: 0,
         tools_emulated: false,
         plan: validate::Plan::default(),
+        model_defaulted: false,
     };
 
     // ── 토큰 검증 ───────────────────────────────────────────
@@ -333,26 +341,50 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Body)
         }
     };
 
-    let resolved = req
-        .model
-        .as_deref()
-        .and_then(|requested| find_model(&models, requested))
-        .or_else(|| default_model(&models, &cfg.default_model_alias));
+    // 요청한 이름이 실제로 있는가. **폴백하지 않습니다** — 예전에는 없는 이름을
+    // 조용히 기본 모델로 바꿔 주어, 오타가 성공처럼 보였습니다. 그 조용한 실패가
+    // 규약 위반보다 나쁩니다.
+    let requested = req.model.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let resolved = match requested {
+        Some(name) => find_model(&models, name),
+        // `model` 을 아예 안 보낸 요청에는 설정의 기본 모델을 씁니다.
+        None => default_model(&models, &cfg.default_model_alias),
+    };
+
     let Some(model) = resolved else {
-        let msg = "사내 모델 목록이 비어 있어 요청을 보낼 수 없습니다.".to_string();
+        let (status, msg, code) = match requested {
+            Some(name) => (
+                404,
+                format!(
+                    "모델 '{name}' 을 찾을 수 없습니다. 사용 가능한 모델은 GET /v1/models 또는 \
+                     앱의 [모델 목록] 창에서 확인하세요."
+                ),
+                "model_not_found",
+            ),
+            None => (
+                502,
+                "사내 모델 목록이 비어 있어 요청을 보낼 수 없습니다.".to_string(),
+                "upstream_bad_response",
+            ),
+        };
         state.record(ctx.entry(
-            502,
+            status,
             true,
             Some("모델 없음".into()),
             Some("모델 없음".into()),
             msg.clone(),
-            "실패 · 모델 목록 없음".into(),
+            format!("실패 · HTTP {status} · 모델 없음"),
         ));
-        return error_response(
-            502,
-            ErrorEnvelope::new(msg, openai_type(502), Some("upstream_bad_response".into())),
-        );
+        let mut envelope =
+            ErrorEnvelope::new(msg, openai_type(status), Some(code.to_string()));
+        if status == 404 {
+            envelope = envelope.with_param("model");
+        }
+        return error_response(status, envelope);
     };
+    if requested.is_none() {
+        ctx.model_defaulted = true;
+    }
     ctx.model_alias = Some(model.alias.clone());
     ctx.model_id = Some(model.model_id.clone());
     ctx.model_label = Some(model.label.clone());
@@ -549,7 +581,7 @@ impl Drop for StreamLog {
         ) {
             meta.push(line);
         }
-        meta.extend(plan_meta(&self.ctx.plan));
+        meta.extend(plan_meta(&self.ctx));
 
         let note = match (aborted, self.failure.is_some()) {
             (true, _) => Some("클라이언트가 연결을 끊음".to_string()),
@@ -851,7 +883,7 @@ async fn collect_response(
     ) {
         meta.push(line);
     }
-    meta.extend(plan_meta(&ctx.plan));
+    meta.extend(plan_meta(&ctx));
 
     let note = (ctx.tools_emulated && !has_calls).then(|| "도구 미사용".to_string());
 
@@ -909,9 +941,29 @@ mod tests {
         assert!(line.contains("형식 오류 2건"), "{line}");
     }
 
+    fn ctx_with(plan: validate::Plan, model_defaulted: bool) -> Ctx {
+        Ctx {
+            started: Instant::now(),
+            stream: false,
+            client: None,
+            model_requested: None,
+            model_alias: None,
+            model_id: None,
+            model_label: None,
+            req_openai: String::new(),
+            req_fabrix: String::new(),
+            req_fabrix_headers: String::new(),
+            fabrix_url: String::new(),
+            tools_declared: 0,
+            tools_emulated: false,
+            plan,
+            model_defaulted,
+        }
+    }
+
     #[test]
     fn plan_meta_is_silent_for_a_plain_request() {
-        assert!(plan_meta(&validate::Plan::default()).is_empty());
+        assert!(plan_meta(&ctx_with(validate::Plan::default(), false)).is_empty());
     }
 
     #[test]
@@ -922,11 +974,12 @@ mod tests {
             ignored: vec!["stop", "presence_penalty"],
             unknown: vec!["래빗홀".into()],
         };
-        let lines = plan_meta(&plan);
-        assert_eq!(lines.len(), 3);
-        assert_eq!(lines[0], "무시된 파라미터: stop · presence_penalty");
-        assert!(lines[1].contains("이미지 파트 2개"), "{}", lines[1]);
-        assert!(lines[2].contains("래빗홀"), "{}", lines[2]);
+        let lines = plan_meta(&ctx_with(plan, true));
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[0], "model 미지정 → 기본 모델");
+        assert_eq!(lines[1], "무시된 파라미터: stop · presence_penalty");
+        assert!(lines[2].contains("이미지 파트 2개"), "{}", lines[2]);
+        assert!(lines[3].contains("래빗홀"), "{}", lines[3]);
     }
 
     // ── 클라이언트가 실제로 보는 청크 ──
