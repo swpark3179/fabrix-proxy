@@ -66,7 +66,7 @@ impl Ctx {
             ts_full: state::now_iso(),
             kind: Kind::Images,
             method: Kind::Images.method(),
-            path: self.path,
+            path: self.path.into(),
             status,
             latency_ms: self.started.elapsed().as_millis() as u64,
             stream: false,

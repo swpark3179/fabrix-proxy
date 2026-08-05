@@ -90,7 +90,7 @@ impl Ctx {
             ts_full: state::now_iso(),
             kind: Kind::Chat,
             method: Kind::Chat.method(),
-            path: Kind::Chat.path(),
+            path: Kind::Chat.path().into(),
             status,
             latency_ms: self.started.elapsed().as_millis() as u64,
             stream: self.stream,

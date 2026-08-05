@@ -46,7 +46,11 @@ pub struct LogEntry {
     pub ts_full: String,
     pub kind: Kind,
     pub method: &'static str,
-    pub path: &'static str,
+    /// 실제로 들어온 경로. 리터럴이 아닌 이유: `/v1/models/{id}` 처럼 경로에 값이
+    /// 박히는 엔드포인트가 있고, 로그 창의 `cURL 복사`(`format.ts` `toCurl`)가 이 값을
+    /// 그대로 URL 에 넣습니다. `{id}` 를 그대로 두면 붙여넣어도 동작하지 않는 명령이
+    /// 만들어집니다.
+    pub path: String,
     pub status: u16,
     pub latency_ms: u64,
     pub stream: bool,
