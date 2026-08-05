@@ -107,41 +107,7 @@
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
 }
 
-/* ── 포트 + Base URL ─────────────────────────────────────────── */
-
-.fields {
-  display: flex;
-  align-items: flex-end;
-  gap: 18px;
-}
-
-.field {
-  display: flex;
-  flex-direction: column;
-  gap: 7px;
-}
-
-.field--grow {
-  flex: 1;
-  min-width: 0;
-}
-
-.field__label {
-  font: 400 12px var(--font-sans);
-  color: var(--ink-5);
-  white-space: nowrap;
-}
-
-.field__label--muted {
-  color: var(--ink-off);
-}
-
-.field__row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
+/* 공용 컨트롤은 styles/controls.css 로 옮겼습니다. */
 .port-input {
   width: 88px;
   font: 500 14px var(--font-mono);
@@ -191,25 +157,6 @@
   border-color: var(--border-soft);
 }
 
-.btn-primary {
-  font: 600 12.5px var(--font-sans);
-  color: #fff;
-  background: var(--accent);
-  border-radius: 7px;
-  padding: 10px 16px;
-  white-space: nowrap;
-  flex: none;
-}
-
-.btn-primary:hover:not(:disabled) {
-  background: var(--accent-hover);
-}
-
-.btn-primary:disabled {
-  color: var(--ink-off);
-  background: #eeece7;
-}
-
 .hint {
   font: 400 11.5px/1.6 var(--font-sans);
   color: var(--ink-5);
@@ -249,25 +196,6 @@
 
 .conflict .btn-primary {
   padding: 9px 15px;
-}
-
-/* 켜기 실패 등 일반 오류 */
-.alert {
-  background: rgba(191, 53, 36, 0.06);
-  border: 1px solid rgba(191, 53, 36, 0.28);
-  border-radius: 8px;
-  padding: 11px 13px;
-  font: 400 12px/1.6 var(--font-sans);
-  color: #a12c1e;
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-}
-
-.alert__close {
-  font: 400 12px var(--font-sans);
-  color: #a12c1e;
-  flex: none;
 }
 
 /* ── 엔드포인트 카드 ─────────────────────────────────────────── */
@@ -369,16 +297,6 @@
   font: 600 13px var(--font-sans);
   color: var(--ink);
   white-space: nowrap;
-}
-
-.link {
-  font: 500 12px var(--font-sans);
-  color: var(--accent);
-  white-space: nowrap;
-}
-
-.link:hover {
-  color: var(--accent-hover);
 }
 
 .recent__table {
@@ -500,44 +418,10 @@
   min-width: 0;
 }
 
-.text-input {
-  width: 100%;
-  font: 400 12.5px var(--font-mono);
-  color: var(--ink);
-  background: var(--surface);
-  border: 1px solid var(--border-strong);
-  border-radius: 7px;
-  padding: 9px 11px;
-  user-select: text;
-}
-
-.text-input::placeholder {
-  color: var(--ink-off);
-  font-family: var(--font-sans);
-}
-
 .setup__foot {
   display: flex;
   align-items: center;
   gap: 10px;
-}
-
-.btn-ghost {
-  font: 500 12.5px var(--font-sans);
-  color: var(--ink-2);
-  border: 1px solid var(--border-strong);
-  border-radius: 7px;
-  padding: 9px 15px;
-  white-space: nowrap;
-  background: var(--surface);
-}
-
-.btn-ghost:hover:not(:disabled) {
-  background: var(--surface-5);
-}
-
-.btn-ghost:disabled {
-  color: var(--ink-off);
 }
 
 .setup__result {

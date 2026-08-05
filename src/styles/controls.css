@@ -1,0 +1,128 @@
+/* 창 여러 개가 공유하는 컨트롤.
+ *
+ * 원래 main.css(대시보드 전용 600줄) 안에 있었습니다. 모델 목록 창이 버튼·입력칸
+ * 때문에 그 파일을 통째로 import 하면 쓰지 않는 대시보드 규칙이 따라 들어오므로,
+ * 규칙을 **한 글자도 바꾸지 않고** 여기로 옮겼습니다.
+ *
+ * base.css 가 fonts·tokens 를 import 하는 것과 같은 방식으로 이 파일을 import 하고,
+ * 세 창 모두 base.css 를 먼저 읽으므로 기존 화면은 픽셀 단위로 같습니다. */
+
+/* ── 폼 필드 ──────────────────────────────────────────────── */
+
+.fields {
+  display: flex;
+  align-items: flex-end;
+  gap: 18px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.field--grow {
+  flex: 1;
+  min-width: 0;
+}
+
+.field__label {
+  font: 400 12px var(--font-sans);
+  color: var(--ink-5);
+  white-space: nowrap;
+}
+
+.field__label--muted {
+  color: var(--ink-off);
+}
+
+.field__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.text-input {
+  width: 100%;
+  font: 400 12.5px var(--font-mono);
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  padding: 9px 11px;
+  user-select: text;
+}
+
+.text-input::placeholder {
+  color: var(--ink-off);
+  font-family: var(--font-sans);
+}
+
+/* ── 버튼 ────────────────────────────────────────────────── */
+
+.btn-primary {
+  font: 600 12.5px var(--font-sans);
+  color: #fff;
+  background: var(--accent);
+  border-radius: 7px;
+  padding: 10px 16px;
+  white-space: nowrap;
+  flex: none;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.btn-primary:disabled {
+  color: var(--ink-off);
+  background: #eeece7;
+}
+
+.btn-ghost {
+  font: 500 12.5px var(--font-sans);
+  color: var(--ink-2);
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  padding: 9px 15px;
+  white-space: nowrap;
+  background: var(--surface);
+}
+
+.btn-ghost:hover:not(:disabled) {
+  background: var(--surface-5);
+}
+
+.btn-ghost:disabled {
+  color: var(--ink-off);
+}
+
+.link {
+  font: 500 12px var(--font-sans);
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+.link:hover {
+  color: var(--accent-hover);
+}
+
+/* ── 오류 배너 ────────────────────────────────────────────── */
+
+.alert {
+  background: rgba(191, 53, 36, 0.06);
+  border: 1px solid rgba(191, 53, 36, 0.28);
+  border-radius: 8px;
+  padding: 11px 13px;
+  font: 400 12px/1.6 var(--font-sans);
+  color: #a12c1e;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.alert__close {
+  font: 400 12px var(--font-sans);
+  color: #a12c1e;
+  flex: none;
+}
