@@ -125,23 +125,28 @@ pub fn build_aliases(models: &[FabrixModel]) -> Vec<ResolvedModel> {
     out
 }
 
-/// UUID 직매치 → alias 완전일치 → 대소문자 무시 → 기본 모델 폴백.
-pub fn resolve_model<'a>(
+/// UUID 직매치 → alias 완전일치 → 대소문자 무시. **폴백하지 않습니다.**
+///
+/// 폴백을 이 함수 안에 두면 `/v1/models/{id}` 가 모르는 id 에 200 을 돌려주는 거짓말이
+/// 됩니다 — 클라이언트는 그 id 가 있다고 믿고 계속 씁니다. 폴백이 필요한 자리
+/// (`model` 을 아예 안 보낸 요청)는 [`default_model`] 을 따로 부릅니다.
+pub fn find_model<'a>(models: &'a [ResolvedModel], requested: &str) -> Option<&'a ResolvedModel> {
+    let req = requested.trim();
+    if req.is_empty() {
+        return None;
+    }
+    models
+        .iter()
+        .find(|m| m.model_id == req)
+        .or_else(|| models.iter().find(|m| m.alias == req))
+        .or_else(|| models.iter().find(|m| m.alias.eq_ignore_ascii_case(req)))
+}
+
+/// `model` 을 아예 안 보낸 요청에 쓸 모델 — 설정의 기본 alias, 없으면 목록의 첫 모델.
+pub fn default_model<'a>(
     models: &'a [ResolvedModel],
-    requested: Option<&str>,
     default_alias: &str,
 ) -> Option<&'a ResolvedModel> {
-    if let Some(req) = requested.map(str::trim).filter(|s| !s.is_empty()) {
-        if let Some(hit) = models.iter().find(|m| m.model_id == req) {
-            return Some(hit);
-        }
-        if let Some(hit) = models.iter().find(|m| m.alias == req) {
-            return Some(hit);
-        }
-        if let Some(hit) = models.iter().find(|m| m.alias.eq_ignore_ascii_case(req)) {
-            return Some(hit);
-        }
-    }
     models
         .iter()
         .find(|m| m.alias == default_alias)
@@ -1090,17 +1095,54 @@ mod tests {
         assert_eq!(resolved[1].label, "라이트");
     }
 
+    fn two_models() -> Vec<ResolvedModel> {
+        build_aliases(&[
+            FabrixModel {
+                model_id: "uuid-1".into(),
+                name: vec![LocalizedText {
+                    language_code: Some("en".into()),
+                    content: Some("Chat 4".into()),
+                }],
+                description: vec![],
+            },
+            FabrixModel {
+                model_id: "uuid-2".into(),
+                name: vec![LocalizedText {
+                    language_code: Some("en".into()),
+                    content: Some("Chat Lite".into()),
+                }],
+                description: vec![],
+            },
+        ])
+    }
+
     #[test]
-    fn unknown_model_falls_back_to_default() {
-        let models = build_aliases(&[FabrixModel {
-            model_id: "uuid-1".into(),
-            name: vec![LocalizedText { language_code: Some("en".into()), content: Some("Chat 4".into()) }],
-            description: vec![],
-        }]);
-        let hit = resolve_model(&models, Some("gpt-4o"), "fabrix-chat-4").unwrap();
-        assert_eq!(hit.model_id, "uuid-1");
-        // UUID 를 직접 보내도 통합니다.
-        assert_eq!(resolve_model(&models, Some("uuid-1"), "").unwrap().alias, "fabrix-chat-4");
+    fn find_model_hits_by_uuid_alias_and_ignoring_case() {
+        let models = two_models();
+        assert_eq!(find_model(&models, "uuid-1").unwrap().alias, "fabrix-chat-4");
+        assert_eq!(find_model(&models, "fabrix-chat-lite").unwrap().model_id, "uuid-2");
+        assert_eq!(find_model(&models, "FABRIX-Chat-4").unwrap().model_id, "uuid-1");
+        // 앞뒤 공백은 다듬습니다.
+        assert_eq!(find_model(&models, "  fabrix-chat-4  ").unwrap().model_id, "uuid-1");
+    }
+
+    /// 이 함수의 존재 이유입니다 — 모르는 이름에 아무 모델도 돌려주지 않아야 합니다.
+    #[test]
+    fn find_model_never_falls_back() {
+        let models = two_models();
+        assert!(find_model(&models, "gpt-4o").is_none());
+        assert!(find_model(&models, "").is_none());
+        assert!(find_model(&models, "   ").is_none());
+    }
+
+    #[test]
+    fn default_model_prefers_the_configured_alias_then_the_first() {
+        let models = two_models();
+        assert_eq!(default_model(&models, "fabrix-chat-lite").unwrap().model_id, "uuid-2");
+        // 설정이 비었거나 목록에 없으면 첫 모델.
+        assert_eq!(default_model(&models, "").unwrap().model_id, "uuid-1");
+        assert_eq!(default_model(&models, "fabrix-nope").unwrap().model_id, "uuid-1");
+        assert!(default_model(&[], "fabrix-chat-4").is_none());
     }
 
     #[test]

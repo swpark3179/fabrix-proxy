@@ -25,7 +25,7 @@ use crate::openai::{
 use crate::state::{self, Shared};
 
 use super::fabrix::{
-    extract_object, fold_messages, map_finish_reason, resolve_model, FabrixChunk, FabrixError,
+    default_model, extract_object, find_model, fold_messages, map_finish_reason, FabrixChunk, FabrixError,
     LlmConfig, MessagesRequest, ResolvedModel, StreamDecoder, StreamEvent, MESSAGES_PATH,
 };
 use super::models::ensure_models;
@@ -219,7 +219,12 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Bytes
         }
     };
 
-    let Some(model) = resolve_model(&models, req.model.as_deref(), &cfg.default_model_alias) else {
+    let resolved = req
+        .model
+        .as_deref()
+        .and_then(|requested| find_model(&models, requested))
+        .or_else(|| default_model(&models, &cfg.default_model_alias));
+    let Some(model) = resolved else {
         let msg = "사내 모델 목록이 비어 있어 요청을 보낼 수 없습니다.".to_string();
         state.record(ctx.entry(
             502,
