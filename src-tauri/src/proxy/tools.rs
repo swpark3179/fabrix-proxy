@@ -254,17 +254,6 @@ impl ToolCallScanner {
         self.next_index
     }
 
-    /// 누적 모드에서 상위가 **본문을** 통째로 다시 쓴 지점. 본문 버퍼를 버립니다.
-    ///
-    /// 추론 채널은 건드리지 않습니다 — 재작성은 `content` 에만 일어나므로
-    /// (`StreamDecoder::absorb`), 추론 쪽 미완성 블록을 같이 버릴 이유가 없습니다.
-    ///
-    /// `next_index` 는 **유지**합니다 — 이미 내보낸 index 를 재사용하면 클라이언트가
-    /// 서로 다른 두 호출을 같은 호출의 조각으로 이어 붙입니다.
-    pub fn reset(&mut self) {
-        self.content = ChannelState::default();
-    }
-
     /// 본문 채널에 밀어 넣습니다 (`push_on(Channel::Content, …)` 의 별칭).
     pub fn push(&mut self, delta: &str) -> ScanOut {
         self.push_on(Channel::Content, delta)
@@ -440,12 +429,6 @@ impl ThinkSplitter {
     /// 스트림 종료. 붙들고 있던 것은 모두 흘려보냅니다 — 절대 버리지 않습니다.
     pub fn finish(&mut self) -> Split {
         self.drain(true)
-    }
-
-    /// 누적 모드에서 본문이 통째로 다시 쓰인 지점.
-    pub fn reset(&mut self) {
-        self.buf.clear();
-        self.inside = None;
     }
 
     /// 갈라낸 추론 블록 수 — 로그용.
@@ -922,34 +905,18 @@ mod tests {
         }
     }
 
-    /// 본문 재작성(`StreamEvent::Reset`)은 추론 채널을 건드리면 안 됩니다 —
-    /// 재작성은 `content` 에만 일어납니다.
+    /// 미완성 블록을 붙들고 있는 동안 다음 조각이 와서 완성되는 경로 — 채널마다
+    /// 독립적으로 성립해야 합니다.
     #[test]
-    fn reset_spares_the_reasoning_channel() {
+    fn a_held_block_completes_on_its_own_channel() {
         let mut sc = scanner();
         sc.push_on(Channel::Reasoning, "<tool_call>{\"name\":\"read\",\"argu");
-        sc.push("본문 <tool_call>{\"name\":\"wr");
-        sc.reset();
-        // 추론 쪽 미완성 블록은 살아 있어야 하고, 이어지는 조각으로 완성됩니다.
+        // 그 사이 본문 조각이 끼어들어도 추론 쪽 버퍼는 그대로입니다.
+        sc.push("본문 텍스트");
         let out = sc.push_on(Channel::Reasoning, "ments\":{}}</tool_call>");
-        assert_eq!(out.calls.len(), 1, "리셋이 추론 버퍼를 지웠습니다");
+        assert_eq!(out.calls.len(), 1, "다른 채널이 끼어들어 버퍼가 깨졌습니다");
         assert_eq!(out.calls[0].name, "read");
-        // 본문 쪽은 버려졌습니다.
-        assert!(!sc.finish().text.contains("wr"));
-    }
-
-    #[test]
-    fn reset_clears_the_buffer_but_keeps_the_index() {
-        let mut sc = scanner();
-        let first = sc.push("<tool_call>{\"name\":\"read\",\"arguments\":{}}</tool_call>tail");
-        assert_eq!(first.calls[0].index, 0);
-        sc.push("<tool_call>{\"name\":\"wr");
-        sc.reset();
-        let after = scan_all(&mut sc, "<tool_call>{\"name\":\"write\",\"arguments\":{}}</tool_call>");
-        assert_eq!(after.calls.len(), 1);
-        // 이미 나간 index 0 을 재사용하면 클라이언트가 두 호출을 하나로 잇습니다.
-        assert_eq!(after.calls[0].index, 1);
-        assert!(!after.text.contains("wr"), "리셋된 버퍼가 새어 나왔습니다");
+        assert_eq!(sc.finish().text, "");
     }
 
     /// 한 덩어리로 밀어 넣든 조각으로 밀어 넣든 같은 결과여야 합니다. 예전에는

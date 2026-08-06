@@ -114,7 +114,7 @@ impl Turn {
 
     /// 이벤트 하나를 소비하고 내보낼 조각들을 돌려줍니다.
     ///
-    /// `Delta`/`Reasoning`/`Reset`/`Finish`/`Error`/`Done` 처리가 **여기 한 곳**뿐입니다.
+    /// `Delta`/`Reasoning`/`Finish`/`Error`/`Done` 처리가 **여기 한 곳**뿐입니다.
     pub fn push(&mut self, event: StreamEvent) -> Emit {
         let mut emit = Emit::default();
         match event {
@@ -134,16 +134,6 @@ impl Turn {
                 self.raw_reasoning.push_str(&text);
                 let out = self.scanner.push_on(Channel::Reasoning, &text);
                 self.route(Channel::Reasoning, out, &mut emit);
-            }
-            // 누적 모드에서 상위가 **본문을** 통째로 다시 썼습니다. 본문 파생 상태만
-            // 버립니다 — 추론 채널은 재작성 대상이 아닙니다.
-            StreamEvent::Reset => {
-                self.scanner.reset();
-                if let Some(th) = self.think.as_mut() {
-                    th.reset();
-                }
-                self.raw_content.clear();
-                self.content.clear();
             }
             StreamEvent::Finish(reason) => self.upstream_finish = Some(reason),
             StreamEvent::Error(msg) => self.failure = Some(msg),
@@ -492,25 +482,25 @@ mod tests {
         assert_eq!(t.finish_reason(), "length");
     }
 
-    /// 재작성은 본문에만 일어납니다 — 추론 누적기와 호출 index 는 살아야 합니다.
+    /// 여러 프레임에 걸친 호출들의 index 가 이어져야 합니다 — 재사용하면 클라이언트가
+    /// 서로 다른 두 호출을 한 호출의 조각으로 잇습니다.
     #[test]
-    fn reset_drops_content_but_keeps_reasoning_and_call_indices() {
+    fn call_indices_keep_increasing_across_frames_and_channels() {
         let mut t = turn();
-        t.push(StreamEvent::Reasoning("추론은 남아야".into()));
-        t.push(StreamEvent::Delta(
-            "<tool_call>{\"name\":\"read\",\"arguments\":{}}</tool_call>버릴 본문".into(),
-        ));
-        t.push(StreamEvent::Reset);
         let pieces = drive(
             &mut t,
-            vec![StreamEvent::Delta(
-                "<tool_call>{\"name\":\"write\",\"arguments\":{}}</tool_call>새 본문".into(),
-            )],
+            vec![
+                StreamEvent::Delta("<tool_call>{\"name\":\"read\",\"arguments\":{}}</tool_call>".into()),
+                StreamEvent::Reasoning(
+                    "<tool_call>{\"name\":\"write\",\"arguments\":{}}</tool_call>".into(),
+                ),
+                StreamEvent::Delta("<tool_call>{\"name\":\"read\",\"arguments\":{}}</tool_call>".into()),
+            ],
         );
-        assert_eq!(t.content(), "새 본문", "재작성된 본문이 남았습니다");
-        assert_eq!(t.reasoning(), "추론은 남아야");
-        // 이미 내보낸 index 0 을 재사용하면 클라이언트가 두 호출을 하나로 잇습니다.
-        assert_eq!(call_of(&pieces)[0].index, 1);
+        let calls = call_of(&pieces);
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls.iter().map(|c| c.index).collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert_eq!(t.tool_stats().in_reasoning, 1);
     }
 
     #[test]

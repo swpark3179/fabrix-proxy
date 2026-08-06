@@ -744,6 +744,139 @@ async fn tail_reminder_reaches_the_upstream_contents() {
     assert!(!tail.contains("# Tool calling"), "규약 전문이 두 번 실렸습니다");
 }
 
+/// 벤더 샘플과 같은 대화가 **턴 배열**로 나가야 합니다. 예전에는
+/// `["User: …\n\nAssistant: …\n\nUser: …"]` 한 덩어리였습니다.
+#[tokio::test]
+async fn multi_turn_reaches_the_upstream_as_one_element_per_turn() {
+    let (base, _state, up) = harness(Upstream::answering("네")).await;
+
+    let (status, _) = chat(
+        &base,
+        json!({
+            "model": "fabrix-chat-4",
+            "messages": [
+                { "role": "user", "content": "안녕하세요?" },
+                { "role": "assistant", "content": "네 안녕하세요" },
+                { "role": "user", "content": "내 이름은 LCY인데 너 이름은 뭐니?" },
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let payload = up.lock().unwrap().seen.last().cloned().unwrap();
+    assert_eq!(
+        payload["contents"],
+        json!(["안녕하세요?", "네 안녕하세요", "내 이름은 LCY인데 너 이름은 뭐니?"]),
+        "{payload}"
+    );
+}
+
+/// 도구 왕복 한 바퀴가 `[user, assistant, user]` 로 접히고, 리마인더가 **user 자리**에
+/// 붙어야 합니다 — assistant 자리에 들어가면 지시문이 모델 자신의 발화가 됩니다.
+#[tokio::test]
+async fn a_tool_round_trip_keeps_alternation_and_the_reminder_in_a_user_slot() {
+    let (base, _state, up) = harness(Upstream::answering("네")).await;
+
+    let (status, _) = chat(
+        &base,
+        with_write_tool(json!({
+            "model": "fabrix-chat-4",
+            "messages": [
+                { "role": "user", "content": "페이지 만들어줘" },
+                { "role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_a1", "type": "function",
+                    "function": { "name": "write", "arguments": "{\"filePath\":\"a.html\"}" },
+                }]},
+                { "role": "tool", "tool_call_id": "call_a1", "content": "wrote 12 bytes" },
+            ],
+        })),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let payload = up.lock().unwrap().seen.last().cloned().unwrap();
+    let contents = payload["contents"].as_array().unwrap();
+    assert_eq!(contents.len(), 3, "{payload}");
+    assert_eq!(contents[0], "페이지 만들어줘");
+    assert!(contents[1].as_str().unwrap().contains("<tool_call>"), "{payload}");
+    let last = contents[2].as_str().unwrap();
+    assert!(last.contains("wrote 12 bytes"), "{last}");
+    // 리마인더는 도구 결과와 같은 user 원소에 붙습니다.
+    assert!(last.contains("# Reminder"), "리마인더가 user 자리에 없습니다: {last}");
+    assert!(!contents[1].as_str().unwrap().contains("# Reminder"), "{payload}");
+}
+
+/// 마지막 메시지가 assistant 면 리마인더는 **새 user 원소**로 나가야 합니다.
+#[tokio::test]
+async fn the_reminder_becomes_its_own_user_turn_after_an_assistant_message() {
+    let (base, _state, up) = harness(Upstream::answering("네")).await;
+
+    chat(
+        &base,
+        with_write_tool(json!({
+            "model": "fabrix-chat-4",
+            "messages": [
+                { "role": "user", "content": "만들어줘" },
+                { "role": "assistant", "content": "무엇을 만들까요?" },
+            ],
+        })),
+    )
+    .await;
+
+    let payload = up.lock().unwrap().seen.last().cloned().unwrap();
+    let contents = payload["contents"].as_array().unwrap();
+    assert_eq!(contents.len(), 3, "리마인더가 자기 턴을 갖지 못했습니다: {payload}");
+    assert_eq!(contents[1], "무엇을 만들까요?");
+    assert!(contents[2].as_str().unwrap().contains("# Reminder"), "{payload}");
+    // assistant 발화는 오염되지 않았습니다.
+    assert!(!contents[1].as_str().unwrap().contains("# Reminder"));
+}
+
+/// 사내 `temperature` 상한은 0–1 입니다. OpenAI 범위(0–2)를 보내는 클라이언트를 깨지
+/// 않으면서, 나가는 값만 줄이고 그 사실을 로그에 적습니다.
+#[tokio::test]
+async fn temperature_above_the_fabrix_ceiling_is_clamped_and_logged() {
+    let (base, state, up) = harness(Upstream::answering("네")).await;
+
+    let (status, _) = chat(
+        &base,
+        json!({
+            "model": "fabrix-chat-4", "temperature": 1.5,
+            "messages": [{ "role": "user", "content": "hi" }],
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "0–2 를 보내는 클라이언트를 거절하면 안 됩니다");
+
+    let payload = up.lock().unwrap().seen.last().cloned().unwrap();
+    assert_eq!(payload["llmConfig"]["temperature"], 1.0, "{payload}");
+
+    let meta = state.snapshot().recent[0].resp_meta.clone();
+    assert!(meta.contains("temperature 1.5 → 1 (사내 상한)"), "{meta}");
+}
+
+/// 두 철자를 모두 실어 보냅니다 — 문서와 샘플이 달라 어느 쪽을 읽는지 모릅니다.
+#[tokio::test]
+async fn llm_config_carries_both_spellings_upstream() {
+    let (base, _state, up) = harness(Upstream::answering("네")).await;
+
+    chat(
+        &base,
+        json!({
+            "model": "fabrix-chat-4", "frequency_penalty": 1.04, "top_k": 14,
+            "messages": [{ "role": "user", "content": "hi" }],
+        }),
+    )
+    .await;
+
+    let cfg = up.lock().unwrap().seen.last().cloned().unwrap()["llmConfig"].clone();
+    assert_eq!(cfg["repetition_penalty"], 1.04, "샘플 철자: {cfg}");
+    assert_eq!(cfg["repetion_penalty"], 1.04, "문서 철자: {cfg}");
+    assert_eq!(cfg["top_k"], 14, "샘플 철자: {cfg}");
+    assert_eq!(cfg["tok_k"], 14, "문서 철자: {cfg}");
+}
+
 /// 도구를 안 쓰는 요청은 문자 하나도 달라지지 않아야 합니다.
 #[tokio::test]
 async fn a_tool_free_request_carries_no_reminder() {

@@ -164,9 +164,9 @@ OpenAI 양식 토큰(`sk-…`)이 자동 발행되고, 인바운드 `Authorizati
 | `model` | `modelIds: [uuid]` — UUID 직매치 → alias → 대소문자 무시. **못 찾으면 404** (폴백하지 않습니다) |
 | `model` 없음 | 설정의 `defaultModelAlias`, 그것도 없으면 목록의 첫 모델 |
 | `messages[role=system]` | `systemPrompt` (여러 개면 `\n\n` 연결) |
-| 나머지 `messages` | `contents` — 단일 user 턴이면 그 텍스트, 멀티턴이면 `User:`/`Assistant:` 트랜스크립트 하나 |
+| 나머지 `messages` | `contents` — **턴당 원소 하나** (배열 위치가 롤: 짝수 user, 홀수 assistant). 연속 동일 롤은 병합, `role:"tool"` 결과는 user 턴 |
 | `stream` | `isStream` |
-| `temperature` `top_p` `max_tokens` `seed` `frequency_penalty` `top_k` | `llmConfig.{temperature, top_p, max_new_tokens, seed, repetion_penalty, tok_k}` |
+| `temperature` `top_p` `max_tokens` `seed` `frequency_penalty` `top_k` | `llmConfig.{temperature, top_p, max_new_tokens, seed, …}`. `temperature` 는 사내 상한 **1.0** 으로 클램프. 페널티·top-k 는 문서와 샘플의 철자가 달라 **두 철자 모두** 보냅니다 (아래 참고) |
 | `tools` `tool_choice` | 대응 필드가 **없어** `systemPrompt` 뒤의 규약 텍스트로 접힙니다 (아래 참고) |
 | `stream_options.include_usage` | 스트림 꼬리에 `usage` 청크 (추정치 · 아래 참고) |
 
@@ -176,7 +176,7 @@ OpenAI 양식 토큰(`sk-…`)이 자동 발행되고, 인바운드 `Authorizati
 | 필드 | 왜 |
 |---|---|
 | `stop` | 사내에 대응 필드가 없습니다. 거절하지 않는 이유는 기본값으로 실어 보내는 클라이언트가 많아 400 이 더 많이 깨뜨리기 때문입니다 |
-| `presence_penalty` | 페널티 키가 `repetion_penalty` 하나뿐이고 `frequency_penalty` 가 이미 씁니다. 의미가 다른 두 값을 한 키에 겹쳐 넣는 것은 상위 동작을 지어내는 일입니다 |
+| `presence_penalty` | 사내 페널티 키가 하나뿐이고 `frequency_penalty` 가 이미 씁니다. 의미가 다른 두 값을 한 키에 겹쳐 넣는 것은 상위 동작을 지어내는 일입니다 |
 | `logit_bias` | 사내 모델의 토크나이저를 모릅니다 |
 | `user` `metadata` `store` `service_tier` `parallel_tool_calls` | 대응 필드 없음 |
 | `response_format` | 프롬프트 규약으로 흉내 낼 수는 있지만 이번 범위 밖입니다 |
@@ -193,9 +193,40 @@ OpenAI 양식 토큰(`sk-…`)이 자동 발행되고, 인바운드 `Authorizati
 `messages`(비어 있지 않고 롤이 규약값) 도 검증합니다. 위반은 OpenAI 모양의 400 —
 `{"error":{"message":…,"type":"invalid_request_error","param":"temperature","code":"invalid_value"}}`.
 
-FabriX에는 롤 구조가 없어 멀티턴은 한 덩어리로 접힙니다. 무엇이 어떻게 접혔는지는
-로그 창 ② 칸에서 그대로 확인할 수 있습니다 (`MOCK_ECHO=1` 로 사내가 받은 것을 그대로
-되돌려 받아 볼 수도 있습니다).
+**`temperature` 는 0–2 를 통과시키고 나갈 값만 1.0 으로 줄입니다.** 사내 스펙은 0–1 인데
+OpenAI 는 0–2 라, 거절하면 그 범위를 기본값으로 보내는 클라이언트가 전부 400 을 받습니다.
+조용히 줄이지는 않습니다 — 로그 ③ 칸 꼬리에 `temperature 1.5 → 1 (사내 상한)` 이 남습니다.
+
+**페널티·top-k 는 두 철자를 모두 보냅니다.** 스펙 문서의 속성 목록은 `repetion_penalty`·
+`tok_k` 이고, 벤더가 준 **실행되는 샘플 코드**는 `repetition_penalty`·`top_k` 입니다. 어느
+쪽이 서버가 읽는 키인지 확정되지 않아 네 키에 같은 값을 싣습니다. 한쪽만 보내면 서버가 다른
+쪽을 읽을 때 값이 **조용히 버려집니다** — 실제로 그래 왔을 수 있습니다. 사내가 `llmConfig` 의
+모르는 키를 무시한다는 것은, 문서 철자만 보내면서도 앱이 동작해 온 사실이 말해 줍니다.
+
+### `contents` 는 턴 배열입니다
+
+`contents` 는 원소 하나가 한 턴이고 **배열 위치가 롤**입니다 (짝수 user, 홀수 assistant).
+벤더 샘플이 근거입니다:
+
+```python
+"contents": ["안녕하세요?", "네 안녕하세요", "내 이름은 LCY인데 너 이름은 뭐니?"]
+#              user           assistant        user
+```
+
+예전에는 "FabriX 엔 롤 구조가 없다" 고 보아 멀티턴을 `["User: …\n\nAssistant: …"]` 한
+덩어리로 접었습니다. 롤 *라벨* 이 없을 뿐 배열이 턴을 담습니다. 한 덩어리로 보내면 사내
+모델의 chat template 이 제대로 걸리지 않고, 모델은 "대화 중" 이 아니라 "대화록을 읽는 중"
+으로 인식합니다 — 프롬프트 기반 툴콜은 모델이 자기 턴의 시작을 알아야 잘 동작하므로
+도구 준수율에 직접 영향을 줍니다.
+
+교대는 구조적으로 보장합니다. 연속 동일 롤은 하나로 병합하고(안 하면 원소가 하나 밀려 그
+뒤 전체의 롤이 뒤집힙니다), 대화가 assistant 로 시작하면 앞에 `(continue)` user 턴을 넣습니다.
+`role: "tool"` 결과는 **user 턴**으로 들어갑니다 — 사내엔 tool 롤이 없고, 결과를 모델에게
+돌려주는 쪽이 우리입니다.
+
+무엇이 어떻게 접혔는지는 로그 창 ② 칸에서 그대로 확인할 수 있습니다. 목업은 받은 원소를
+롤과 함께 한 줄씩 찍어 주고, `MOCK_ECHO=1` 로 사내가 받은 것을 그대로 되돌려 받아 볼 수도
+있습니다.
 
 ### 응답
 
@@ -257,11 +288,12 @@ FabriX 요청 스키마에는 도구 필드가 **없습니다**. 그래서 `tool
   JSON Schema)이 전부 영어라, 한국어 프레임을 씌우면 모델이 센티널을 뱉는 대신 도구를
   한국어로 *설명하기* 시작합니다.
 
-  꼬리 리마인더가 필요한 이유: FabriX 엔 롤 구조가 없어 모든 것이 한 덩어리로 접히고,
-  모델이 **마지막으로 읽는 글**은 트랜스크립트 꼬리입니다. OpenCode 같은 클라이언트의
-  시스템 프롬프트는 수천 토큰이고 도구를 "네이티브 기능" 으로 설명하므로, 우리 규약 블록은
-  저 앞으로 밀려납니다. 꼬리에는 **형식만** 다시 적습니다 — 규약 전문을 두 번 실으면
-  토큰이 두 배로 들고, 같은 글이 두 번 나오면 모델이 둘째 것을 예시로 오독합니다.
+  꼬리 리마인더가 필요한 이유: 모델이 **마지막으로 읽는 글**은 대화 꼬리입니다. OpenCode
+  같은 클라이언트의 시스템 프롬프트는 수천 토큰이고 도구를 "네이티브 기능" 으로 설명하므로,
+  우리 규약 블록은 저 앞으로 밀려납니다. 꼬리에는 **형식만** 다시 적습니다 — 규약 전문을 두
+  번 실으면 토큰이 두 배로 들고, 같은 글이 두 번 나오면 모델이 둘째 것을 예시로 오독합니다.
+  리마인더는 언제나 **user 자리**에 붙습니다 — assistant 자리에 넣으면 지시문이 모델 자신의
+  발화가 되어, 모델은 자기가 이미 그렇게 말했다고 읽습니다.
 - **들어올 때** — 답변에서 아래 블록을 걷어내 OpenAI `tool_calls` 로 조립하고,
   `finish_reason` 을 `tool_calls` 로 바꿉니다. **본문과 추론 양쪽**을 훑습니다 (아래 참고).
 
@@ -355,14 +387,14 @@ FabriX 요청 스키마에는 도구 필드가 **없습니다**. 그래서 `tool
 **강제로 골라 실행**할 수 있습니다.
 
 ```bash
-MOCK_CASE=camel MOCK_STREAM=cumulative npm run mock
+MOCK_CASE=camel npm run mock
 ```
 
 | 변수 | 값 | 무엇을 태우는가 |
 |---|---|---|
 | `MOCK_CASE` | `snake`(기본) · `camel` | 필드 표기 양쪽 |
-| `MOCK_STREAM` | `delta`(기본) · `cumulative` | `content` 가 증분인지 누적인지 |
-| `MOCK_RAW` | `1` | `data:` 접두 없이 개행 구분 JSON |
+| `MOCK_DONE` | `1` | 끝에 `data: [DONE]` 을 붙입니다. **실서버는 보내지 않습니다** — 프록시가 있어도 견디는지 볼 때만 |
+| `MOCK_REASONING` | `field` · `think` | 답변을 추론 쪽으로 흘립니다 (아래 「도구 호출 확인」) |
 | `MOCK_FAIL` | `429` · `500` · `timeout` · `midstream` | 오류 경로 |
 | `MOCK_DELAY` | ms (기본 40) | 프레임 간 지연 |
 | `MOCK_TOOLCALL` | `single` · `parallel` · `prose` · `malformed` · `unknown` · `fenced` | 답변에 `<tool_call>` 을 섞습니다 |
@@ -412,7 +444,7 @@ curl -i -X GET http://127.0.0.1:8787/v1/chat/completions   # 405 봉투
 
 ```bash
 MOCK_TOOLCALL=single MOCK_CHUNK=3 npm run mock       # 센티널을 프레임 5개로 쪼갬
-MOCK_TOOLCALL=parallel MOCK_STREAM=cumulative npm run mock
+MOCK_TOOLCALL=parallel MOCK_CHUNK=1 npm run mock
 MOCK_TOOLCALL=malformed npm run mock                 # 텍스트로 되돌아와야 함
 ```
 
@@ -457,7 +489,7 @@ ls /tmp/odtest
 
 ## 목업과 다른 점
 
-의도적으로 다르게 만든 다섯 곳입니다.
+의도적으로 다르게 만든 곳들입니다.
 
 | 목업 | 구현 | 이유 |
 |---|---|---|
@@ -466,21 +498,37 @@ ls /tmp/odtest
 | 로그 ③ 칸의 `원본 JSON 보기` | `전체보기` | 들고 있는 것은 답변 **전문**이지 사내가 준 원본 JSON 봉투가 아닙니다. 원본을 안 갖고 있으면서 "원본 보기"를 띄우면 거짓말이라, 가진 그대로 "전체보기"로 부릅니다. |
 | 꺼짐 화면의 최근 호출은 항상 빈 상태 | 기록이 있으면 계속 보여줌 | 방금 뭐가 오갔는지가 이 앱의 세 기능 중 하나인데, 끄자마자 지워 버릴 이유가 없습니다. 기록이 정말 없을 때만 목업의 빈 상태가 나옵니다. |
 | Google Fonts CDN | 번들에 포함 | 사내망/오프라인에서 CDN 을 못 받으면 조판이 무너집니다. |
+| 스트림 끝에 `data: [DONE]` | 기본으로 **안 보냄** (`MOCK_DONE=1` 로 켬) | 실서버가 보내지 않습니다 — 벤더 샘플이 모든 이벤트에 `json.loads` 를 그대로 걸므로 `[DONE]` 이 온다면 거기서 죽습니다. 목업이 실서버보다 관대하면 프록시의 결함이 목업에서 안 보입니다. (프록시는 양쪽 다 견딥니다.) |
 | 창 3개 | 창 **4개** (모델 목록 추가) | 720×560 고정 창에 4열 표(표시 이름·모델 ID·UUID·설명)가 들어가지 않습니다. UUID 36자를 펼쳐 놓고 복사하려면 폭이 필요하고, 창을 넓힐 수 있어야 합니다. 목업에는 모델을 고르는 화면 자체가 없었습니다. |
 
 ## 실서버에 붙일 때 확인할 것
 
 스펙 문서에 없어서 방어적으로 처리해 둔 것들입니다. 실서버 응답을 한 번 보면 확정할 수 있습니다.
 
-- **SSE 프레임 형태** — `data:` 접두 유무, 종료 센티널. 현재는 양쪽 모두 처리합니다.
-- **`content` 가 누적인지 증분인지** — 두 번째 프레임에서 자동 판별하고 그 모드로 고정합니다.
-- **추론(`reasoningContent`)이 누적인지 증분인지** — 지금은 **증분으로만** 다룹니다.
-  목업도 `MOCK_STREAM=cumulative` 를 본문에만 적용합니다. 확인 안 된 모양을 목업이 흉내
-  내면 프록시의 진짜 결함과 목업의 상상이 구별되지 않기 때문입니다. 사내가 추론도 누적으로
-  준다면 추론 텍스트가 중복되므로, 샘플을 받으면 여기를 가장 먼저 확인해야 합니다.
-- **`repetion_penalty` · `tok_k`** — 스펙 문서의 철자 그대로 보냅니다(오타로 보이지만 서버가
-  기대하는 키일 가능성이 높음). 다르면 `src-tauri/src/proxy/fabrix.rs` 의 `LlmConfig` 에서
-  `rename` 두 줄만 고치면 됩니다.
+**샘플로 확정된 것** — 더 이상 추측하지 않습니다.
+
+- **SSE 프레임 형태** — 표준 `data:` 프레이밍입니다(샘플이 `sseclient` 를 씁니다). 종료
+  센티널은 **없습니다** — 샘플이 모든 이벤트에 `json.loads` 를 그대로 걸므로 `[DONE]` 이
+  온다면 거기서 죽습니다. 종료는 `status == "SUCCESS"` + `response_code == "R20000"` 프레임입니다.
+- **`content` 는 증분** — 샘플이 `result_message += ch_json['content']` 로 이어 붙입니다.
+  누적 판별·재작성(`Reset`) 배관은 전부 걷어냈습니다.
+- **camel/snake 이중 표기는 필요합니다** — 문서가 "스트림은 스네이크, 비스트림은 카멜" 이라
+  명시하고, `reasoning_content`·`processing_content`·`content_references` 세 개만 비스트림
+  문맥에서도 스네이크로 적혀 있습니다. `FabrixChunk` 의 `alias` 는 **지우면 안 됩니다.**
+
+**아직 미확인** — 남은 추측입니다.
+- **페널티·top-k 의 철자** — 문서(`repetion_penalty`·`tok_k`)와 샘플(`repetition_penalty`·
+  `top_k`)이 다릅니다. 지금은 **네 키를 모두** 보냅니다. 확정되면 `LlmConfig` 에서 안 쓰는
+  쪽 두 필드만 지우면 됩니다.
+- **`contentReferences[].answer`** — 문서는 `content_references` 를 "References used while
+  generating the answer" 라고만 하고 `answer` 하위 필드를 적지 않습니다. 즉 이 답변 폴백은
+  죽은 코드일 수 있습니다. `content` 가 있으면 발동하지 않아 비용이 0 이라 남겨 뒀습니다 —
+  플러그인/RAG 응답에 정말 없다면 `answer_text()` 에서 지우세요.
+- **`processing_content`** — 문서화된 필드지만(스트리밍 중간 처리 과정, list) 파싱하지
+  않습니다. 무엇이 담기는지 보고 필요하면 로그에 실으면 됩니다.
+- **`contents` 가 정말 턴 교대인가** — 샘플이 3턴 대화라 그렇게 읽었습니다. 확인하려면
+  `contents: ["\"B\"라고만 답해", "B", "네가 방금 뭐라고 답했지? 한 단어로."]` 를 보내
+  보세요. `B` 라고 답하면 턴 교대가 맞습니다. 아니면 `fabrix::fold_messages` 만 되돌리면 됩니다.
 - **토큰 사용량** — FabriX가 실측을 주지 않아 **문자 기반 추정치**를 채웁니다
   (ASCII 4자 ≈ 1토큰, 한글·CJK 1자 ≈ 1토큰). 추정 대상은 클라이언트의 `messages` 가 아니라
   **실제로 사내에 보낸 프롬프트**(`systemPrompt` + `contents`)와 생성된 답변이며, 도구 호출
@@ -490,10 +538,5 @@ ls /tmp/odtest
   이 문단. `FabrixChunk` 가 `inputTokens`/`outputTokens`/중첩 `usage` 를 방어적으로 받아 두므로
   **사내가 토큰 수를 주기 시작하면 코드를 고치지 않고 실측으로 넘어갑니다**
   (헤더가 `upstream` 으로 바뀝니다 — `MOCK_USAGE=1` 로 확인할 수 있습니다).
-- **`contents` 가 배열인 이유** — 턴 배열인지(한 항목 = 한 턴) 독립 프롬프트 배열인지 스펙에
-  없습니다. 저장소에 스펙 문서가 없고 목업도 이 값을 로그만 찍으므로 확인할 방법이 없어,
-  `fold_messages` 는 지금처럼 **한 덩어리 트랜스크립트**로 둡니다. 실서버에서 확인되면 바꿀
-  자리는 그 함수의 반환값 한 곳뿐이고, `MOCK_ECHO=1` 로 사내가 받은 것을 그대로 되돌려 받아
-  대조할 수 있습니다.
 - **사내 루트 CA** — Windows 인증서 저장소(schannel)를 그대로 신뢰합니다. CA가 없어 실패하면
   설정에서 `TLS 인증서 검증 건너뛰기` 를 켤 수 있습니다.

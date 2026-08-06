@@ -25,7 +25,7 @@ use crate::openai::{
 use crate::state::{self, Shared};
 
 use super::fabrix::{
-    default_model, extract_object, find_model, fold_messages, nonstream_events, FabrixChunk,
+    self, default_model, extract_object, find_model, fold_messages, nonstream_events, FabrixChunk,
     FabrixError, LlmConfig, MessagesRequest, ResolvedModel, StreamDecoder, MESSAGES_PATH,
 };
 use super::models::ensure_models;
@@ -67,6 +67,9 @@ struct Ctx {
     /// `model` 을 아예 안 보내 기본 모델로 처리했는가. 없는 이름을 보낸 것과 구분해야
     /// 하므로(그건 이제 404 입니다) 따로 들고 있습니다.
     model_defaulted: bool,
+    /// 클라이언트가 보낸 `temperature` 원값. 사내 상한(0–1)으로 줄였는지 로그에 적는 데
+    /// 씁니다 — 나간 값은 `req_fabrix` 에 있으니 여기엔 **요청 원값**을 둡니다.
+    temperature_requested: Option<f64>,
     /// 실제로 사내에 보낸 프롬프트 전문(systemPrompt + contents).
     ///
     /// 클라이언트의 `messages` 가 아니라 이걸로 토큰을 추정합니다 — 모델이 실제로 본
@@ -203,6 +206,11 @@ fn plan_meta(ctx: &Ctx) -> Vec<String> {
     if !plan.unknown.is_empty() {
         out.push(format!("스펙에 없는 키: {}", plan.unknown.join(" · ")));
     }
+    // OpenAI 는 temperature 0–2, 사내는 0–1 입니다. 줄여서 보냈으면 그렇게 말합니다 —
+    // 조용히 다른 값을 보내는 것이 이 줄이 막으려는 것입니다.
+    if let Some((requested, sent)) = fabrix::temperature_was_clamped(ctx.temperature_requested) {
+        out.push(format!("temperature {requested} → {sent} (사내 상한)"));
+    }
     out
 }
 
@@ -308,6 +316,7 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Body)
         tools_choice_none: false,
         plan: validate::Plan::default(),
         model_defaulted: false,
+        temperature_requested: None,
         prompt_text: String::new(),
     };
 
@@ -353,6 +362,7 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Body)
     };
     ctx.stream = req.is_stream();
     ctx.model_requested = req.model.clone();
+    ctx.temperature_requested = req.temperature;
 
     // ── 요청 검증 ───────────────────────────────────────────
     // 규약 위반은 **사내 호출 전에** 걸러냅니다. 잘못된 요청이 사내 쿼터를 쓰거나
@@ -490,14 +500,14 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Body)
     // 붙이므로 로그 ② 칸과 토큰 추정(`ctx.prompt_text`)에 자동으로 포함됩니다.
     if emulate {
         if let Some(reminder) = tools::render_tail_reminder(&tool_mode) {
-            match contents.last_mut() {
-                // 마지막 원소에 이어 붙입니다 — 사내가 `contents` 배열을 무엇으로
-                // 잇는지 모르므로, 문자열 안에서 꼬리를 만드는 것이 확실합니다.
-                Some(last) => {
-                    last.push_str("\n\n");
-                    last.push_str(&reminder);
-                }
-                None => contents.push(reminder),
+            // 리마인더는 **user 자리**에 있어야 합니다. assistant 자리에 넣으면 지시문이
+            // 모델 자신의 발화가 되어, 모델은 자기가 이미 그렇게 말했다고 읽습니다.
+            if fabrix::last_is_user_turn(&contents) {
+                let last = contents.last_mut().expect("길이가 홀수면 원소가 있습니다");
+                last.push_str("\n\n");
+                last.push_str(&reminder);
+            } else {
+                contents.push(reminder);
             }
         }
     }
@@ -1099,6 +1109,7 @@ mod tests {
             tools_choice_none: false,
             plan,
             model_defaulted,
+            temperature_requested: None,
             prompt_text: String::new(),
         }
     }
