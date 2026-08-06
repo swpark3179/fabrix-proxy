@@ -17,7 +17,7 @@ use futures_util::StreamExt;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::logstore::{self, Kind, LogEntry};
+use crate::logstore::{self, Kind, LogEntry, RawBuf, RawWire};
 use crate::openai::{
     AssistantMessage, ChatChunk, ChatCompletion, ChatRequest, Choice, Delta, ErrorEnvelope,
     ToolCall, ToolCallDelta,
@@ -75,6 +75,14 @@ struct Ctx {
     /// 클라이언트의 `messages` 가 아니라 이걸로 토큰을 추정합니다 — 모델이 실제로 본
     /// 글이 이것이고, 주입된 도구 규약까지 포함해야 값이 맞습니다.
     prompt_text: String,
+    /// 사내가 준 바이트 그대로. 설정에서 끄면 아무것도 담지 않습니다.
+    ///
+    /// 로그 ③ 칸은 이미 **가공된** 답변입니다(`<think>` 를 갈라내고 `<tool_call>` 을
+    /// 걷어낸 뒤). 그래서 "0자" 가 나왔을 때 모델이 아무 말도 안 한 것인지, 우리가
+    /// 프레임을 못 읽은 것인지 구분할 방법이 없었습니다. 이 두 버퍼가 그 자리입니다.
+    raw_upstream: RawBuf,
+    /// 클라이언트로 나간 본문 그대로.
+    raw_client: RawBuf,
 }
 
 /// 로그 꼬리에 붙일 도구 관련 한 줄.
@@ -181,6 +189,8 @@ fn oversize_entry(
         fabrix_url: format!("{}{MESSAGES_PATH}", cfg.normalized_base_url()),
         resp_body: envelope.error.message.clone(),
         resp_meta: "거부 · HTTP 413".into(),
+        // 사내 호출을 하지 않았고 응답도 우리가 지어낸 봉투뿐이라 원문이 없습니다.
+        raw: RawWire::default(),
     }
 }
 
@@ -250,6 +260,11 @@ impl Ctx {
             fabrix_url: self.fabrix_url.clone(),
             resp_body,
             resp_meta,
+            raw: RawWire {
+                captured: self.raw_upstream.enabled(),
+                upstream: self.raw_upstream.text(),
+                client: self.raw_client.text(),
+            },
         }
     }
 
@@ -318,6 +333,8 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Body)
         model_defaulted: false,
         temperature_requested: None,
         prompt_text: String::new(),
+        raw_upstream: RawBuf::new(cfg.raw_wire_log),
+        raw_client: RawBuf::new(cfg.raw_wire_log),
     };
 
     // ── 토큰 검증 ───────────────────────────────────────────
@@ -570,8 +587,10 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Body)
     }
 }
 
-fn sse_json<T: serde::Serialize>(value: &T) -> Event {
-    Event::default().data(serde_json::to_string(value).unwrap_or_default())
+/// 청크 하나를 SSE `data:` 에 실을 문자열로. 원문 기록과 실제 전송이 **같은 문자열**을
+/// 쓰도록 직렬화를 여기 한 곳에만 둡니다 — 두 번 만들면 로그가 거짓말할 수 있습니다.
+fn sse_data<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_string(value).unwrap_or_default()
 }
 
 /// `Emit` 하나를 `chat.completion.chunk` 들로 바꿉니다. 순서는 `Emit` 의 순서
@@ -640,6 +659,20 @@ struct StreamLog {
     counted: Option<usage::Counted>,
 }
 
+impl StreamLog {
+    /// 클라이언트로 나갈 SSE 프레임 하나 — 원문을 기록하고 이벤트로 만듭니다.
+    ///
+    /// 모든 `yield` 가 이 함수를 지나므로 로그 ④ 칸의 아래쪽은 클라이언트가 실제로 읽은
+    /// 바이트와 같습니다. `data:` 접두와 빈 줄까지 적는 이유: 프레임 경계가 보여야
+    /// "청크 하나에 뭐가 실렸나" 를 눈으로 셀 수 있습니다.
+    fn out(&mut self, data: String) -> Event {
+        self.ctx.raw_client.push_str("data: ");
+        self.ctx.raw_client.push_str(&data);
+        self.ctx.raw_client.push_str("\n\n");
+        Event::default().data(data)
+    }
+}
+
 impl Drop for StreamLog {
     fn drop(&mut self) {
         let aborted = !self.drained;
@@ -661,6 +694,10 @@ impl Drop for StreamLog {
         });
         meta.push(format!("SSE {}프레임", self.frames));
         meta.push(format!("{}자", self.turn.raw_content().chars().count()));
+        // "모델이 아무 말도 안 했다" 와 "우리가 못 알아들었다" 는 다음 행동이 정반대입니다.
+        if self.decoder.undecodable > 0 {
+            meta.push(format!("해석하지 못한 프레임 {}개", self.decoder.undecodable));
+        }
         meta.push(match &self.counted {
             Some(counted) => usage::meta_line(counted),
             // include_usage 를 안 켠 스트림은 usage 를 계산하지 않습니다 — 규약대로
@@ -784,9 +821,8 @@ fn stream_response(
 
         // OpenAI 처럼 롤만 담은 청크를 **맨 앞에** 하나 흘립니다. 이후 청크에는 role 을
         // 넣지 않으므로 `sent_role` 은 참으로 시작합니다.
-        yield Ok::<Event, Infallible>(sse_json(&ChatChunk::opening(
-            &id, created, &model, fingerprint.clone(),
-        )));
+        let opening = sse_data(&ChatChunk::opening(&id, created, &model, fingerprint.clone()));
+        yield Ok::<Event, Infallible>(log.out(opening));
         let mut sent_role = true;
 
         // 펌프와 디코더 꼬리가 **같은 함수**를 지납니다. 예전에는 두 곳에 똑같은
@@ -797,6 +833,9 @@ fn stream_response(
             let events = match bytes.next().await {
                 Some(Ok(chunk)) => {
                     log.frames += 1;
+                    // 해석하기 **전에** 남깁니다 — 해석에 실패한 프레임이야말로 원문이
+                    // 필요한 프레임입니다.
+                    log.ctx.raw_upstream.push(&chunk);
                     log.decoder.push(&chunk)
                 }
                 Some(Err(err)) => {
@@ -807,7 +846,8 @@ fn stream_response(
             };
             let (chunks, saw_end) = drive(&mut log, events, &id, created, &model, &mut sent_role);
             for chunk in chunks {
-                yield Ok::<Event, Infallible>(sse_json(&chunk));
+                let data = sse_data(&chunk);
+                yield Ok::<Event, Infallible>(log.out(data));
             }
             ended = saw_end;
         }
@@ -816,14 +856,16 @@ fn stream_response(
         let tail = log.decoder.finish();
         let (chunks, _) = drive(&mut log, tail, &id, created, &model, &mut sent_role);
         for chunk in chunks {
-            yield Ok(sse_json(&chunk));
+            let data = sse_data(&chunk);
+            yield Ok(log.out(data));
         }
         // 분리기와 두 채널 버퍼가 붙들고 있던 꼬리를 흘려보냅니다 — 절대 버리지 않습니다.
         // `finish_reason` 을 읽기 전에 반드시 여기를 지나야 합니다: 마지막 도구 호출이
         // 닫는 태그를 만나 완성되는 자리가 여기입니다.
         let closing = log.turn.finish();
         for chunk in emit_chunks(&id, created, &model, closing, &mut sent_role) {
-            yield Ok(sse_json(&chunk));
+            let data = sse_data(&chunk);
+            yield Ok(log.out(data));
         }
         if log.decoder.truncated {
             log.turn.mark_truncated();
@@ -831,16 +873,21 @@ fn stream_response(
         log.drained = true;
 
         if let Some(msg) = log.turn.failure().map(str::to_string) {
-            yield Ok(sse_json(&ErrorEnvelope::new(msg, openai_type(502), Some("upstream_error".into()))));
+            let data = sse_data(&ErrorEnvelope::new(
+                msg, openai_type(502), Some("upstream_error".into()),
+            ));
+            yield Ok(log.out(data));
         }
         // 종료 사유는 실패든 아니든 **한 함수**가 정합니다. 오류 프레임 뒤에도 finish
         // 청크를 넣습니다 — 없으면 종료 사유를 기다리는 클라이언트가 [DONE] 을 받고도
         // 스트림을 미완으로 남깁니다.
         let reason = log.turn.finish_reason();
         log.emitted_finish = Some(reason);
-        yield Ok(sse_json(&ChatChunk::new(
-            &id, created, &model, Delta::default(), Some(reason.into()),
-        ).with_fingerprint(fingerprint.clone())));
+        let data = sse_data(
+            &ChatChunk::new(&id, created, &model, Delta::default(), Some(reason.into()))
+                .with_fingerprint(fingerprint.clone()),
+        );
+        yield Ok(log.out(data));
 
         // 규약 순서: finish 청크 → usage 청크(choices: []) → [DONE].
         // 클라이언트가 include_usage 로 **명시적으로 옵트인**했을 때만 보냅니다.
@@ -850,12 +897,11 @@ fn stream_response(
                 &log.ctx.prompt_text,
                 &log.turn.completion_text(),
             );
-            yield Ok(sse_json(&ChatChunk::usage_only(
-                &id, created, &model, counted.usage.clone(),
-            )));
+            let data = sse_data(&ChatChunk::usage_only(&id, created, &model, counted.usage.clone()));
+            yield Ok(log.out(data));
             log.counted = Some(counted);
         }
-        yield Ok(Event::default().data("[DONE]"));
+        yield Ok(log.out("[DONE]".to_string()));
     };
 
     // keep-alive 주석은 붙이지 않습니다 — 로컬호스트에는 중간 프록시가 없고,
@@ -877,7 +923,7 @@ fn stream_response(
 /// 비스트리밍 응답을 `chat.completion` 하나로 조립합니다.
 async fn collect_response(
     state: Shared,
-    ctx: Ctx,
+    mut ctx: Ctx,
     res: reqwest::Response,
     model: String,
     tool_names: HashSet<String>,
@@ -891,6 +937,8 @@ async fn collect_response(
             return error_response(err.status(), err.envelope());
         }
     };
+    // 해석하기 전에 남깁니다 — 아래 갈래 중 어디로 빠지든 원문은 로그에 남습니다.
+    ctx.raw_upstream.push_str(&raw);
 
     // 스트리밍과 **같은 상태 기계**를 태웁니다 — 두 경로가 어긋날 수 없게.
     let mut turn = Turn::new(tool_names, true);
@@ -901,6 +949,7 @@ async fn collect_response(
     let truncated;
     let upstream_tokens;
     let mut via_stream_decoder = false;
+    let mut undecodable = 0;
 
     match serde_json::from_str::<Value>(&raw) {
         Ok(value) => {
@@ -933,6 +982,7 @@ async fn collect_response(
             looks_successful = decoder.finish_reason.is_some();
             truncated = decoder.truncated;
             upstream_tokens = decoder.upstream_tokens;
+            undecodable = decoder.undecodable;
         }
     }
     if truncated {
@@ -1002,6 +1052,9 @@ async fn collect_response(
     if via_stream_decoder {
         meta.push("SSE 본문을 합쳐 해석".into());
     }
+    if undecodable > 0 {
+        meta.push(format!("해석하지 못한 프레임 {undecodable}개"));
+    }
     if let Some(line) = reasoning_meta(&turn) {
         meta.push(line);
     }
@@ -1013,6 +1066,10 @@ async fn collect_response(
     meta.extend(plan_meta(&ctx));
 
     let note = (ctx.tools_emulated && stats.calls == 0).then(|| "도구 미사용".to_string());
+
+    // 클라이언트가 받는 바이트 그대로. `Json` 도 `serde_json` 으로 직렬화하므로 같은
+    // 문자열이고, 여기서 한 번 더 만드는 비용은 요청당 한 번뿐입니다.
+    ctx.raw_client.push_str(&serde_json::to_string(&completion).unwrap_or_default());
 
     state.record(ctx.entry(
         200,
@@ -1111,6 +1168,8 @@ mod tests {
             model_defaulted,
             temperature_requested: None,
             prompt_text: String::new(),
+            raw_upstream: RawBuf::new(false),
+            raw_client: RawBuf::new(false),
         }
     }
 

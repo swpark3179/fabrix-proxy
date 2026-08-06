@@ -417,8 +417,13 @@ pub struct FabrixChunk {
     #[serde(default, alias = "reasoningContent")]
     pub reasoning_content: Option<String>,
     /// 플러그인/RAG 가 답한 경우 답변이 여기에 담깁니다(비스트림 응답).
+    ///
+    /// `Vec` 이 아니라 `Option<Vec>` 인 이유: `#[serde(default)]` 는 키가 **없을 때만**
+    /// 듣습니다. 값이 명시적으로 `null` 이면(사내 샘플이 다른 필드에서 실제로 그렇게
+    /// 합니다) `Vec` 역직렬화가 실패하고, 그러면 프레임 **한 통째**가 조용히 버려집니다 —
+    /// 그 안의 `content` 까지 함께. 0자 응답의 유력한 모양이 이것입니다.
     #[serde(default, alias = "contentReferences")]
-    pub content_references: Vec<ContentReference>,
+    pub content_references: Option<Vec<ContentReference>>,
     /// 필터에 걸린 경우 차단 사유가 담깁니다.
     #[serde(default, alias = "filterBlockReason")]
     pub filter_block_reason: Option<FilterBlockReason>,
@@ -542,6 +547,7 @@ impl FabrixChunk {
         let joined = self
             .content_references
             .iter()
+            .flatten()
             .filter_map(|r| r.answer.as_deref())
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
@@ -667,6 +673,12 @@ pub struct StreamDecoder {
     /// 사내가 토큰 수를 실어 보냈다면 그 값. 오늘은 항상 `None` 입니다
     /// (`FabrixChunk::upstream_tokens` 참고).
     pub upstream_tokens: Option<(u32, u32)>,
+    /// `data:` 는 붙어 있었지만 우리가 [`FabrixChunk`] 로 읽지 못한 프레임 수.
+    ///
+    /// 이 숫자가 0 이 아니면 "모델이 아무 말도 안 했다"가 아니라 **우리가 못 알아들은
+    /// 것**입니다. 둘은 다음 행동이 정반대라 반드시 구분되어야 합니다. 프레임을
+    /// 조용히 버리던 갈래가 이 값을 남기고, 원문은 로그 ④ 칸에 그대로 있습니다.
+    pub undecodable: u32,
 }
 
 impl StreamDecoder {
@@ -731,13 +743,17 @@ impl StreamDecoder {
                 }
             }
             Ok(value) => self.handle_value(value, out),
-            // JSON 이 아닌 줄은 무시합니다 (프록시 배너, 빈 keep-alive 등).
-            Err(_) => {}
+            // JSON 이 아닌 `data:` 줄. 무시하되 **셉니다** — 우리가 못 알아본 것이
+            // 답변이었을 수 있고, 그 사실이 로그에 남아야 합니다.
+            Err(_) => self.undecodable += 1,
         }
     }
 
     fn handle_value(&mut self, value: Value, out: &mut Vec<StreamEvent>) {
         let Ok(chunk) = serde_json::from_value::<FabrixChunk>(value) else {
+            // 필드 하나의 타입이 어긋나면 프레임 전체가 떨어집니다 — 그 안에 `content`
+            // 가 있었어도. 예전에는 그대로 조용했습니다.
+            self.undecodable += 1;
             return;
         };
 
@@ -1106,6 +1122,30 @@ mod tests {
         let out = events(&mut d, ": keep-alive\n\ndata: [DONE]\n\n");
         assert_eq!(out, vec![StreamEvent::Done]);
         assert!(d.done);
+    }
+
+    /// `null` 하나가 프레임 **전체**를 조용히 버리던 자리. 답변이 함께 사라지므로
+    /// 사용자에게는 "0자 · finish_reason: stop" 으로만 보였습니다.
+    #[test]
+    fn a_null_content_references_field_does_not_swallow_the_frame() {
+        let mut d = StreamDecoder::new();
+        let out = events(
+            &mut d,
+            "data: {\"content\":\"안녕\",\"contentReferences\":null,\"reasoningContent\":null}\n",
+        );
+        assert_eq!(out, vec![StreamEvent::Delta("안녕".into())]);
+        assert_eq!(d.undecodable, 0);
+    }
+
+    /// 그래도 못 읽는 프레임은 남습니다 — 그때는 **셉니다**. 0 이 아니면 "모델이 말을
+    /// 안 한 것" 이 아니라 "우리가 못 알아들은 것" 입니다.
+    #[test]
+    fn frames_we_cannot_read_are_counted_not_forgotten() {
+        let mut d = StreamDecoder::new();
+        // content 가 문자열이 아니라 객체 — 필드 하나로 프레임 전체가 떨어집니다.
+        let out = events(&mut d, "data: {\"content\":{\"text\":\"안녕\"}}\ndata: 문장이 왔습니다\n");
+        assert!(out.is_empty());
+        assert_eq!(d.undecodable, 2);
     }
 
     #[test]

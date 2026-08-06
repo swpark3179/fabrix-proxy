@@ -385,6 +385,17 @@ export function ConnectionForm({ initial, variant, busy, onSave, onCancel }: Pro
           <label className="check">
             <input
               type="checkbox"
+              checked={draft.rawWireLog}
+              onChange={(e) => set('rawWireLog', e.target.checked)}
+            />
+            와이어 원문 기록 — 사내가 준 응답과 클라이언트로 나간 응답을 가공 없이 로그 창 ④
+            칸에 남깁니다. 답변이 비었을 때 원인이 사내에 있는지 프록시에 있는지 가리는 근거입니다
+            (호출당 각 256KiB 까지, 메모리에만)
+          </label>
+
+          <label className="check">
+            <input
+              type="checkbox"
               checked={draft.autoStart}
               onChange={(e) => set('autoStart', e.target.checked)}
             />

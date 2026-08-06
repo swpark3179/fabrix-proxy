@@ -45,6 +45,9 @@ struct Upstream {
     fail_midstream: bool,
     /// `isStream=false` 요청에도 SSE 로 답합니다 — 프록시의 폴백 경로를 태웁니다.
     sse_always: bool,
+    /// 우리가 읽지 못하는 모양의 프레임을 하나 끼워 넣습니다(`content` 가 객체).
+    /// 필드 하나가 어긋나면 프레임 전체가 떨어지던 갈래를 재현합니다.
+    garble: bool,
     /// 프록시가 실제로 보낸 payload 들 — 꼬리 리마인더 검증용.
     seen: Vec<Value>,
 }
@@ -60,6 +63,7 @@ impl Default for Upstream {
             chunk: 5,
             fail_midstream: false,
             sse_always: false,
+            garble: false,
             seen: Vec::new(),
         }
     }
@@ -159,6 +163,11 @@ async fn upstream_messages(
     let mut out = String::new();
     let mut frames = 0usize;
     let chunk = up.chunk.max(1);
+
+    if up.garble {
+        let odd = json!({ "content": { "text": "우리가 못 읽는 모양" } });
+        out.push_str(&format!("data: {odd}\n\n"));
+    }
 
     let push_frames = |out: &mut String, frames: &mut usize, text: &str, key: &str| -> bool {
         let chars: Vec<char> = text.chars().collect();
@@ -920,6 +929,113 @@ async fn non_stream_sse_body_goes_through_the_same_pipeline() {
     assert_eq!(choice["message"]["tool_calls"].as_array().unwrap().len(), 1);
     assert_eq!(choice["message"]["content"], "답입니다.");
     assert_eq!(choice["message"]["reasoning_content"], "생각.");
+}
+
+// ─────────────────────────── 2c. 와이어 원문 기록 ───────────────────────────
+//
+// 로그 ③ 칸은 **가공된** 답변입니다 — `<think>` 를 갈라내고 `<tool_call>` 을 걷어낸
+// 뒤. 그래서 "0자" 가 나왔을 때 모델이 아무 말도 안 한 것인지, 우리가 프레임을 못
+// 읽은 것인지 구분할 수단이 없었습니다. ④ 칸이 그 자리입니다.
+
+/// 스트림 로그는 제너레이터가 **버려질 때** 남습니다 — 클라이언트가 본문을 다 읽은
+/// 직후에는 아직 없을 수 있어 잠깐 기다립니다.
+async fn newest_chat_log(state: &Shared) -> fabrix_proxy_lib::logstore::LogEntry {
+    for _ in 0..80 {
+        let found = state
+            .logs
+            .lock()
+            .unwrap()
+            .snapshot()
+            .into_iter()
+            .find(|e| e.path == "/v1/chat/completions");
+        if let Some(entry) = found {
+            return entry;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("채팅 로그가 남지 않았습니다");
+}
+
+#[tokio::test]
+async fn streaming_records_both_sides_of_the_wire() {
+    let (base, state, _up) = harness(Upstream::answering("안녕하세요")).await;
+
+    stream_chunks(
+        &base,
+        json!({
+            "model": "fabrix-chat-4", "stream": true,
+            "messages": [{ "role": "user", "content": "hi" }],
+        }),
+    )
+    .await;
+
+    let raw = newest_chat_log(&state).await.raw;
+    assert!(raw.captured);
+    // 위쪽: 사내가 준 프레임 그대로. 우리가 못 알아본 프레임도 여기 남습니다.
+    assert!(raw.upstream.contains("data: {\"content\":"), "{}", raw.upstream);
+    assert!(raw.upstream.contains("[DONE]"), "{}", raw.upstream);
+    // 아래쪽: 클라이언트가 실제로 읽은 바이트.
+    assert!(raw.client.contains("\"object\":\"chat.completion.chunk\""), "{}", raw.client);
+    assert!(raw.client.contains("\"content\":\"안녕하세요\""), "{}", raw.client);
+    assert!(raw.client.trim_end().ends_with("data: [DONE]"), "{}", raw.client);
+}
+
+#[tokio::test]
+async fn non_stream_records_the_upstream_body_and_the_client_body() {
+    let (base, state, _up) = harness(Upstream::answering("연차는 15일입니다.")).await;
+
+    chat(
+        &base,
+        json!({ "model": "fabrix-chat-4", "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+
+    let raw = newest_chat_log(&state).await.raw;
+    assert!(raw.captured);
+    assert!(raw.upstream.contains("\"responseCode\":\"R20000\""), "{}", raw.upstream);
+    assert!(raw.client.contains("\"object\":\"chat.completion\""), "{}", raw.client);
+    assert!(raw.client.contains("연차는 15일입니다."), "{}", raw.client);
+}
+
+/// 끄면 아무것도 담기지 않습니다. `captured` 가 거짓이라 화면은 "꺼져 있어 비었다" 와
+/// "켰는데 아무것도 안 왔다" 를 다르게 말할 수 있습니다.
+#[tokio::test]
+async fn raw_wire_log_off_keeps_the_buffers_empty() {
+    let (upstream_url, _handle) = spawn_upstream(Upstream::answering("답변")).await;
+    let mut cfg = config_for(&upstream_url);
+    cfg.raw_wire_log = false;
+    let (base, state) = spawn_proxy(cfg).await;
+
+    chat(
+        &base,
+        json!({ "model": "fabrix-chat-4", "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+
+    let raw = newest_chat_log(&state).await.raw;
+    assert!(!raw.captured);
+    assert_eq!(raw.upstream, "");
+    assert_eq!(raw.client, "");
+}
+
+/// 우리가 못 읽은 프레임은 세어서 ③ 칸 꼬리에 적고, 원문은 ④ 칸에 그대로 남깁니다 —
+/// 그 둘이 있어야 "모델이 말을 안 했다" 와 "우리가 못 알아들었다" 가 갈립니다.
+#[tokio::test]
+async fn frames_we_cannot_read_are_reported_and_their_bytes_kept() {
+    let (base, state, _up) = harness(Upstream { garble: true, ..Upstream::answering("안녕") }).await;
+
+    stream_chunks(
+        &base,
+        json!({
+            "model": "fabrix-chat-4", "stream": true,
+            "messages": [{ "role": "user", "content": "hi" }],
+        }),
+    )
+    .await;
+
+    let entry = newest_chat_log(&state).await;
+    assert!(entry.resp_meta.contains("해석하지 못한 프레임 1개"), "{}", entry.resp_meta);
+    assert!(entry.raw.upstream.contains("\"content\":{"), "{}", entry.raw.upstream);
 }
 
 // ─────────────────────────── 3. 모델 해석 ───────────────────────────

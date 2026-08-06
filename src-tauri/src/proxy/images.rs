@@ -15,7 +15,7 @@ use axum::Json;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::logstore::{self, Kind, LogEntry};
+use crate::logstore::{self, Kind, LogEntry, RawWire};
 use crate::openai::{
     parse_size, split_data_url, ErrorEnvelope, ImageDatum, ImageEditRequest, ImageGenerationRequest,
     ImagesResponse,
@@ -87,6 +87,8 @@ impl Ctx {
             fabrix_url: self.fabrix_url.clone(),
             resp_body,
             resp_meta,
+            // 이미지 응답은 본문이 base64 라 원문을 그대로 담지 않습니다.
+            raw: RawWire::default(),
         }
     }
 }
