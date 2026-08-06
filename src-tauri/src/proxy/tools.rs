@@ -96,6 +96,42 @@ pub fn render_system_block(tools: &[&FunctionDef], mode: &ToolChoiceMode) -> Opt
     Some(out)
 }
 
+/// `contents` 꼬리에 붙일 짧은 재확인. 도구가 없거나 `tool_choice: "none"` 이면 `None`.
+///
+/// `systemPrompt` 뒤의 규약 블록만으로는 부족합니다. FabriX 엔 롤 구조가 없어 모든
+/// 것이 한 덩어리로 접히고(`fabrix::fold_messages`), 모델이 **마지막으로 읽는 글**은
+/// 트랜스크립트 꼬리입니다. opencode 같은 클라이언트의 시스템 프롬프트는 수천 토큰이고
+/// 도구를 "네이티브 기능" 으로 설명하므로, 우리 규약 블록은 저 앞으로 밀려납니다.
+/// 프롬프트 기반 툴콜의 표준 처방이 꼬리에 형식만 다시 못박는 것입니다.
+///
+/// 규약 전문을 두 번 싣지 않는 이유: 도구 스키마가 크면 토큰이 두 배로 들고, 같은 글이
+/// 두 번 나오면 모델이 둘째 것을 예시로 오독합니다. 여기서는 **형식만** 말합니다.
+pub fn render_tail_reminder(mode: &ToolChoiceMode) -> Option<String> {
+    if *mode == ToolChoiceMode::None {
+        return None;
+    }
+    // 영어로 쓰는 이유는 `render_system_block` 과 같습니다 — 감싸는 대상이 전부
+    // 영어라, 한국어 프레임을 씌우면 모델이 센티널을 뱉는 대신 설명하기 시작합니다.
+    let mut out = String::from(
+        "# Reminder\n\
+         To use a tool, emit a block exactly like \
+         <tool_call>{\"name\": \"<one of the names in <tools>>\", \"arguments\": {…}}</tool_call> \
+         — one block per call, no Markdown code fence, and nothing but JSON inside the block. \
+         Put the block in your reply itself, not only in your private reasoning.\n",
+    );
+    match mode {
+        ToolChoiceMode::Required => out.push_str(
+            "You must emit at least one <tool_call> block before any prose.\n",
+        ),
+        ToolChoiceMode::Function(name) => out.push_str(&format!(
+            "You must emit exactly one <tool_call> block for `{name}` and call no other tool.\n"
+        )),
+        ToolChoiceMode::Auto => out.push_str("If no tool is needed, just answer.\n"),
+        ToolChoiceMode::None => unreachable!("위에서 걸렀습니다"),
+    }
+    Some(out)
+}
+
 /// 지난 턴의 도구 호출을 트랜스크립트에 실을 문자열로 만듭니다.
 ///
 /// 모델에게 뱉으라고 시킨 것과 **같은 형식**을 씁니다 — 자기가 낸 것과 같은 모양으로
@@ -143,28 +179,52 @@ pub struct ScanOut {
 }
 
 impl ScanOut {
-    pub fn is_empty(&self) -> bool {
-        self.text.is_empty() && self.calls.is_empty()
-    }
-
+    /// 두 출력을 잇습니다. 프로덕션 경로는 `Turn` 이 채널별로 누적하므로 필요 없고,
+    /// 스캐너 단위 테스트가 "여러 번 밀어 넣은 결과" 를 모으는 데만 씁니다.
+    #[cfg(test)]
     fn absorb(&mut self, other: ScanOut) {
         self.text.push_str(&other.text);
         self.calls.extend(other.calls);
     }
 }
 
+/// 스캐너가 훑는 줄기. 사내 모델은 답변을 두 갈래로 흘려보냅니다.
+///
+/// 추론 채널을 스캐너에 태우지 않던 것이 "추론 단계마다 stop" 의 원인이었습니다 —
+/// 모델이 센티널을 `reasoningContent` 에 실으면 호출이 영구히 0건이고, 그러면
+/// `finish_reason` 이 영구히 `stop` 이라 에이전트 루프가 한 스텝 만에 끝났습니다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Channel {
+    /// `content` — 사용자에게 보이는 답변.
+    Content,
+    /// `reasoningContent`, 그리고 본문에서 갈라낸 `<think>` 안쪽.
+    Reasoning,
+}
+
+/// 채널 하나의 버퍼. 채널마다 따로 두어야 하는 이유: 두 줄기가 섞이면 한쪽의
+/// 미완성 센티널 꼬리가 다른 쪽 텍스트와 이어 붙어 엉뚱한 블록이 만들어집니다.
+#[derive(Debug, Default)]
+struct ChannelState {
+    buf: String,
+    in_call: bool,
+}
+
 /// 증분 텍스트에서 `<tool_call>` 블록을 걷어내는 상태 기계.
 ///
 /// `StreamDecoder::absorb` 가 누적/증분 모드를 이미 정규화해 **언제나 증분 조각**을
 /// 내보내므로 여기서는 상위 모드를 몰라도 됩니다.
+///
+/// 버퍼는 채널마다 따로지만 `next_index` 와 `rejected` 는 **하나**입니다. index 를
+/// 채널별로 세면 본문의 첫 호출과 추론의 첫 호출이 둘 다 `index: 0` 을 받아,
+/// 클라이언트가 서로 다른 두 호출을 한 호출의 조각으로 이어 붙입니다.
 #[derive(Debug)]
 pub struct ToolCallScanner {
     enabled: bool,
     names: HashSet<String>,
-    buf: String,
-    in_call: bool,
+    content: ChannelState,
+    reasoning: ChannelState,
     next_index: u32,
-    /// 도구가 아니라고 판정해 텍스트로 되돌린 블록 수. 로그용.
+    /// 도구가 아니라고 판정해 텍스트로 되돌린 블록 수. 로그용. 두 채널 합계입니다.
     pub rejected: u32,
 }
 
@@ -178,20 +238,11 @@ impl ToolCallScanner {
         Self {
             enabled: enabled && !names.is_empty(),
             names,
-            buf: String::new(),
-            in_call: false,
+            content: ChannelState::default(),
+            reasoning: ChannelState::default(),
             next_index: 0,
             rejected: 0,
         }
-    }
-
-    /// 에뮬레이션이 꺼졌을 때 쓰는 통과 전용 스캐너.
-    pub fn disabled() -> Self {
-        Self::new(Vec::new(), false)
-    }
-
-    pub fn is_enabled(&self) -> bool {
-        self.enabled
     }
 
     /// 이번 응답에서 도구 호출을 하나라도 뽑아냈는가. `finish_reason` 결정에 씁니다.
@@ -203,56 +254,83 @@ impl ToolCallScanner {
         self.next_index
     }
 
-    /// 누적 모드에서 상위가 답변을 통째로 다시 쓴 지점. 버퍼를 버립니다.
+    /// 누적 모드에서 상위가 **본문을** 통째로 다시 쓴 지점. 본문 버퍼를 버립니다.
+    ///
+    /// 추론 채널은 건드리지 않습니다 — 재작성은 `content` 에만 일어나므로
+    /// (`StreamDecoder::absorb`), 추론 쪽 미완성 블록을 같이 버릴 이유가 없습니다.
     ///
     /// `next_index` 는 **유지**합니다 — 이미 내보낸 index 를 재사용하면 클라이언트가
     /// 서로 다른 두 호출을 같은 호출의 조각으로 이어 붙입니다.
     pub fn reset(&mut self) {
-        self.buf.clear();
-        self.in_call = false;
+        self.content = ChannelState::default();
     }
 
+    /// 본문 채널에 밀어 넣습니다 (`push_on(Channel::Content, …)` 의 별칭).
     pub fn push(&mut self, delta: &str) -> ScanOut {
+        self.push_on(Channel::Content, delta)
+    }
+
+    pub fn push_on(&mut self, ch: Channel, delta: &str) -> ScanOut {
         if !self.enabled {
             return ScanOut { text: delta.to_string(), calls: Vec::new() };
         }
-        self.buf.push_str(delta);
-        self.drain(false)
+        self.state(ch).buf.push_str(delta);
+        self.drain(ch, false)
     }
 
-    /// 스트림 종료. 미완성 꼬리는 **텍스트로 흘려보냅니다** — 절대 버리지 않습니다.
+    /// 본문 채널 종료 (`finish_on(Channel::Content)` 의 별칭).
     pub fn finish(&mut self) -> ScanOut {
+        self.finish_on(Channel::Content)
+    }
+
+    /// 채널 종료. 미완성 꼬리는 **텍스트로 흘려보냅니다** — 절대 버리지 않습니다.
+    pub fn finish_on(&mut self, ch: Channel) -> ScanOut {
         if !self.enabled {
             return ScanOut::default();
         }
-        self.drain(true)
+        self.drain(ch, true)
     }
 
-    fn drain(&mut self, eof: bool) -> ScanOut {
+    fn state(&mut self, ch: Channel) -> &mut ChannelState {
+        match ch {
+            Channel::Content => &mut self.content,
+            Channel::Reasoning => &mut self.reasoning,
+        }
+    }
+
+    fn drain(&mut self, ch: Channel, eof: bool) -> ScanOut {
+        // `names` 를 빌리면서 `next_index`·`rejected`·버퍼를 함께 고쳐야 하므로
+        // 필드를 미리 분해합니다. 이러지 않으면 대여 검사를 통과하지 못합니다.
+        let Self { names, next_index, rejected, content, reasoning, .. } = self;
+        let st = match ch {
+            Channel::Content => content,
+            Channel::Reasoning => reasoning,
+        };
+
         let mut out = ScanOut::default();
         loop {
-            if self.in_call {
-                match self.buf.find(CLOSE) {
+            if st.in_call {
+                match st.buf.find(CLOSE) {
                     Some(j) => {
-                        let payload = self.buf[..j].to_string();
-                        self.buf.drain(..j + CLOSE.len());
-                        self.in_call = false;
-                        match parse_payload(&payload, &self.names) {
+                        let payload = st.buf[..j].to_string();
+                        st.buf.drain(..j + CLOSE.len());
+                        st.in_call = false;
+                        match parse_payload(&payload, names) {
                             Some(calls) if !calls.is_empty() => {
                                 for (name, arguments) in calls {
                                     out.calls.push(ScannedCall {
-                                        index: self.next_index,
+                                        index: *next_index,
                                         id: new_call_id(),
                                         name,
                                         arguments,
                                     });
-                                    self.next_index += 1;
+                                    *next_index += 1;
                                 }
                             }
                             // 도구가 아니었다 — 원문 그대로 사용자에게 돌려줍니다.
                             // 오탐을 무해하게 만드는 것이 이 갈래의 목적입니다.
                             _ => {
-                                self.rejected += 1;
+                                *rejected += 1;
                                 out.text.push_str(OPEN);
                                 out.text.push_str(&payload);
                                 out.text.push_str(CLOSE);
@@ -262,30 +340,179 @@ impl ToolCallScanner {
                     }
                     None => {
                         // 닫는 태그를 아직 못 봤으면 붙들고 있습니다. 단, 폭주는 막습니다.
-                        if eof || self.buf.len() > MAX_CALL_BYTES {
-                            self.rejected += 1;
+                        if eof || st.buf.len() > MAX_CALL_BYTES {
+                            *rejected += 1;
                             out.text.push_str(OPEN);
-                            out.text.push_str(&self.buf);
-                            self.buf.clear();
-                            self.in_call = false;
+                            out.text.push_str(&st.buf);
+                            st.buf.clear();
+                            st.in_call = false;
                         }
                         break;
                     }
                 }
             }
 
-            match self.buf.find(OPEN) {
+            match st.buf.find(OPEN) {
                 Some(i) => {
-                    out.text.push_str(&self.buf[..i]);
-                    self.buf.drain(..i + OPEN.len());
-                    self.in_call = true;
+                    out.text.push_str(&st.buf[..i]);
+                    st.buf.drain(..i + OPEN.len());
+                    st.in_call = true;
                 }
                 None => {
                     // 여는 태그의 **부분 접두**일 수 있는 꼬리만 붙들어 둡니다(≤10바이트).
                     // 그래서 평범한 텍스트는 지연 없이 흘러갑니다.
-                    let keep = if eof { 0 } else { partial_open_len(&self.buf) };
+                    let keep = if eof { 0 } else { partial_tag_len(&st.buf, OPEN) };
+                    let cut = st.buf.len() - keep;
+                    out.text.push_str(&st.buf[..cut]);
+                    st.buf.drain(..cut);
+                    break;
+                }
+            }
+        }
+        out
+    }
+}
+
+// ─────────────────────────── 본문 안의 추론 태그 ───────────────────────────
+
+/// 인식하는 추론 태그 짝.
+///
+/// 사내 모델이 추론을 별도 필드(`reasoningContent`)로 줄지, 본문에 태그로 섞어 줄지
+/// 확인되지 않아 양쪽을 모두 견디게 합니다. 목록을 넓히면 오탐이 늘어 평범한 텍스트가
+/// 추론으로 옮겨가므로 실제로 쓰이는 두 가지만 답니다.
+const THINK_TAGS: &[(&str, &str)] = &[("<think>", "</think>"), ("<thinking>", "</thinking>")];
+
+/// 한 번의 분리 결과. **순서를 보존**합니다 — `답변<think>생각` 에서 생각을 앞으로
+/// 끌어오면 클라이언트가 보는 순서가 뒤집힙니다.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Split {
+    pub parts: Vec<(Channel, String)>,
+}
+
+impl Split {
+    /// 분리기를 거치지 않는 경로용 — 통째로 본문입니다.
+    pub fn content(text: String) -> Self {
+        if text.is_empty() {
+            return Self::default();
+        }
+        Self { parts: vec![(Channel::Content, text)] }
+    }
+
+    fn push(&mut self, ch: Channel, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        // 같은 채널이 연달아 나오면 한 조각으로 합칩니다 — 청크 수를 늘릴 이유가 없습니다.
+        if let Some((last_ch, last)) = self.parts.last_mut() {
+            if *last_ch == ch {
+                last.push_str(text);
+                return;
+            }
+        }
+        self.parts.push((ch, text.to_string()));
+    }
+}
+
+/// 본문에 섞여 오는 `<think>…</think>` 를 추론 채널로 갈라내는 상태 기계.
+///
+/// 프레임 경계에 태그가 걸려도 안전합니다 — `partial_tag_len` 이 부분 접두만 붙듭니다.
+/// 추론 블록 **안에서도** 닫는 태그의 부분 접두만 붙들고 나머지는 흘려보내므로,
+/// 긴 사고 과정이 통째로 버퍼링되어 늦게 나가는 일은 없습니다.
+#[derive(Debug, Default)]
+pub struct ThinkSplitter {
+    buf: String,
+    /// 열려 있는 태그 짝의 번호. `None` 이면 본문 안입니다.
+    inside: Option<usize>,
+    blocks: u32,
+    unclosed: bool,
+}
+
+impl ThinkSplitter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(&mut self, delta: &str) -> Split {
+        self.buf.push_str(delta);
+        self.drain(false)
+    }
+
+    /// 스트림 종료. 붙들고 있던 것은 모두 흘려보냅니다 — 절대 버리지 않습니다.
+    pub fn finish(&mut self) -> Split {
+        self.drain(true)
+    }
+
+    /// 누적 모드에서 본문이 통째로 다시 쓰인 지점.
+    pub fn reset(&mut self) {
+        self.buf.clear();
+        self.inside = None;
+    }
+
+    /// 갈라낸 추론 블록 수 — 로그용.
+    pub fn blocks(&self) -> u32 {
+        self.blocks
+    }
+
+    /// 여는 태그를 봤는데 닫는 태그 없이 끝났는가 — 로그용.
+    pub fn unclosed(&self) -> bool {
+        self.unclosed
+    }
+
+    fn drain(&mut self, eof: bool) -> Split {
+        let mut out = Split::default();
+        loop {
+            if let Some(i) = self.inside {
+                let close = THINK_TAGS[i].1;
+                match self.buf.find(close) {
+                    Some(j) => {
+                        let thought = self.buf[..j].to_string();
+                        out.push(Channel::Reasoning, &thought);
+                        self.buf.drain(..j + close.len());
+                        self.inside = None;
+                        self.blocks += 1;
+                        continue;
+                    }
+                    None => {
+                        if eof {
+                            // 여는 태그를 봤으면 추론이라는 신호가 충분히 강합니다 —
+                            // 본문으로 되돌리지 않고 추론으로 흘립니다.
+                            let tail = std::mem::take(&mut self.buf);
+                            out.push(Channel::Reasoning, &tail);
+                            self.inside = None;
+                            self.unclosed = true;
+                        } else {
+                            let keep = partial_tag_len(&self.buf, close);
+                            let cut = self.buf.len() - keep;
+                            let ready = self.buf[..cut].to_string();
+                            out.push(Channel::Reasoning, &ready);
+                            self.buf.drain(..cut);
+                        }
+                        break;
+                    }
+                }
+            }
+
+            match earliest_think_open(&self.buf) {
+                Some((i, at)) => {
+                    let before = self.buf[..at].to_string();
+                    out.push(Channel::Content, &before);
+                    self.buf.drain(..at + THINK_TAGS[i].0.len());
+                    self.inside = Some(i);
+                }
+                None => {
+                    // 어떤 여는 태그의 부분 접두든 될 수 있는 만큼만 붙듭니다.
+                    let keep = if eof {
+                        0
+                    } else {
+                        THINK_TAGS
+                            .iter()
+                            .map(|(open, _)| partial_tag_len(&self.buf, open))
+                            .max()
+                            .unwrap_or(0)
+                    };
                     let cut = self.buf.len() - keep;
-                    out.text.push_str(&self.buf[..cut]);
+                    let ready = self.buf[..cut].to_string();
+                    out.push(Channel::Content, &ready);
                     self.buf.drain(..cut);
                     break;
                 }
@@ -295,15 +522,28 @@ impl ToolCallScanner {
     }
 }
 
-/// `buf` 의 꼬리가 `OPEN` 의 접두사이면 그 길이.
+/// 가장 먼저 나오는 여는 태그의 `(태그 번호, 위치)`.
 ///
-/// `OPEN` 이 순수 ASCII 라 자르는 지점은 언제나 char 경계입니다 (ASCII 바이트는
+/// 위치가 같으면 **긴 태그**가 이깁니다 — `<thinking>` 은 `<think` 로 시작하지 않지만
+/// (`<think>` 는 `>` 로 닫힙니다) 목록이 늘어날 때를 대비해 규칙을 못박아 둡니다.
+fn earliest_think_open(buf: &str) -> Option<(usize, usize)> {
+    THINK_TAGS
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (open, _))| buf.find(open).map(|at| (i, at)))
+        .min_by_key(|(i, at)| (*at, std::cmp::Reverse(THINK_TAGS[*i].0.len())))
+}
+
+/// `buf` 의 꼬리가 `tag` 의 접두사이면 그 길이.
+///
+/// 여는 태그가 프레임 경계에서 반쪽만 왔을 때 **그만큼만** 붙들어 두기 위한 것입니다.
+/// `tag` 가 순수 ASCII 라 자르는 지점은 언제나 char 경계입니다 (ASCII 바이트는
 /// UTF-8 연속 바이트가 될 수 없습니다).
-fn partial_open_len(buf: &str) -> usize {
-    let max = (OPEN.len() - 1).min(buf.len());
+fn partial_tag_len(buf: &str, tag: &str) -> usize {
+    let max = (tag.len() - 1).min(buf.len());
     let bytes = buf.as_bytes();
     for k in (1..=max).rev() {
-        if bytes[buf.len() - k..] == OPEN.as_bytes()[..k] {
+        if bytes[buf.len() - k..] == tag.as_bytes()[..k] {
             return k;
         }
     }
@@ -355,15 +595,6 @@ fn parse_payload(payload: &str, names: &HashSet<String>) -> Option<Vec<(String, 
         out.push((name.to_string(), arguments));
     }
     Some(out)
-}
-
-/// 비스트리밍용 일괄 파싱. 스트리밍 경로와 **같은 상태 기계**를 태워서 두 경로가
-/// 어긋날 수 없게 합니다.
-pub fn parse_all(text: &str, names: &HashSet<String>) -> ScanOut {
-    let mut scanner = ToolCallScanner::new(names.iter().cloned(), true);
-    let mut out = scanner.push(text);
-    out.absorb(scanner.finish());
-    out
 }
 
 #[cfg(test)]
@@ -589,20 +820,122 @@ mod tests {
         assert!(out.text.is_empty());
     }
 
+    /// 이름 집합이 비면 스캐너는 스스로 통과 모드가 됩니다 — 도구를 안 쓰는 요청에
+    /// 별도 분기를 두지 않아도 되는 것이 이 성질의 존재 이유입니다.
     #[test]
-    fn disabled_scanner_is_a_passthrough() {
-        let mut sc = ToolCallScanner::disabled();
-        let out = sc.push("<tool_call>{\"name\":\"write\",\"arguments\":{}}</tool_call>");
-        assert_eq!(out.text, "<tool_call>{\"name\":\"write\",\"arguments\":{}}</tool_call>");
-        assert!(out.calls.is_empty());
+    fn scanner_without_names_is_a_passthrough() {
+        let mut sc = ToolCallScanner::new(Vec::new(), true);
+        let body = "<tool_call>{\"name\":\"write\",\"arguments\":{}}</tool_call>";
+        assert_eq!(sc.push(body).text, body);
+        assert_eq!(sc.push_on(Channel::Reasoning, body).text, body);
         assert!(!sc.saw_call());
-        assert!(sc.finish().is_empty());
+        assert_eq!(sc.finish(), ScanOut::default());
+        assert_eq!(sc.finish_on(Channel::Reasoning), ScanOut::default());
+    }
+
+    // ── 채널 두 갈래 ──
+
+    /// 이번 수정의 핵심 — 추론 채널로만 온 호출도 잡혀야 합니다. 여기가 뚫려 있어서
+    /// `finish_reason` 이 영구히 `stop` 이었습니다.
+    #[test]
+    fn tool_call_only_in_reasoning_is_extracted() {
+        let mut sc = scanner();
+        let out = sc.push_on(
+            Channel::Reasoning,
+            "생각 중.<tool_call>{\"name\":\"read\",\"arguments\":{\"filePath\":\"a.css\"}}</tool_call>",
+        );
+        assert_eq!(out.calls.len(), 1);
+        assert_eq!(out.calls[0].name, "read");
+        assert_eq!(out.text, "생각 중.");
+        assert!(sc.saw_call());
+    }
+
+    /// index 는 채널을 가로질러 하나의 수열이어야 합니다. 채널별로 세면 둘 다 0 을
+    /// 받아 클라이언트가 서로 다른 두 호출을 하나로 잇습니다.
+    #[test]
+    fn channels_share_one_call_index_space() {
+        let mut sc = scanner();
+        let a = sc.push("<tool_call>{\"name\":\"write\",\"arguments\":{}}</tool_call>");
+        let b = sc.push_on(
+            Channel::Reasoning,
+            "<tool_call>{\"name\":\"read\",\"arguments\":{}}</tool_call>",
+        );
+        assert_eq!(a.calls[0].index, 0);
+        assert_eq!(b.calls[0].index, 1);
+        assert_ne!(a.calls[0].id, b.calls[0].id);
+        assert_eq!(sc.call_count(), 2);
+    }
+
+    /// 한쪽 채널이 붙들고 있는 부분 접두가 다른 채널 텍스트에 이어 붙으면 엉뚱한
+    /// 블록이 만들어집니다. 버퍼를 채널마다 따로 두는 이유가 이것입니다.
+    #[test]
+    fn channels_do_not_leak_each_others_buffers() {
+        let mut sc = scanner();
+        assert_eq!(sc.push("hi <t").text, "hi ");
+        // 추론 쪽 텍스트에 본문이 붙들고 있던 `<t` 가 섞이면 안 됩니다.
+        assert_eq!(sc.push_on(Channel::Reasoning, "생각").text, "생각");
+        assert_eq!(sc.finish_on(Channel::Reasoning).text, "");
+        assert_eq!(sc.finish().text, "<t");
     }
 
     #[test]
-    fn scanner_without_names_is_disabled() {
-        let sc = ToolCallScanner::new(Vec::new(), true);
-        assert!(!sc.is_enabled());
+    fn reasoning_prose_passes_through_untouched() {
+        let mut sc = scanner();
+        let out = sc.push_on(Channel::Reasoning, "이 파일을 먼저 읽어야겠다. a < b 인지 확인.");
+        assert_eq!(out.text, "이 파일을 먼저 읽어야겠다. a < b 인지 확인.");
+        assert!(out.calls.is_empty());
+        assert!(!sc.saw_call());
+    }
+
+    /// 추론 채널의 거절된 블록도 **추론 텍스트로** 되돌아와야 합니다 — 본문으로
+    /// 새어 나가면 답변에 없던 글이 생깁니다.
+    #[test]
+    fn rejected_block_on_the_reasoning_channel_returns_as_reasoning_text() {
+        let mut sc = scanner();
+        let mut out = sc.push_on(
+            Channel::Reasoning,
+            "<tool_call>{\"name\":\"definitely_not_a_tool\",\"arguments\":{}}</tool_call>",
+        );
+        out.absorb(sc.finish_on(Channel::Reasoning));
+        assert!(out.calls.is_empty());
+        assert!(out.text.contains("definitely_not_a_tool"));
+        assert_eq!(sc.rejected, 1);
+    }
+
+    /// 프레임 경계는 파서가 깨지는 자리입니다. 본문에서 이미 검증한 불변식을
+    /// 추론 채널에서도 확인합니다.
+    #[test]
+    fn split_at_every_char_boundary_is_stable_on_the_reasoning_channel() {
+        let s = "앞 <tool_call>{\"name\":\"write\",\"arguments\":{\"p\":\"한글\"}}</tool_call> 뒤";
+        for cut in 1..s.len() {
+            if !s.is_char_boundary(cut) {
+                continue;
+            }
+            let mut sc = scanner();
+            let mut got = sc.push_on(Channel::Reasoning, &s[..cut]);
+            got.absorb(sc.push_on(Channel::Reasoning, &s[cut..]));
+            got.absorb(sc.finish_on(Channel::Reasoning));
+            assert_eq!(got.text, "앞  뒤", "cut at {cut}");
+            assert_eq!(got.calls.len(), 1, "cut at {cut}");
+            assert_eq!(got.calls[0].name, "write", "cut at {cut}");
+            assert_eq!(got.calls[0].index, 0, "cut at {cut}");
+        }
+    }
+
+    /// 본문 재작성(`StreamEvent::Reset`)은 추론 채널을 건드리면 안 됩니다 —
+    /// 재작성은 `content` 에만 일어납니다.
+    #[test]
+    fn reset_spares_the_reasoning_channel() {
+        let mut sc = scanner();
+        sc.push_on(Channel::Reasoning, "<tool_call>{\"name\":\"read\",\"argu");
+        sc.push("본문 <tool_call>{\"name\":\"wr");
+        sc.reset();
+        // 추론 쪽 미완성 블록은 살아 있어야 하고, 이어지는 조각으로 완성됩니다.
+        let out = sc.push_on(Channel::Reasoning, "ments\":{}}</tool_call>");
+        assert_eq!(out.calls.len(), 1, "리셋이 추론 버퍼를 지웠습니다");
+        assert_eq!(out.calls[0].name, "read");
+        // 본문 쪽은 버려졌습니다.
+        assert!(!sc.finish().text.contains("wr"));
     }
 
     #[test]
@@ -619,15 +952,182 @@ mod tests {
         assert!(!after.text.contains("wr"), "리셋된 버퍼가 새어 나왔습니다");
     }
 
+    /// 한 덩어리로 밀어 넣든 조각으로 밀어 넣든 같은 결과여야 합니다. 예전에는
+    /// 비스트림용 `parse_all` 이 따로 있어 이 동등성을 명시적으로 확인해야 했는데,
+    /// 이제 두 경로가 같은 `Turn` 을 지나므로 스캐너 단위에서만 확인합니다.
     #[test]
-    fn parse_all_matches_the_streaming_result() {
+    fn chunked_and_whole_input_agree() {
         let s = "a<tool_call>{\"name\":\"read\",\"arguments\":{\"p\":1}}</tool_call>b";
-        let streamed = scan_all(&mut scanner(), s);
-        let batched = parse_all(s, &names());
-        assert_eq!(streamed.text, batched.text);
-        assert_eq!(streamed.calls.len(), batched.calls.len());
-        assert_eq!(streamed.calls[0].name, batched.calls[0].name);
-        assert_eq!(streamed.calls[0].arguments, batched.calls[0].arguments);
+        let whole = scan_all(&mut scanner(), s);
+
+        let mut sc = scanner();
+        let mut chunked = ScanOut::default();
+        for ch in s.chars() {
+            chunked.absorb(sc.push(&ch.to_string()));
+        }
+        chunked.absorb(sc.finish());
+
+        assert_eq!(whole.text, chunked.text);
+        assert_eq!(whole.calls.len(), chunked.calls.len());
+        assert_eq!(whole.calls[0].name, chunked.calls[0].name);
+        assert_eq!(whole.calls[0].arguments, chunked.calls[0].arguments);
+    }
+
+    // ── 본문 안의 <think> 분리 ──
+
+    /// 전부 밀어 넣고 끝낸 분리 결과.
+    fn split_all(sp: &mut ThinkSplitter, s: &str) -> Vec<(Channel, String)> {
+        let mut parts = sp.push(s).parts;
+        parts.extend(sp.finish().parts);
+        parts
+    }
+
+    fn joined(parts: &[(Channel, String)], want: Channel) -> String {
+        parts
+            .iter()
+            .filter(|(ch, _)| *ch == want)
+            .map(|(_, t)| t.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn plain_content_is_untouched_by_the_splitter() {
+        let parts = split_all(&mut ThinkSplitter::new(), "그냥 답변입니다. a < b.");
+        assert_eq!(joined(&parts, Channel::Content), "그냥 답변입니다. a < b.");
+        assert_eq!(joined(&parts, Channel::Reasoning), "");
+    }
+
+    #[test]
+    fn think_block_moves_to_the_reasoning_channel() {
+        let parts = split_all(
+            &mut ThinkSplitter::new(),
+            "<think>먼저 읽어야겠다</think>읽어 보겠습니다.",
+        );
+        assert_eq!(joined(&parts, Channel::Reasoning), "먼저 읽어야겠다");
+        assert_eq!(joined(&parts, Channel::Content), "읽어 보겠습니다.");
+    }
+
+    #[test]
+    fn thinking_variant_is_recognized() {
+        let parts = split_all(&mut ThinkSplitter::new(), "<thinking>고민</thinking>답");
+        assert_eq!(joined(&parts, Channel::Reasoning), "고민");
+        assert_eq!(joined(&parts, Channel::Content), "답");
+    }
+
+    /// 순서가 뒤집히면 클라이언트가 보는 답변 순서가 달라집니다.
+    #[test]
+    fn order_is_preserved_when_content_precedes_think() {
+        let parts = split_all(&mut ThinkSplitter::new(), "앞<think>중</think>뒤");
+        assert_eq!(
+            parts,
+            vec![
+                (Channel::Content, "앞".to_string()),
+                (Channel::Reasoning, "중".to_string()),
+                (Channel::Content, "뒤".to_string()),
+            ]
+        );
+    }
+
+    /// 프레임 경계가 어디로 떨어져도 같은 분리 결과여야 합니다. 스트리밍 파서가
+    /// 깨지는 곳은 거의 언제나 여기입니다.
+    #[test]
+    fn think_split_at_every_char_boundary_is_stable() {
+        let s = "앞<think>한글 생각</think>뒤 텍스트";
+        for cut in 1..s.len() {
+            if !s.is_char_boundary(cut) {
+                continue;
+            }
+            let mut sp = ThinkSplitter::new();
+            let mut parts = sp.push(&s[..cut]).parts;
+            parts.extend(sp.push(&s[cut..]).parts);
+            parts.extend(sp.finish().parts);
+            assert_eq!(joined(&parts, Channel::Reasoning), "한글 생각", "cut at {cut}");
+            assert_eq!(joined(&parts, Channel::Content), "앞뒤 텍스트", "cut at {cut}");
+            assert!(!sp.unclosed(), "cut at {cut}");
+            assert_eq!(sp.blocks(), 1, "cut at {cut}");
+        }
+    }
+
+    /// 긴 사고 과정이 통째로 버퍼링되면 안 됩니다 — 닫는 태그의 부분 접두만 붙듭니다.
+    #[test]
+    fn reasoning_streams_out_without_waiting_for_the_close_tag() {
+        let mut sp = ThinkSplitter::new();
+        // 닫는 태그를 보기 전에 이미 나옵니다.
+        assert_eq!(joined(&sp.push("<think>생각을 ").parts, Channel::Reasoning), "생각을 ");
+        assert_eq!(joined(&sp.push("이어서 합니다").parts, Channel::Reasoning), "이어서 합니다");
+    }
+
+    #[test]
+    fn unterminated_think_flushes_as_reasoning_at_eof() {
+        let mut sp = ThinkSplitter::new();
+        let parts = split_all(&mut sp, "답변 <think>끝나지 않은 생각");
+        assert_eq!(joined(&parts, Channel::Content), "답변 ");
+        assert_eq!(joined(&parts, Channel::Reasoning), "끝나지 않은 생각");
+        assert!(sp.unclosed());
+    }
+
+    /// 여는 태그의 부분 접두로 끝난 본문은 **본문으로** 되돌아와야 합니다 —
+    /// 태그처럼 보였을 뿐 실제로는 답변 텍스트입니다.
+    #[test]
+    fn partial_think_prefix_is_released_as_content_at_eof() {
+        let mut sp = ThinkSplitter::new();
+        assert_eq!(joined(&sp.push("답변 <thi").parts, Channel::Content), "답변 ");
+        let parts = sp.finish().parts;
+        assert_eq!(joined(&parts, Channel::Content), "<thi");
+        assert_eq!(joined(&parts, Channel::Reasoning), "");
+    }
+
+    #[test]
+    fn close_without_open_stays_literal_content() {
+        let parts = split_all(&mut ThinkSplitter::new(), "답변</think>계속");
+        assert_eq!(joined(&parts, Channel::Content), "답변</think>계속");
+        assert_eq!(joined(&parts, Channel::Reasoning), "");
+    }
+
+    #[test]
+    fn two_think_blocks_are_counted() {
+        let mut sp = ThinkSplitter::new();
+        let parts = split_all(&mut sp, "<think>가</think>글<think>나</think>");
+        assert_eq!(joined(&parts, Channel::Reasoning), "가나");
+        assert_eq!(joined(&parts, Channel::Content), "글");
+        assert_eq!(sp.blocks(), 2);
+    }
+
+    /// 분리기와 스캐너를 이어 붙이면 `<think>` 안의 도구 호출도 잡힙니다 —
+    /// 이것이 두 조각을 이 순서로 합치는 이유입니다.
+    #[test]
+    fn tool_call_inside_a_think_block_is_found() {
+        let mut sp = ThinkSplitter::new();
+        let mut sc = scanner();
+        let body = "<think>이걸 써야지<tool_call>{\"name\":\"read\",\"arguments\":{}}</tool_call></think>확인했습니다.";
+
+        let mut calls = Vec::new();
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        for (ch, seg) in split_all(&mut sp, body) {
+            let out = sc.push_on(ch, &seg);
+            match ch {
+                Channel::Content => content.push_str(&out.text),
+                Channel::Reasoning => reasoning.push_str(&out.text),
+            }
+            calls.extend(out.calls);
+        }
+        content.push_str(&sc.finish_on(Channel::Content).text);
+        reasoning.push_str(&sc.finish_on(Channel::Reasoning).text);
+
+        assert_eq!(calls.len(), 1, "think 안의 호출을 놓쳤습니다");
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(content, "확인했습니다.");
+        assert_eq!(reasoning, "이걸 써야지");
+    }
+
+    #[test]
+    fn partial_tag_len_holds_only_a_real_prefix() {
+        assert_eq!(partial_tag_len("hi <t", OPEN), 2);
+        assert_eq!(partial_tag_len("hi <think", THINK_TAGS[0].0), 6);
+        assert_eq!(partial_tag_len("hi there", OPEN), 0);
+        // 완성된 태그는 부분 접두가 아닙니다 — 호출부가 find 로 먼저 잡습니다.
+        assert_eq!(partial_tag_len("<tool_call>", OPEN), 0);
     }
 
     // ── 규약 렌더링 ──
@@ -680,7 +1180,7 @@ mod tests {
         let rendered = render_history_call(&call);
         assert!(rendered.contains("call_a1"));
 
-        let out = parse_all(&rendered, &names());
+        let out = scan_all(&mut scanner(), &rendered);
         assert_eq!(out.calls.len(), 1);
         assert_eq!(out.calls[0].name, "write");
         let args: Value = serde_json::from_str(&out.calls[0].arguments).unwrap();

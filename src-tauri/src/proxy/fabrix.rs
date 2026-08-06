@@ -485,7 +485,9 @@ impl FabrixChunk {
 /// 상한에 걸려 잘린 답변이 클라이언트에는 깔끔한 `"stop"` 으로 보였습니다 —
 /// 도구 호출 인자 한가운데서 잘려도 마찬가지라, 파일이 반쪽만 써지고도 성공으로
 /// 보입니다.
-pub fn map_finish_reason(raw: Option<&str>, truncated: bool) -> Option<String> {
+/// `decide_finish` 만 호출합니다 — 종료 사유 판단이 한 자리에 모여 있게 하려고
+/// 밖으로 내보내지 않습니다.
+fn map_finish_reason(raw: Option<&str>, truncated: bool) -> Option<String> {
     if truncated {
         return Some("length".into());
     }
@@ -514,7 +516,7 @@ pub fn map_finish_reason(raw: Option<&str>, truncated: bool) -> Option<String> {
 ///
 /// 중단 계열(`abort`·`timeout`·`error`…)은 `stop` 이 아니라 `length` 로 접습니다 —
 /// 끊긴 답변을 완성된 것처럼 부르면 안 됩니다.
-pub fn clamp_finish_reason(mapped: Option<&str>) -> &'static str {
+fn clamp_finish_reason(mapped: Option<&str>) -> &'static str {
     match mapped.unwrap_or("stop").trim().to_ascii_lowercase().as_str() {
         "stop" => "stop",
         "length" => "length",
@@ -525,6 +527,28 @@ pub fn clamp_finish_reason(mapped: Option<&str>) -> &'static str {
         | "incomplete" => "length",
         _ => "stop",
     }
+}
+
+/// 이 턴의 `finish_reason` 을 정하는 **단 하나의** 자리.
+///
+/// 예전에는 스트림 경로와 비스트림 경로가 각자 이 판단을 했습니다. 두 사본이 어긋나면
+/// 같은 답변이 `stream` 여부에 따라 다른 종료 사유를 받습니다 — 클라이언트는 이 값으로
+/// 에이전트 루프를 계속할지 정하므로, 어긋남이 곧 "한쪽에서만 루프가 끊김" 입니다.
+///
+/// 우선순위: **도구 호출 > 절단 > 상위가 준 사유 > stop**.
+///
+/// 도구 호출이 절단보다 앞서는 것은 의도입니다. 스캐너는 닫는 태그를 보고 이름 검증까지
+/// 끝난 **완성된 호출만** 내보내므로, 뒤가 잘렸어도 이미 뽑은 호출은 실행할 수 있습니다.
+/// 절단 사실은 로그 ③ 칸 꼬리에 남습니다.
+///
+/// 스트림이 중간에 끊긴 경우는 호출부가 `upstream` 자리에 `"error"` 를 넣어 알립니다 —
+/// `clamp_finish_reason` 의 중단 계열 갈래가 그것을 `length` 로 접습니다. 별도 상수를
+/// 두지 않는 이유: 상수와 clamp 표가 따로 있으면 둘이 어긋날 수 있습니다.
+pub fn decide_finish(saw_call: bool, upstream: Option<&str>, truncated: bool) -> &'static str {
+    if saw_call {
+        return "tool_calls";
+    }
+    clamp_finish_reason(map_finish_reason(upstream, truncated).as_deref())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -560,7 +584,6 @@ enum DeltaMode {
 pub struct StreamDecoder {
     buf: Vec<u8>,
     acc: String,
-    reasoning: String,
     mode: DeltaMode,
     pub finish_reason: Option<String>,
     pub model_type: Option<String>,
@@ -583,10 +606,6 @@ impl StreamDecoder {
     /// 지금까지 합쳐진 전체 답변.
     pub fn text(&self) -> &str {
         &self.acc
-    }
-
-    pub fn reasoning(&self) -> &str {
-        &self.reasoning
     }
 
     pub fn push(&mut self, chunk: &[u8]) -> Vec<StreamEvent> {
@@ -667,9 +686,10 @@ impl StreamDecoder {
         if let Some(tokens) = chunk.upstream_tokens() {
             self.upstream_tokens = Some(tokens);
         }
+        // 누적은 소비자(`proxy::turn::Turn`)가 합니다 — 디코더가 따로 모으면 두 곳이
+        // 어긋납니다(특히 누적 모드 재작성에서).
         if let Some(reasoning) = chunk.reasoning_content.as_deref() {
             if !reasoning.is_empty() {
-                self.reasoning.push_str(reasoning);
                 out.push(StreamEvent::Reasoning(reasoning.to_string()));
             }
         }
@@ -736,6 +756,30 @@ impl StreamDecoder {
             }
         }
     }
+}
+
+/// 비스트림 응답 한 덩어리를 스트림과 **같은 이벤트 열**로 바꿉니다.
+///
+/// 이 함수가 있어서 비스트림 경로가 자기만의 조립 코드를 갖지 않습니다 — 두 경로가
+/// 같은 상태 기계(`proxy::turn::Turn`)를 지나가는 것이 이 변환의 목적입니다.
+/// 순서는 스트림 프레임과 같습니다: 추론 → 본문 → 종료.
+///
+/// `contentReferences`·`eventData` 폴백은 **여기서만** 일어납니다(스트림 프레임에는
+/// 적용하지 않습니다). 실서버 와이어를 확인하면 줄어드는 것도 이 함수 하나입니다.
+pub fn nonstream_events(chunk: &FabrixChunk) -> Vec<StreamEvent> {
+    let mut out = Vec::new();
+    if let Some(reasoning) = chunk.reasoning_content.as_deref().filter(|s| !s.is_empty()) {
+        out.push(StreamEvent::Reasoning(reasoning.to_string()));
+    }
+    if let Some(text) = chunk.answer_text().filter(|s| !s.is_empty()) {
+        out.push(StreamEvent::Delta(text));
+    }
+    // 공백만 있는 사유로 이벤트를 만들지 않습니다 — `map_finish_reason` 이 어차피
+    // 트림해서 버리므로 와이어 결과는 같고, 빈 이벤트만 사라집니다.
+    if let Some(reason) = chunk.finish_reason.as_deref().filter(|r| !r.trim().is_empty()) {
+        out.push(StreamEvent::Finish(reason.to_string()));
+    }
+    out
 }
 
 /// `absorb` 의 결과. 추가인지 재작성인지 구분해야 소비자가 상태를 언제 버릴지 압니다.
@@ -1480,6 +1524,75 @@ mod tests {
         assert_eq!(map_finish_reason(Some("weird"), false).as_deref(), Some("weird"));
         assert_eq!(map_finish_reason(Some("   "), false), None);
         assert_eq!(map_finish_reason(None, false), None);
+    }
+
+    /// 두 경로가 공유하는 유일한 종료 사유 판단. 표로 못박아 둡니다.
+    #[test]
+    fn decide_finish_puts_tool_calls_first() {
+        // 도구 호출이 있으면 절단이든 상위 사유든 이깁니다 — 뽑은 호출은 실행 가능합니다.
+        assert_eq!(decide_finish(true, Some("stop"), false), "tool_calls");
+        assert_eq!(decide_finish(true, None, true), "tool_calls");
+        assert_eq!(decide_finish(true, Some("weird"), true), "tool_calls");
+        // 호출이 없으면 절단이 상위 사유를 이깁니다.
+        assert_eq!(decide_finish(false, Some("stop"), true), "length");
+        // 상위가 모르는 값을 줘도 와이어에는 열거값만 나갑니다.
+        assert_eq!(decide_finish(false, Some("weird"), false), "stop");
+        assert_eq!(decide_finish(false, Some("content_filter"), false), "content_filter");
+        assert_eq!(decide_finish(false, None, false), "stop");
+    }
+
+    /// 스트림 중단은 호출부가 `"error"` 로 알리고, clamp 가 `length` 로 접습니다 —
+    /// 끊긴 답변을 완성된 것처럼 `stop` 으로 부르면 안 됩니다.
+    #[test]
+    fn decide_finish_folds_a_midstream_break_to_length() {
+        assert_eq!(decide_finish(false, Some("error"), false), "length");
+        // 다만 이미 완성된 호출을 뽑았다면 그것이 우선입니다 — 사장시킬 이유가 없습니다.
+        assert_eq!(decide_finish(true, Some("error"), false), "tool_calls");
+    }
+
+    /// 비스트림 본문도 스트림과 **같은 순서**의 이벤트가 되어야 합니다.
+    #[test]
+    fn nonstream_events_order_reasoning_then_content_then_finish() {
+        let chunk = FabrixChunk {
+            content: Some("답변".into()),
+            reasoning_content: Some("생각".into()),
+            finish_reason: Some("stop".into()),
+            ..FabrixChunk::default()
+        };
+        assert_eq!(
+            nonstream_events(&chunk),
+            vec![
+                StreamEvent::Reasoning("생각".into()),
+                StreamEvent::Delta("답변".into()),
+                StreamEvent::Finish("stop".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn nonstream_events_skip_empty_fields() {
+        let chunk = FabrixChunk {
+            content: Some(String::new()),
+            reasoning_content: Some(String::new()),
+            finish_reason: Some("   ".into()),
+            ..FabrixChunk::default()
+        };
+        // 빈 값으로 이벤트를 만들면 소비자가 빈 델타 청크를 내보냅니다.
+        assert_eq!(nonstream_events(&chunk), Vec::new());
+    }
+
+    /// 추론만 있고 본문이 빈 응답 — 이번 버그의 실제 모양입니다.
+    #[test]
+    fn nonstream_events_carry_reasoning_only_answers() {
+        let chunk = FabrixChunk {
+            content: None,
+            reasoning_content: Some("<tool_call>{\"name\":\"read\"}</tool_call>".into()),
+            ..FabrixChunk::default()
+        };
+        assert_eq!(
+            nonstream_events(&chunk),
+            vec![StreamEvent::Reasoning("<tool_call>{\"name\":\"read\"}</tool_call>".into())]
+        );
     }
 
     #[test]

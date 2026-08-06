@@ -25,12 +25,12 @@ use crate::openai::{
 use crate::state::{self, Shared};
 
 use super::fabrix::{
-    clamp_finish_reason, default_model, extract_object, find_model, fold_messages,
-    map_finish_reason, FabrixChunk, FabrixError,
-    LlmConfig, MessagesRequest, ResolvedModel, StreamDecoder, StreamEvent, MESSAGES_PATH,
+    default_model, extract_object, find_model, fold_messages, nonstream_events, FabrixChunk,
+    FabrixError, LlmConfig, MessagesRequest, ResolvedModel, StreamDecoder, MESSAGES_PATH,
 };
 use super::models::ensure_models;
-use super::tools::{self, ToolCallScanner};
+use super::tools;
+use super::turn::{Emit, Piece, ToolStats, Turn};
 use super::usage;
 use super::validate;
 use super::{
@@ -56,6 +56,11 @@ struct Ctx {
     tools_declared: usize,
     /// 그 도구를 규약으로 접어 실제로 보냈는가(설정으로 끌 수 있습니다).
     tools_emulated: bool,
+    /// 클라이언트가 `tool_choice: "none"` 으로 스스로 껐는가.
+    ///
+    /// 프록시 설정으로 끈 것과 구분해야 합니다 — 예전에는 둘 다 로그에
+    /// "에뮬레이션 꺼짐" 으로 찍혀, 사용자가 자기 요청을 의심할 수 없었습니다.
+    tools_choice_none: bool,
     /// 검증을 통과한 요청에서 뽑아낸 실행 계획 — 무시한 필드와 버린 이미지 파트를
     /// 로그 ③ 칸까지 들고 갑니다.
     plan: validate::Plan,
@@ -69,32 +74,73 @@ struct Ctx {
     prompt_text: String,
 }
 
-/// 스트림이 중간에 끊겼을 때 마지막 청크에 넣는 `finish_reason`.
-///
-/// `stop` 은 쓰지 않습니다 — 끊긴 답변을 완성된 것처럼 부르는 거짓말이 됩니다
-/// (`d550bc4` 의 "절단은 length" 와 같은 판단). 이 값을 보고 자동으로 이어받기를
-/// 시도하는 클라이언트가 있다는 것이 대가입니다. 뒤집으려면 이 한 줄만 고치면 됩니다.
-const MIDSTREAM_FINISH: &str = "length";
-
 /// 로그 꼬리에 붙일 도구 관련 한 줄.
 ///
 /// "요청에 도구가 있었는데 프록시가 버렸다" 와 "도구는 전달됐는데 모델이 안 썼다" 를
 /// 사용자가 구분할 수 있어야 합니다 — 지금까지는 둘 다 똑같이 조용히 실패했습니다.
-fn tool_meta(declared: usize, emulated: bool, calls: u32, rejects: u32) -> Option<String> {
+fn tool_meta(
+    declared: usize,
+    emulated: bool,
+    choice_none: bool,
+    stats: &ToolStats,
+) -> Option<String> {
     if declared == 0 {
         return None; // 평범한 채팅에는 아무 것도 붙이지 않습니다.
     }
     if !emulated {
-        return Some(format!("도구 {declared}개 선언 · 에뮬레이션 꺼짐 — 무시함"));
+        // 누가 껐는지가 다음 행동을 가릅니다 — 설정을 볼지, 요청을 볼지.
+        return Some(if choice_none {
+            format!("도구 {declared}개 선언 · 클라이언트가 tool_choice: none 으로 껐음")
+        } else {
+            format!("도구 {declared}개 선언 · 에뮬레이션 꺼짐 — 무시함")
+        });
     }
-    let mut line = match calls {
+    let mut line = match stats.calls {
         0 => format!("도구 {declared}개 선언 · 호출 0건 — 모델이 규약을 따르지 않음"),
         n => format!("도구 {declared}개 선언 · 호출 {n}건"),
     };
-    if rejects > 0 {
-        line.push_str(&format!(" · 형식 오류 {rejects}건은 텍스트로 되돌림"));
+    // 이 숫자가 "추론 단계마다 stop" 수정이 실제로 물었는지를 말해 줍니다.
+    if stats.in_reasoning > 0 {
+        line.push_str(&format!(" · 그중 {}건은 추론 채널에서", stats.in_reasoning));
+    }
+    if stats.rejected > 0 {
+        line.push_str(&format!(" · 형식 오류 {}건은 텍스트로 되돌림", stats.rejected));
     }
     Some(line)
+}
+
+/// 로그 꼬리에 붙일 추론 채널 한 줄.
+///
+/// 도구와 무관하게 일어나므로(`<think>` 분리는 평범한 채팅에서도 합니다) `tool_meta`
+/// 밖에 둡니다. 추론이 없으면 아무 것도 붙이지 않아 기존 로그가 그대로 유지됩니다.
+fn reasoning_meta(turn: &Turn) -> Option<String> {
+    if turn.reasoning().is_empty() {
+        return None;
+    }
+    let stats = turn.tool_stats();
+    let mut line = format!("추론 {}자", turn.reasoning().chars().count());
+    if stats.think_blocks > 0 {
+        line.push_str(&format!(" · <think> {}개 분리", stats.think_blocks));
+    }
+    if stats.think_unclosed {
+        line.push_str(" · <think> 가 닫히지 않음");
+    }
+    Some(line)
+}
+
+/// 로그 ③ 칸 본문. 추론이 있으면 두 칸으로 나눠 담습니다.
+///
+/// 스캐너가 걷어내기 **전** 원문이라 `<tool_call>` 유무를 눈으로 볼 수 있습니다.
+/// 추론을 빼놓으면 호출이 추론 채널에서 나온 경우에 ③ 칸이 산문만 보여 주어,
+/// "모델이 규약을 안 지켰다"와 구별할 방법이 없습니다 — 이번 버그가 그렇게 오래
+/// 숨어 있었던 이유가 정확히 이것입니다.
+fn log_body(turn: &Turn) -> String {
+    let content = turn.raw_content();
+    let reasoning = turn.raw_reasoning();
+    if reasoning.is_empty() {
+        return content.to_string();
+    }
+    format!("[추론]\n{reasoning}\n\n[답변]\n{content}")
 }
 
 /// 본문이 상한을 넘어 `Ctx` 를 만들기도 전에 끝난 호출의 로그 한 건.
@@ -259,6 +305,7 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Body)
         fabrix_url: format!("{}{MESSAGES_PATH}", cfg.normalized_base_url()),
         tools_declared: 0,
         tools_emulated: false,
+        tools_choice_none: false,
         plan: validate::Plan::default(),
         model_defaulted: false,
         prompt_text: String::new(),
@@ -396,6 +443,7 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Body)
     // 도구 에뮬레이션. FabriX 에 도구 필드가 없어 규약을 systemPrompt 뒤에 붙이고,
     // 답변에서 <tool_call> 을 걷어내 tool_calls 로 돌려줍니다.
     let declared = req.declared_tools();
+    let tool_mode = req.tool_mode();
     let emulate = cfg.tool_emulation && req.wants_tools();
     let tool_names: HashSet<String> = if emulate {
         declared.iter().map(|f| f.name.trim().to_string()).collect()
@@ -403,7 +451,7 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Body)
         HashSet::new()
     };
     if emulate {
-        if let Some(block) = tools::render_system_block(&declared, &req.tool_mode()) {
+        if let Some(block) = tools::render_system_block(&declared, &tool_mode) {
             system_prompt = Some(match system_prompt {
                 Some(existing) => format!("{existing}\n\n{block}"),
                 None => block,
@@ -412,6 +460,7 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Body)
     }
     ctx.tools_declared = declared.len();
     ctx.tools_emulated = emulate;
+    ctx.tools_choice_none = tool_mode == crate::openai::ToolChoiceMode::None;
     drop(declared);
 
     if contents.is_empty() {
@@ -434,6 +483,22 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Body)
                 ErrorEnvelope::new(msg, openai_type(400), Some("invalid_value".into()))
                     .with_param("messages"),
             );
+        }
+    }
+
+    // 규약 형식을 **모델이 마지막으로 읽는 자리**에 한 번 더 못박습니다. 여기서
+    // 붙이므로 로그 ② 칸과 토큰 추정(`ctx.prompt_text`)에 자동으로 포함됩니다.
+    if emulate {
+        if let Some(reminder) = tools::render_tail_reminder(&tool_mode) {
+            match contents.last_mut() {
+                // 마지막 원소에 이어 붙입니다 — 사내가 `contents` 배열을 무엇으로
+                // 잇는지 모르므로, 문자열 안에서 꼬리를 만드는 것이 확실합니다.
+                Some(last) => {
+                    last.push_str("\n\n");
+                    last.push_str(&reminder);
+                }
+                None => contents.push(reminder),
+            }
         }
     }
 
@@ -499,76 +564,47 @@ fn sse_json<T: serde::Serialize>(value: &T) -> Event {
     Event::default().data(serde_json::to_string(value).unwrap_or_default())
 }
 
-/// 스캐너 출력 하나를 `chat.completion.chunk` 들로 바꿉니다 — 텍스트 먼저,
-/// 그다음 도구 호출. 클라이언트가 보는 순서가 곧 이 순서입니다.
+/// `Emit` 하나를 `chat.completion.chunk` 들로 바꿉니다. 순서는 `Emit` 의 순서
+/// 그대로 — 클라이언트가 보는 순서가 곧 이 순서입니다.
 ///
-/// 펌프 본문과 꼬리 처리가 같은 경로를 쓰도록 함수로 뺐습니다
-/// (`async_stream::stream!` 안에서는 `yield` 를 매크로로 감쌀 수 없습니다).
-/// SSE 직렬화는 호출부가 하므로 이 함수는 순수하고 테스트할 수 있습니다.
-fn scan_chunks(
+/// 함수로 빼 둔 이유: `async_stream::stream!` 안에서는 `yield` 를 함수로 감쌀 수
+/// 없으므로 청크 **조립**만 밖으로 내고 방출은 제너레이터가 합니다. 덕분에 이
+/// 함수는 순수하고 HTTP 없이 테스트할 수 있습니다.
+fn emit_chunks(
     id: &str,
     created: i64,
     model: &str,
-    out: tools::ScanOut,
+    emit: Emit,
     sent_role: &mut bool,
 ) -> Vec<ChatChunk> {
     let mut chunks = Vec::new();
-    if !out.text.is_empty() {
-        let delta = Delta {
-            role: (!*sent_role).then_some("assistant"),
-            content: Some(out.text),
-            ..Delta::default()
-        };
-        *sent_role = true;
-        chunks.push(ChatChunk::new(id, created, model, delta, None));
-    }
-    for call in out.calls {
-        let delta = Delta {
-            role: (!*sent_role).then_some("assistant"),
-            tool_calls: Some(vec![ToolCallDelta::whole(
-                call.index,
-                &call.id,
-                &call.name,
-                &call.arguments,
-            )]),
-            ..Delta::default()
+    for piece in emit.0 {
+        let delta = match piece {
+            Piece::Content(text) => Delta {
+                role: (!*sent_role).then_some("assistant"),
+                content: Some(text),
+                ..Delta::default()
+            },
+            Piece::Reasoning(text) => Delta {
+                role: (!*sent_role).then_some("assistant"),
+                reasoning_content: Some(text),
+                ..Delta::default()
+            },
+            Piece::Call(call) => Delta {
+                role: (!*sent_role).then_some("assistant"),
+                tool_calls: Some(vec![ToolCallDelta::whole(
+                    call.index,
+                    &call.id,
+                    &call.name,
+                    &call.arguments,
+                )]),
+                ..Delta::default()
+            },
         };
         *sent_role = true;
         chunks.push(ChatChunk::new(id, created, model, delta, None));
     }
     chunks
-}
-
-fn scan_events(
-    id: &str,
-    created: i64,
-    model: &str,
-    out: tools::ScanOut,
-    sent_role: &mut bool,
-) -> Vec<Event> {
-    scan_chunks(id, created, model, out, sent_role)
-        .iter()
-        .map(sse_json)
-        .collect()
-}
-
-/// `scan_events` + 생성 텍스트 누적. 토큰 추정의 completion 쪽 입력을 모으기 위한
-/// 것으로, 산문뿐 아니라 도구 호출 이름·인자까지 더합니다 — 그것도 모델이 만든
-/// 토큰이라, 빼면 도구를 쓰는 요청의 출력이 통째로 0 이 됩니다.
-fn scan_events_counting(
-    id: &str,
-    created: i64,
-    model: &str,
-    out: tools::ScanOut,
-    sent_role: &mut bool,
-    generated: &mut String,
-) -> Vec<Event> {
-    generated.push_str(&out.text);
-    for call in &out.calls {
-        generated.push_str(&call.name);
-        generated.push_str(&call.arguments);
-    }
-    scan_events(id, created, model, out, sent_role)
 }
 
 /// 스트리밍 한 건의 로그를 `Drop` 에서 남깁니다.
@@ -581,27 +617,24 @@ struct StreamLog {
     state: Shared,
     ctx: Ctx,
     decoder: StreamDecoder,
+    /// 이 턴의 조립 상태. 답변·추론·도구 호출·종료 사유를 모두 이것이 압니다.
+    turn: Turn,
     first_token: Option<Duration>,
     frames: u32,
-    finish: Option<String>,
-    failure: Option<String>,
     /// FabriX 스트림을 끝까지 읽었는지. false 면 클라이언트가 먼저 끊은 것.
     drained: bool,
-    tool_calls: u32,
-    tool_rejects: u32,
-    /// 실제로 클라이언트에 내보낸 `finish_reason`. 상위가 준 원문(`finish`)과 다를 수
+    /// 실제로 클라이언트에 내보낸 `finish_reason`. 상위가 준 원문과 다를 수
     /// 있고, 그 차이가 로그에 보여야 합니다.
     emitted_finish: Option<&'static str>,
-    /// 도구 호출 인자까지 더한 생성 텍스트 — 토큰 추정의 completion 쪽 입력.
-    generated: String,
     /// 이 스트림에서 계산한 usage. 로그 꼬리 한 줄에 씁니다.
     counted: Option<usage::Counted>,
 }
 
 impl Drop for StreamLog {
     fn drop(&mut self) {
-        let text = self.decoder.text().to_string();
         let aborted = !self.drained;
+        let failure = self.turn.failure().map(str::to_string);
+        let stats = self.turn.tool_stats();
 
         let mut meta: Vec<String> = Vec::new();
         if let Some(first) = self.first_token {
@@ -610,36 +643,39 @@ impl Drop for StreamLog {
         let emitted = self
             .emitted_finish
             .unwrap_or(if aborted { "(없음 · 클라이언트가 끊음)" } else { "stop" });
-        meta.push(match self.finish.as_deref() {
+        meta.push(match self.turn.upstream_finish() {
             // 상위가 준 값이 그대로 안 나갔으면 원문을 함께 적습니다 — 준수와 진단을
             // 동시에 만족시키는 자리입니다.
             Some(raw) if raw != emitted => format!("finish_reason: {emitted} (사내: {raw})"),
             _ => format!("finish_reason: {emitted}"),
         });
         meta.push(format!("SSE {}프레임", self.frames));
-        meta.push(format!("{}자", text.chars().count()));
+        meta.push(format!("{}자", self.turn.raw_content().chars().count()));
         meta.push(match &self.counted {
             Some(counted) => usage::meta_line(counted),
             // include_usage 를 안 켠 스트림은 usage 를 계산하지 않습니다 — 규약대로
             // 청크를 안 보내므로 지어낸 숫자를 로그에만 남길 이유가 없습니다.
             None => "usage 미계산 (stream_options.include_usage 를 켜면 계산합니다)".to_string(),
         });
+        if let Some(line) = reasoning_meta(&self.turn) {
+            meta.push(line);
+        }
         if let Some(line) = tool_meta(
             self.ctx.tools_declared,
             self.ctx.tools_emulated,
-            self.tool_calls,
-            self.tool_rejects,
+            self.ctx.tools_choice_none,
+            &stats,
         ) {
             meta.push(line);
         }
         meta.extend(plan_meta(&self.ctx));
 
-        let note = match (aborted, self.failure.is_some()) {
+        let note = match (aborted, failure.is_some()) {
             (true, _) => Some("클라이언트가 연결을 끊음".to_string()),
             (false, true) => Some("스트리밍 중 끊김".to_string()),
             // 도구를 줬는데 모델이 한 번도 안 썼다 — 실패는 아니지만 눈에 띄어야
             // 합니다. Open Design 같은 클라이언트는 이 경우 조용히 빈손이 됩니다.
-            (false, false) if self.ctx.tools_emulated && self.tool_calls == 0 => {
+            (false, false) if self.ctx.tools_emulated && stats.calls == 0 => {
                 Some("도구 미사용".to_string())
             }
             (false, false) => None,
@@ -647,7 +683,8 @@ impl Drop for StreamLog {
 
         // 받은 답변은 자르지 않고 통째로 담습니다 — 화면이 앞부분만 보여 주고
         // "전체보기" 로 펼치므로, 여기서 자르면 펼칠 뒤가 남지 않습니다.
-        let body = match (&self.failure, text.is_empty()) {
+        let text = log_body(&self.turn);
+        let body = match (&failure, text.is_empty()) {
             (Some(msg), true) => msg.clone(),
             (Some(msg), false) => format!("{text}\n\n[중단] {msg}"),
             (None, true) if aborted => "(클라이언트가 먼저 끊어 받은 내용이 없습니다)".into(),
@@ -669,6 +706,39 @@ impl Drop for StreamLog {
     }
 }
 
+/// 디코더가 낸 이벤트 묶음을 `Turn` 에 먹이고 내보낼 청크들을 만듭니다.
+///
+/// 두 번째 반환값은 상위가 스트림을 끝냈는가(`Done`/`Error`) — 펌프의 종료 조건입니다.
+/// 청크 조립을 함수로 빼서 펌프와 디코더 꼬리가 **같은 코드**를 지나게 합니다.
+fn drive(
+    log: &mut StreamLog,
+    events: Vec<super::fabrix::StreamEvent>,
+    id: &str,
+    created: i64,
+    model: &str,
+    sent_role: &mut bool,
+) -> (Vec<ChatChunk>, bool) {
+    use super::fabrix::StreamEvent;
+
+    let mut chunks = Vec::new();
+    let mut ended = false;
+    for event in events {
+        // 첫 토큰은 본문뿐 아니라 **추론**으로도 시작할 수 있습니다. 예전에는 Delta
+        // 만 셌기 때문에 추론부터 흘리는 모델은 첫 토큰 지연이 로그에 안 남았습니다.
+        if matches!(event, StreamEvent::Delta(_) | StreamEvent::Reasoning(_)) {
+            let started = log.ctx.started;
+            log.first_token.get_or_insert_with(|| started.elapsed());
+        }
+        ended |= matches!(event, StreamEvent::Done | StreamEvent::Error(_));
+        let emit = log.turn.push(event);
+        chunks.extend(emit_chunks(id, created, model, emit, sent_role));
+        if ended {
+            break;
+        }
+    }
+    (chunks, ended)
+}
+
 /// FabriX 스트림을 OpenAI `chat.completion.chunk` SSE 로 옮겨 흘립니다.
 ///
 /// 로그는 스트림이 완전히 끝난 뒤에 남깁니다 — 첫 토큰 지연과 프레임 수를
@@ -686,22 +756,17 @@ fn stream_response(
     let created = state::epoch_secs();
 
     let body = async_stream::stream! {
-        // 이름이 비면 스캐너는 스스로 통과 모드가 됩니다.
-        let mut scanner = ToolCallScanner::new(tool_names, true);
         // 제너레이터가 어떻게 끝나든(완주 · 취소) Drop 에서 로그가 남습니다.
         let mut log = StreamLog {
             state,
             ctx,
             decoder: StreamDecoder::new(),
+            // 이름이 비면 스캐너는 스스로 통과 모드가 됩니다.
+            turn: Turn::new(tool_names, true),
             first_token: None,
             frames: 0,
-            finish: None,
-            failure: None,
             drained: false,
-            tool_calls: 0,
-            tool_rejects: 0,
             emitted_finish: None,
-            generated: String::new(),
             counted: None,
         };
 
@@ -714,120 +779,66 @@ fn stream_response(
         )));
         let mut sent_role = true;
 
-        'pump: loop {
-            let Some(item) = bytes.next().await else { break };
-            let chunk = match item {
-                Ok(chunk) => chunk,
-                Err(err) => {
-                    log.failure = Some(format!("스트림이 끊겼습니다: {err}"));
+        // 펌프와 디코더 꼬리가 **같은 함수**를 지납니다. 예전에는 두 곳에 똑같은
+        // match 가 있어, 한쪽만 고치면 개행 없이 끝난 마지막 프레임에서 조용히
+        // 다르게 동작했습니다.
+        let mut ended = false;
+        while !ended {
+            let events = match bytes.next().await {
+                Some(Ok(chunk)) => {
+                    log.frames += 1;
+                    log.decoder.push(&chunk)
+                }
+                Some(Err(err)) => {
+                    log.turn.mark_failure(format!("스트림이 끊겼습니다: {err}"));
                     break;
                 }
+                None => break,
             };
-            log.frames += 1;
-
-            for event in log.decoder.push(&chunk) {
-                match event {
-                    StreamEvent::Delta(text) => {
-                        let started = log.ctx.started;
-                        log.first_token.get_or_insert_with(|| started.elapsed());
-                        let out = scanner.push(&text);
-                        for event in scan_events_counting(
-                            &id, created, &model, out, &mut sent_role, &mut log.generated,
-                        ) {
-                            yield Ok(event);
-                        }
-                    }
-                    StreamEvent::Reasoning(text) => {
-                        let delta = Delta {
-                            role: (!sent_role).then_some("assistant"),
-                            reasoning_content: Some(text),
-                            ..Delta::default()
-                        };
-                        sent_role = true;
-                        yield Ok(sse_json(&ChatChunk::new(&id, created, &model, delta, None)));
-                    }
-                    StreamEvent::Reset => scanner.reset(),
-                    StreamEvent::Finish(reason) => log.finish = Some(reason),
-                    StreamEvent::Error(msg) => {
-                        log.failure = Some(msg);
-                        break 'pump;
-                    }
-                    StreamEvent::Done => break 'pump,
-                }
+            let (chunks, saw_end) = drive(&mut log, events, &id, created, &model, &mut sent_role);
+            for chunk in chunks {
+                yield Ok::<Event, Infallible>(sse_json(&chunk));
             }
+            ended = saw_end;
         }
 
-        // 개행 없이 끝난 마지막 프레임. 예전에는 `_ => {}` 가 꼬리 Reasoning/Error 를
-        // 통째로 삼켰습니다 — 마지막 도구 호출이 개행 없이 끝나면 그대로 유실됩니다.
-        for event in log.decoder.finish() {
-            match event {
-                StreamEvent::Delta(text) => {
-                    let started = log.ctx.started;
-                    log.first_token.get_or_insert_with(|| started.elapsed());
-                    let out = scanner.push(&text);
-                    for event in scan_events_counting(
-                        &id, created, &model, out, &mut sent_role, &mut log.generated,
-                    ) {
-                        yield Ok(event);
-                    }
-                }
-                StreamEvent::Reasoning(text) => {
-                    let delta = Delta {
-                        role: (!sent_role).then_some("assistant"),
-                        reasoning_content: Some(text),
-                        ..Delta::default()
-                    };
-                    sent_role = true;
-                    yield Ok(sse_json(&ChatChunk::new(&id, created, &model, delta, None)));
-                }
-                StreamEvent::Reset => scanner.reset(),
-                StreamEvent::Finish(reason) => log.finish = Some(reason),
-                StreamEvent::Error(msg) => log.failure = Some(msg),
-                StreamEvent::Done => {}
-            }
+        // 개행 없이 끝난 마지막 프레임.
+        let tail = log.decoder.finish();
+        let (chunks, _) = drive(&mut log, tail, &id, created, &model, &mut sent_role);
+        for chunk in chunks {
+            yield Ok(sse_json(&chunk));
         }
-        // 스캐너가 붙들고 있던 미완성 꼬리를 흘려보냅니다 — 절대 버리지 않습니다.
-        for event in scan_events_counting(
-            &id, created, &model, scanner.finish(), &mut sent_role, &mut log.generated,
-        ) {
-            yield Ok(event);
+        // 분리기와 두 채널 버퍼가 붙들고 있던 꼬리를 흘려보냅니다 — 절대 버리지 않습니다.
+        // `finish_reason` 을 읽기 전에 반드시 여기를 지나야 합니다: 마지막 도구 호출이
+        // 닫는 태그를 만나 완성되는 자리가 여기입니다.
+        let closing = log.turn.finish();
+        for chunk in emit_chunks(&id, created, &model, closing, &mut sent_role) {
+            yield Ok(sse_json(&chunk));
+        }
+        if log.decoder.truncated {
+            log.turn.mark_truncated();
         }
         log.drained = true;
-        log.tool_calls = scanner.call_count();
-        log.tool_rejects = scanner.rejected;
 
-        if let Some(msg) = log.failure.clone() {
+        if let Some(msg) = log.turn.failure().map(str::to_string) {
             yield Ok(sse_json(&ErrorEnvelope::new(msg, openai_type(502), Some("upstream_error".into()))));
-            // 오류 프레임 뒤에도 finish 청크를 넣습니다 — 없으면 종료 사유를 기다리는
-            // 클라이언트가 [DONE] 을 받고도 스트림을 미완으로 남깁니다.
-            log.emitted_finish = Some(MIDSTREAM_FINISH);
-            yield Ok(sse_json(&ChatChunk::new(
-                &id, created, &model, Delta::default(), Some(MIDSTREAM_FINISH.into()),
-            ).with_fingerprint(fingerprint.clone())));
-        } else {
-            // 도구 호출이 하나라도 나왔으면 그 사실이 상위 사유보다 우선합니다 —
-            // 클라이언트는 이 값으로 에이전트 루프를 계속할지 정합니다. 그다음이
-            // 절단(length), 마지막이 상위가 준 사유입니다.
-            let reason = if scanner.saw_call() {
-                "tool_calls"
-            } else {
-                // 상위가 모르는 값을 줬어도 와이어에는 열거값만 나갑니다.
-                clamp_finish_reason(
-                    map_finish_reason(log.finish.as_deref(), log.decoder.truncated).as_deref(),
-                )
-            };
-            log.emitted_finish = Some(reason);
-            yield Ok(sse_json(&ChatChunk::new(
-                &id, created, &model, Delta::default(), Some(reason.into()),
-            ).with_fingerprint(fingerprint.clone())));
         }
+        // 종료 사유는 실패든 아니든 **한 함수**가 정합니다. 오류 프레임 뒤에도 finish
+        // 청크를 넣습니다 — 없으면 종료 사유를 기다리는 클라이언트가 [DONE] 을 받고도
+        // 스트림을 미완으로 남깁니다.
+        let reason = log.turn.finish_reason();
+        log.emitted_finish = Some(reason);
+        yield Ok(sse_json(&ChatChunk::new(
+            &id, created, &model, Delta::default(), Some(reason.into()),
+        ).with_fingerprint(fingerprint.clone())));
+
         // 규약 순서: finish 청크 → usage 청크(choices: []) → [DONE].
         // 클라이언트가 include_usage 로 **명시적으로 옵트인**했을 때만 보냅니다.
         if include_usage {
             let counted = usage::build(
                 log.decoder.upstream_tokens,
                 &log.ctx.prompt_text,
-                &log.generated,
+                &log.turn.completion_text(),
             );
             yield Ok(sse_json(&ChatChunk::usage_only(
                 &id, created, &model, counted.usage.clone(),
@@ -871,67 +882,55 @@ async fn collect_response(
         }
     };
 
-    let parsed = match serde_json::from_str::<Value>(&raw) {
+    // 스트리밍과 **같은 상태 기계**를 태웁니다 — 두 경로가 어긋날 수 없게.
+    let mut turn = Turn::new(tool_names, true);
+
+    // `Turn` 이 알 수 없는 것들 — 상위 응답 봉투에만 있는 표지입니다.
+    let looks_successful;
+    let mut filter_reason = None;
+    let truncated;
+    let upstream_tokens;
+    let mut via_stream_decoder = false;
+
+    match serde_json::from_str::<Value>(&raw) {
         Ok(value) => {
             let chunk = serde_json::from_value::<FabrixChunk>(extract_object(&value))
                 .unwrap_or_default();
             if chunk.looks_like_error() {
                 let err = FabrixError::Upstream { status: 502, message: chunk.error_text() };
                 state.record(ctx.fail(&err));
-                return error_response(
-                    err.status(),
-                    err.envelope(),
-                );
+                return error_response(err.status(), err.envelope());
             }
-            // content 가 비어도 플러그인/RAG 답변이 contentReferences 등에 올 수 있어 폴백합니다.
-            let content = chunk.answer_text().unwrap_or_default();
-            let reasoning = chunk.reasoning_content.clone().filter(|s| !s.is_empty());
-            // 답변이 하나도 없고 필터 차단 사유가 있으면 일반 파싱오류 대신 사유를 노출합니다.
-            if content.is_empty() && reasoning.is_none() {
-                if let Some(reason) = chunk.filter_message() {
-                    let err = FabrixError::Upstream { status: 502, message: reason };
-                    state.record(ctx.fail(&err));
-                    return error_response(
-                        err.status(),
-                        err.envelope(),
-                    );
-                }
-            }
-            Parsed {
-                content,
-                reasoning,
-                truncated: chunk.truncated == Some(true),
-                looks_successful: chunk.looks_successful(),
-                upstream_tokens: chunk.upstream_tokens(),
-                finish: chunk.finish_reason,
-                via_stream_decoder: false,
+            looks_successful = chunk.looks_successful();
+            filter_reason = chunk.filter_message();
+            truncated = chunk.truncated == Some(true);
+            upstream_tokens = chunk.upstream_tokens();
+            // content → contentReferences → eventData 폴백은 이 변환 안에 있습니다.
+            for event in nonstream_events(&chunk) {
+                turn.feed(event);
             }
         }
         // isStream=false 인데 SSE 를 흘려보내는 서버도 있어 한 번 더 시도합니다.
         Err(_) => {
+            via_stream_decoder = true;
             let mut decoder = StreamDecoder::new();
-            decoder.push(raw.as_bytes());
-            decoder.finish();
-            Parsed {
-                content: decoder.text().to_string(),
-                reasoning: Some(decoder.reasoning().to_string()).filter(|s| !s.is_empty()),
-                finish: decoder.finish_reason.clone(),
-                truncated: decoder.truncated,
-                // 스트림 디코더까지 태워 프레임을 읽어 냈다면 응답 자체는 성립했습니다.
-                looks_successful: decoder.finish_reason.is_some(),
-                upstream_tokens: decoder.upstream_tokens,
-                via_stream_decoder: true,
+            let mut events = decoder.push(raw.as_bytes());
+            events.extend(decoder.finish());
+            for event in events {
+                turn.feed(event);
             }
+            // 스트림 디코더까지 태워 프레임을 읽어 냈다면 응답 자체는 성립했습니다.
+            looks_successful = decoder.finish_reason.is_some();
+            truncated = decoder.truncated;
+            upstream_tokens = decoder.upstream_tokens;
         }
-    };
-
-    // 스트리밍과 **같은 상태 기계**를 태웁니다 — 두 경로가 어긋날 수 없게.
-    let scanned = if tool_names.is_empty() {
-        tools::ScanOut::default()
-    } else {
-        tools::parse_all(&parsed.content, &tool_names)
-    };
-    let has_calls = !scanned.calls.is_empty();
+    }
+    if truncated {
+        turn.mark_truncated();
+    }
+    // 붙들려 있던 꼬리를 흘려보냅니다. `is_empty()`·`finish_reason()` 은 이 **뒤에야**
+    // 읽을 수 있습니다 — 마지막 도구 호출이 여기서 완성될 수 있습니다.
+    turn.finish();
 
     // 도구 호출만 있고 산문이 없는 답변은 정상입니다 — 빈 응답으로 502 내면 안 됩니다.
     //
@@ -939,26 +938,27 @@ async fn collect_response(
     // 모델이 짧은 max_tokens 등으로 빈 답을 줄 수 있고, 그걸 502 로 부르면 사내 잘못이
     // 아닌 것을 사내 오류로 보고하는 셈입니다. 아무 표지도 없으면 애초에 우리가 못
     // 알아본 본문이라 502 가 맞습니다.
-    let empty = parsed.content.is_empty() && parsed.reasoning.is_none() && !has_calls;
-    if empty && !parsed.looks_successful {
-        let err = FabrixError::BadPayload(format!("본문 앞부분: {}", logstore::preview(&raw, 200)));
-        state.record(ctx.fail(&err));
-        return error_response(err.status(), err.envelope());
+    if turn.is_empty() {
+        // 답변이 하나도 없고 필터 차단 사유가 있으면 일반 파싱오류 대신 사유를 노출합니다.
+        if let Some(reason) = filter_reason {
+            let err = FabrixError::Upstream { status: 502, message: reason };
+            state.record(ctx.fail(&err));
+            return error_response(err.status(), err.envelope());
+        }
+        if !looks_successful {
+            let err =
+                FabrixError::BadPayload(format!("본문 앞부분: {}", logstore::preview(&raw, 200)));
+            state.record(ctx.fail(&err));
+            return error_response(err.status(), err.envelope());
+        }
     }
 
-    let reason = if has_calls {
-        "tool_calls"
-    } else {
-        // 상위가 모르는 값을 줬어도 와이어에는 열거값만 나갑니다.
-        clamp_finish_reason(
-            map_finish_reason(parsed.finish.as_deref(), parsed.truncated).as_deref(),
-        )
-    };
+    let reason = turn.finish_reason();
     // 비스트림 응답에는 `usage` 를 **항상** 채웁니다 — 규약이 요구하는 필드입니다.
     // 사내가 실측을 주지 않으므로 추정치이고, 추정임은 헤더·로그·README 가 말합니다.
-    let answer_for_usage = completion_text_for_usage(&parsed.content, &scanned);
-    let counted = usage::build(parsed.upstream_tokens, &ctx.prompt_text, &answer_for_usage);
+    let counted = usage::build(upstream_tokens, &ctx.prompt_text, &turn.completion_text());
 
+    let calls = turn.calls();
     let completion = ChatCompletion {
         id: format!("chatcmpl-{}", Uuid::new_v4().simple()),
         object: "chat.completion",
@@ -968,10 +968,10 @@ async fn collect_response(
             index: 0,
             message: AssistantMessage {
                 role: "assistant",
-                content: assistant_content(&scanned.text, &parsed.content, has_calls),
-                reasoning_content: parsed.reasoning.clone(),
-                tool_calls: has_calls
-                    .then(|| scanned.calls.iter().map(ToolCall::from).collect()),
+                content: turn.assistant_content(),
+                reasoning_content: turn.reasoning_field(),
+                tool_calls: (!calls.is_empty())
+                    .then(|| calls.iter().map(ToolCall::from).collect()),
             },
             finish_reason: Some(reason.to_string()),
             logprobs: None,
@@ -980,28 +980,29 @@ async fn collect_response(
         system_fingerprint: fingerprint,
     };
 
+    let stats = turn.tool_stats();
     let mut meta = vec![
-        match parsed.finish.as_deref() {
+        match turn.upstream_finish() {
             Some(raw) if raw != reason => format!("finish_reason: {reason} (사내: {raw})"),
             _ => format!("finish_reason: {reason}"),
         },
-        format!("{}자", parsed.content.chars().count()),
+        format!("{}자", turn.raw_content().chars().count()),
         usage::meta_line(&counted),
     ];
-    if parsed.via_stream_decoder {
+    if via_stream_decoder {
         meta.push("SSE 본문을 합쳐 해석".into());
     }
-    if let Some(line) = tool_meta(
-        ctx.tools_declared,
-        ctx.tools_emulated,
-        scanned.calls.len() as u32,
-        0,
-    ) {
+    if let Some(line) = reasoning_meta(&turn) {
+        meta.push(line);
+    }
+    if let Some(line) =
+        tool_meta(ctx.tools_declared, ctx.tools_emulated, ctx.tools_choice_none, &stats)
+    {
         meta.push(line);
     }
     meta.extend(plan_meta(&ctx));
 
-    let note = (ctx.tools_emulated && !has_calls).then(|| "도구 미사용".to_string());
+    let note = (ctx.tools_emulated && stats.calls == 0).then(|| "도구 미사용".to_string());
 
     state.record(ctx.entry(
         200,
@@ -1009,8 +1010,7 @@ async fn collect_response(
         note,
         ctx.success_summary(),
         // 자르지 않은 전문 — 화면에서 앞부분만 보여 주고 "전체보기" 로 펼칩니다.
-        // 스캐너가 걷어내기 **전** 원문이라 <tool_call> 유무를 눈으로 볼 수 있습니다.
-        parsed.content,
+        log_body(&turn),
         meta.join(" · "),
     ));
 
@@ -1021,50 +1021,18 @@ async fn collect_response(
     response
 }
 
-/// usage 의 completion 쪽 입력 — 산문에 도구 호출 `arguments` 까지 더합니다.
-/// 그것도 모델이 생성한 토큰이라, 빼면 도구를 쓰는 요청의 출력이 통째로 0 이 됩니다.
-fn completion_text_for_usage(content: &str, scanned: &tools::ScanOut) -> String {
-    let mut out = String::from(content);
-    for call in &scanned.calls {
-        out.push_str(&call.name);
-        out.push_str(&call.arguments);
-    }
-    out
-}
-
-struct Parsed {
-    content: String,
-    reasoning: Option<String>,
-    finish: Option<String>,
-    truncated: bool,
-    /// 상위 응답이 성공 표지를 가졌는가 — 빈 답변을 200 으로 볼지 502 로 볼지 가릅니다.
-    looks_successful: bool,
-    /// 사내가 준 토큰 수. 오늘은 항상 `None` 입니다.
-    upstream_tokens: Option<(u32, u32)>,
-    via_stream_decoder: bool,
-}
-
-/// `message.content` 의 null / 빈 문자열 규칙을 한 곳에 못박습니다.
-///
-/// 도구 호출만 있는 턴은 `null` 이 규약입니다. 그 밖에는 빈 문자열이라도 **문자열**
-/// 입니다 — 모델이 정말 빈 답을 준 경우가 `content: ""` 이고, 그걸 null 로 바꾸면
-/// 도구 호출 턴과 구분되지 않습니다.
-fn assistant_content(scanned_text: &str, full_text: &str, has_calls: bool) -> Option<String> {
-    if has_calls {
-        Some(scanned_text.to_string()).filter(|s| !s.trim().is_empty())
-    } else {
-        Some(full_text.to_string())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn stats(calls: u32, in_reasoning: u32, rejected: u32) -> ToolStats {
+        ToolStats { calls, in_reasoning, rejected, ..ToolStats::default() }
+    }
+
     #[test]
     fn tool_meta_stays_silent_for_ordinary_chats() {
-        assert_eq!(tool_meta(0, false, 0, 0), None);
-        assert_eq!(tool_meta(0, true, 0, 0), None);
+        assert_eq!(tool_meta(0, false, false, &stats(0, 0, 0)), None);
+        assert_eq!(tool_meta(0, true, false, &stats(0, 0, 0)), None);
     }
 
     /// 이 두 경우를 구분하는 것이 이 줄의 존재 이유입니다. 지금까지는 도구를 버린
@@ -1072,21 +1040,45 @@ mod tests {
     #[test]
     fn tool_meta_separates_dropped_from_unused() {
         assert_eq!(
-            tool_meta(12, false, 0, 0).unwrap(),
+            tool_meta(12, false, false, &stats(0, 0, 0)).unwrap(),
             "도구 12개 선언 · 에뮬레이션 꺼짐 — 무시함"
         );
         assert_eq!(
-            tool_meta(12, true, 0, 0).unwrap(),
+            tool_meta(12, true, false, &stats(0, 0, 0)).unwrap(),
             "도구 12개 선언 · 호출 0건 — 모델이 규약을 따르지 않음"
         );
-        assert_eq!(tool_meta(12, true, 2, 0).unwrap(), "도구 12개 선언 · 호출 2건");
+        assert_eq!(
+            tool_meta(12, true, false, &stats(2, 0, 0)).unwrap(),
+            "도구 12개 선언 · 호출 2건"
+        );
+    }
+
+    /// 프록시 설정으로 끈 것과 클라이언트가 끈 것은 다음 행동이 다릅니다 —
+    /// 설정을 볼지, 요청을 볼지.
+    #[test]
+    fn tool_meta_names_who_turned_tools_off() {
+        assert_eq!(
+            tool_meta(4, false, true, &stats(0, 0, 0)).unwrap(),
+            "도구 4개 선언 · 클라이언트가 tool_choice: none 으로 껐음"
+        );
     }
 
     #[test]
     fn tool_meta_reports_rejected_blocks() {
-        let line = tool_meta(3, true, 1, 2).unwrap();
+        let line = tool_meta(3, true, false, &stats(1, 0, 2)).unwrap();
         assert!(line.contains("호출 1건"), "{line}");
         assert!(line.contains("형식 오류 2건"), "{line}");
+    }
+
+    /// 이 한 줄이 "추론 단계마다 stop" 수정이 실제로 물었는지를 말해 줍니다.
+    #[test]
+    fn tool_meta_names_the_reasoning_channel() {
+        let line = tool_meta(3, true, false, &stats(3, 2, 0)).unwrap();
+        assert!(line.contains("호출 3건"), "{line}");
+        assert!(line.contains("그중 2건은 추론 채널에서"), "{line}");
+        // 추론에서 안 나왔으면 붙지 않습니다.
+        let quiet = tool_meta(3, true, false, &stats(3, 0, 0)).unwrap();
+        assert!(!quiet.contains("추론"), "{quiet}");
     }
 
     fn ctx_with(plan: validate::Plan, model_defaulted: bool) -> Ctx {
@@ -1104,6 +1096,7 @@ mod tests {
             fabrix_url: String::new(),
             tools_declared: 0,
             tools_emulated: false,
+            tools_choice_none: false,
             plan,
             model_defaulted,
             prompt_text: String::new(),
@@ -1131,42 +1124,57 @@ mod tests {
         assert!(lines[3].contains("래빗홀"), "{}", lines[3]);
     }
 
-    /// 도구 호출만 있는 턴만 `null` 입니다. 빈 답변은 `""` 로 남아야 도구 턴과
-    /// 구분됩니다.
+    // ── 로그 ③ 칸 ──
+
+    /// 추론 채널에서 호출이 나왔을 때 그 원문을 못 보면 "모델이 규약을 안 지켰다"와
+    /// 구별할 방법이 없습니다. 이번 버그가 오래 숨어 있던 이유가 정확히 이것입니다.
     #[test]
-    fn assistant_content_is_null_only_for_tool_only_turns() {
-        assert_eq!(assistant_content("", "", true), None);
-        assert_eq!(assistant_content("   ", "", true), None);
-        assert_eq!(assistant_content("만들겠습니다", "만들겠습니다\n<tool_call>…", true).as_deref(), Some("만들겠습니다"));
-        // 도구가 없으면 빈 문자열도 문자열입니다.
-        assert_eq!(assistant_content("", "", false).as_deref(), Some(""));
-        assert_eq!(assistant_content("", "안녕", false).as_deref(), Some("안녕"));
+    fn log_body_labels_both_channels_only_when_reasoning_exists() {
+        let mut plain = Turn::new(HashSet::new(), true);
+        plain.push(super::super::fabrix::StreamEvent::Delta("답변만".into()));
+        plain.finish();
+        assert_eq!(log_body(&plain), "답변만", "추론이 없으면 머리말을 붙이지 않습니다");
+
+        let mut both = Turn::new(HashSet::new(), true);
+        both.push(super::super::fabrix::StreamEvent::Reasoning(
+            "<tool_call>{\"name\":\"read\"}</tool_call>".into(),
+        ));
+        both.push(super::super::fabrix::StreamEvent::Delta("답변".into()));
+        both.finish();
+        let body = log_body(&both);
+        assert!(body.starts_with("[추론]\n"), "{body}");
+        assert!(body.contains("[답변]\n답변"), "{body}");
+        // 걷어내기 전 원문이라 센티널이 눈에 보입니다.
+        assert!(body.contains("<tool_call>"), "{body}");
     }
 
-    /// 도구 호출 인자도 모델이 생성한 토큰입니다 — 빼면 도구를 쓰는 요청의 출력이
-    /// 통째로 0 이 됩니다.
     #[test]
-    fn usage_counts_tool_call_arguments_as_output() {
-        let scanned = tools::ScanOut {
-            text: "만들겠습니다.".into(),
-            calls: vec![call(0, "write", r#"{"filePath":"index.html"}"#)],
-        };
-        let counted = completion_text_for_usage("만들겠습니다.", &scanned);
-        assert!(counted.contains("만들겠습니다."), "{counted}");
-        assert!(counted.contains("write"), "{counted}");
-        assert!(counted.contains("index.html"), "{counted}");
+    fn reasoning_meta_is_silent_without_reasoning() {
+        let mut t = Turn::new(HashSet::new(), true);
+        t.push(super::super::fabrix::StreamEvent::Delta("답변".into()));
+        t.finish();
+        assert_eq!(reasoning_meta(&t), None);
+    }
 
-        // 도구가 없으면 산문 그대로입니다.
-        assert_eq!(
-            completion_text_for_usage("안녕", &tools::ScanOut::default()),
-            "안녕"
-        );
+    #[test]
+    fn reasoning_meta_reports_think_splitting() {
+        let mut t = Turn::new(HashSet::new(), true);
+        t.push(super::super::fabrix::StreamEvent::Delta("<think>가나다</think>답".into()));
+        t.finish();
+        let line = reasoning_meta(&t).unwrap();
+        assert!(line.contains("추론 3자"), "{line}");
+        assert!(line.contains("<think> 1개 분리"), "{line}");
+
+        let mut unclosed = Turn::new(HashSet::new(), true);
+        unclosed.push(super::super::fabrix::StreamEvent::Delta("<think>끊김".into()));
+        unclosed.finish();
+        assert!(reasoning_meta(&unclosed).unwrap().contains("닫히지 않음"), );
     }
 
     // ── 클라이언트가 실제로 보는 청크 ──
 
-    fn scan(out: tools::ScanOut, sent_role: &mut bool) -> Vec<Value> {
-        scan_chunks("chatcmpl-x", 1, "fabrix-chat-4", out, sent_role)
+    fn emit(pieces: Vec<Piece>, sent_role: &mut bool) -> Vec<Value> {
+        emit_chunks("chatcmpl-x", 1, "fabrix-chat-4", Emit(pieces), sent_role)
             .iter()
             .map(|c| serde_json::to_value(c).unwrap())
             .collect()
@@ -1184,8 +1192,8 @@ mod tests {
     #[test]
     fn text_chunk_carries_the_role_only_once() {
         let mut sent_role = false;
-        let a = scan(tools::ScanOut { text: "안".into(), calls: vec![] }, &mut sent_role);
-        let b = scan(tools::ScanOut { text: "녕".into(), calls: vec![] }, &mut sent_role);
+        let a = emit(vec![Piece::Content("안".into())], &mut sent_role);
+        let b = emit(vec![Piece::Content("녕".into())], &mut sent_role);
         assert_eq!(a[0]["choices"][0]["delta"]["role"], "assistant");
         assert_eq!(a[0]["choices"][0]["delta"]["content"], "안");
         // 두 번째부터는 role 키 자체가 없어야 합니다.
@@ -1199,11 +1207,10 @@ mod tests {
     #[test]
     fn tool_call_chunk_is_self_contained() {
         let mut sent_role = true;
-        let out = tools::ScanOut {
-            text: String::new(),
-            calls: vec![call(0, "write", r#"{"filePath":"a.html"}"#)],
-        };
-        let chunks = scan(out, &mut sent_role);
+        let chunks = emit(
+            vec![Piece::Call(call(0, "write", r#"{"filePath":"a.html"}"#))],
+            &mut sent_role,
+        );
         assert_eq!(chunks.len(), 1);
         let tc = &chunks[0]["choices"][0]["delta"]["tool_calls"][0];
         assert_eq!(tc["index"], 0);
@@ -1216,14 +1223,31 @@ mod tests {
         assert_eq!(chunks[0]["object"], "chat.completion.chunk");
     }
 
+    /// 추론 조각은 `reasoning_content` 로만 나가야 합니다 — `content` 에 섞이면
+    /// 사고 과정이 답변에 새어 나옵니다.
     #[test]
-    fn text_is_emitted_before_tool_calls() {
+    fn reasoning_piece_becomes_a_reasoning_content_delta() {
+        let mut sent_role = true;
+        let chunks = emit(vec![Piece::Reasoning("생각".into())], &mut sent_role);
+        assert_eq!(chunks.len(), 1);
+        let delta = &chunks[0]["choices"][0]["delta"];
+        assert_eq!(delta["reasoning_content"], "생각");
+        assert!(delta.get("content").is_none());
+        assert!(delta.get("tool_calls").is_none());
+    }
+
+    /// `Emit` 의 순서가 곧 클라이언트가 보는 순서입니다.
+    #[test]
+    fn pieces_keep_their_order_within_one_emit() {
         let mut sent_role = false;
-        let out = tools::ScanOut {
-            text: "만들겠습니다.".into(),
-            calls: vec![call(0, "write", "{}"), call(1, "read", "{}")],
-        };
-        let chunks = scan(out, &mut sent_role);
+        let chunks = emit(
+            vec![
+                Piece::Content("만들겠습니다.".into()),
+                Piece::Call(call(0, "write", "{}")),
+                Piece::Call(call(1, "read", "{}")),
+            ],
+            &mut sent_role,
+        );
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks[0]["choices"][0]["delta"]["content"], "만들겠습니다.");
         assert_eq!(chunks[1]["choices"][0]["delta"]["tool_calls"][0]["index"], 0);
@@ -1234,9 +1258,9 @@ mod tests {
     }
 
     #[test]
-    fn empty_scan_emits_nothing() {
+    fn empty_emit_produces_nothing() {
         let mut sent_role = false;
-        assert!(scan(tools::ScanOut::default(), &mut sent_role).is_empty());
+        assert!(emit(Vec::new(), &mut sent_role).is_empty());
         assert!(!sent_role, "빈 출력이 role 을 소비하면 안 됩니다");
     }
 }

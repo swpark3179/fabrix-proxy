@@ -104,7 +104,8 @@ src-tauri/src/
   proxy/fabrix.rs      FabriX 스키마 · SSE 디코더 · 오류 분류 · finish_reason 클램프
   proxy/validate.rs    요청 검증 — 규약 위반을 사내 호출 전에 400 으로
   proxy/usage.rs       토큰 수 정책 (사내 실측 우선 · 없으면 문자 기반 추정)
-  proxy/tools.rs       도구 호출 에뮬레이션 — 규약 주입 · <tool_call> 파스아웃
+  proxy/tools.rs       도구 호출 에뮬레이션 — 규약 주입 · <tool_call> 파스아웃 · <think> 분리
+  proxy/turn.rs        응답 조립 상태 기계 — 스트림·비스트림이 **이것 하나**를 공유
   logstore.rs          최근 50건 링버퍼 (본문은 메모리 전용)
   port.rs              포트 가용성 · 점유 PID 조회 · 빈 포트 추천
   tray.rs windows.rs   트레이 메뉴 · 창 4개 관리 (모델 목록은 처음 열 때 생성)
@@ -211,6 +212,14 @@ OpenAI 가 내보내는 필드를 그대로 맞춥니다 — `choices[].logprobs
 
 비표준이지만 남겨 둔 것이 하나 있습니다 — `message.reasoning_content`. o1 계열 클라이언트가
 읽는 필드이고, 사내 `reasoningContent` 를 버리지 않으려면 실을 자리가 필요합니다.
+본문 `content` 에 `<think>…</think>` 로 섞여 오는 추론도 갈라내 이 필드로 옮깁니다 —
+답변에 사고 과정이 새어 나오면 도구를 쓰든 안 쓰든 결과가 오염됩니다.
+
+스트림과 비스트림은 **같은 상태 기계**(`proxy/turn.rs` 의 `Turn`)를 지납니다. 비스트림 응답도
+스트림과 같은 이벤트 열로 바꿔(`fabrix::nonstream_events`) 같은 경로에 흘려보냅니다.
+`finish_reason` 도 한 함수(`fabrix::decide_finish`)만 정합니다 — 두 경로가 각자 판단하면
+같은 답변이 `stream` 여부에 따라 다른 종료 사유를 받고, 그것이 곧 "한쪽에서만 에이전트
+루프가 끊김" 입니다.
 
 모델 alias는 영문명에서 만듭니다 (`Chat 4` → `fabrix-chat-4`). 영문명이 없으면 UUID 앞 8자리를
 씁니다 (`fabrix-01970a3b`) — 서버가 순서를 바꿔도 alias가 흔들리지 않게 하기 위함입니다.
@@ -243,11 +252,18 @@ FabriX 요청 스키마에는 도구 필드가 **없습니다**. 그래서 `tool
 프롬프트 규약 + 출력 파싱으로 흉내 냅니다. 요청에 `tools` 가 있으면 자동으로 켜지고,
 설정 화면에서 끌 수 있습니다(`toolEmulation`). 도구를 안 쓰는 요청은 아무 영향이 없습니다.
 
-- **나갈 때** — 도구 스키마와 출력 규약을 `systemPrompt` 뒤에 붙입니다. 규약은 영어로
-  씁니다. 감싸는 대상(도구 이름·설명·JSON Schema)이 전부 영어라, 한국어 프레임을 씌우면
-  모델이 센티널을 뱉는 대신 도구를 한국어로 *설명하기* 시작합니다.
+- **나갈 때** — 도구 스키마와 출력 규약을 `systemPrompt` 뒤에 붙이고, **`contents` 꼬리에
+  2~3줄 리마인더**를 한 번 더 넣습니다. 규약은 영어로 씁니다. 감싸는 대상(도구 이름·설명·
+  JSON Schema)이 전부 영어라, 한국어 프레임을 씌우면 모델이 센티널을 뱉는 대신 도구를
+  한국어로 *설명하기* 시작합니다.
+
+  꼬리 리마인더가 필요한 이유: FabriX 엔 롤 구조가 없어 모든 것이 한 덩어리로 접히고,
+  모델이 **마지막으로 읽는 글**은 트랜스크립트 꼬리입니다. OpenCode 같은 클라이언트의
+  시스템 프롬프트는 수천 토큰이고 도구를 "네이티브 기능" 으로 설명하므로, 우리 규약 블록은
+  저 앞으로 밀려납니다. 꼬리에는 **형식만** 다시 적습니다 — 규약 전문을 두 번 실으면
+  토큰이 두 배로 들고, 같은 글이 두 번 나오면 모델이 둘째 것을 예시로 오독합니다.
 - **들어올 때** — 답변에서 아래 블록을 걷어내 OpenAI `tool_calls` 로 조립하고,
-  `finish_reason` 을 `tool_calls` 로 바꿉니다.
+  `finish_reason` 을 `tool_calls` 로 바꿉니다. **본문과 추론 양쪽**을 훑습니다 (아래 참고).
 
 ```
 <tool_call>
@@ -262,9 +278,26 @@ FabriX 요청 스키마에는 도구 필드가 **없습니다**. 그래서 `tool
 중요한 것은 이름이 그 요청에 선언된 도구 집합에 있는지입니다. JSON 파싱 실패, 닫히지 않은
 블록, 2MiB 초과도 같은 길로 흘러갑니다 — 어떤 경우에도 버리지 않습니다.
 
+**센티널은 본문뿐 아니라 추론 채널에서도 걷어냅니다.** 사내 모델이 추론형이면 `<tool_call>`
+을 `reasoningContent` 에 실어 보내거나 본문 안 `<think>` 블록에 넣습니다. 예전에는 추론
+채널이 스캐너를 우회해서 그런 호출이 **한 건도** 잡히지 않았고, 그러면 `finish_reason` 이
+언제나 `stop` 이라 OpenCode 같은 에이전트가 **한 스텝 만에 턴을 끝냈습니다**("추론 단계마다
+멈춘다"는 증상이 정확히 이 경로였습니다).
+
+- 채널마다 버퍼를 따로 두어, 한쪽의 미완성 센티널 꼬리가 다른 쪽 텍스트에 이어 붙지 않습니다.
+- `index` 는 채널을 가로질러 **하나의 수열**입니다. 채널별로 세면 본문의 첫 호출과 추론의
+  첫 호출이 둘 다 `index: 0` 을 받아, 클라이언트가 서로 다른 두 호출을 한 호출의 조각으로
+  이어 붙입니다.
+- 걷어낸 산문은 원래 채널로 돌아갑니다 — 추론 산문은 `delta.reasoning_content` 로,
+  본문 산문은 `delta.content` 로.
+
 > 이 방식은 **모델이 형식을 지켜 줘야** 동작합니다. 지키지 않으면 로그 ③ 칸 꼬리에
 > `호출 0건 — 모델이 규약을 따르지 않음` 이 남습니다. ③ 칸은 파서가 걷어내기 **전** 원문이라
-> `<tool_call>` 이 실제로 있었는지 눈으로 확인할 수 있습니다.
+> `<tool_call>` 이 실제로 있었는지 눈으로 확인할 수 있습니다 — 추론이 있으면 `[추론]` /
+> `[답변]` 두 칸으로 나눠 담으므로 **어느 채널에** 있었는지도 보입니다.
+> 호출이 잡혔다면 꼬리에 `호출 3건 · 그중 2건은 추론 채널에서` 처럼 출처가 적힙니다.
+> 도구를 껐다면 누가 껐는지도 구분해 적습니다 — 설정(`toolEmulation`)인지,
+> 클라이언트의 `tool_choice: "none"` 인지.
 
 ### 오류 매핑
 
@@ -383,6 +416,15 @@ MOCK_TOOLCALL=parallel MOCK_STREAM=cumulative npm run mock
 MOCK_TOOLCALL=malformed npm run mock                 # 텍스트로 되돌아와야 함
 ```
 
+**추론 채널로 오는 호출**은 `MOCK_REASONING` 으로 재현합니다. 이 조합이 "추론 단계마다
+`stop` 으로 끝난다"는 실패를 그대로 만들어 냅니다 — 고쳐진 프록시는 `tool_calls` 를 내야 합니다.
+
+```bash
+MOCK_TOOLCALL=single MOCK_REASONING=field MOCK_CHUNK=1 npm run mock   # reasoningContent 로
+MOCK_TOOLCALL=single MOCK_REASONING=think MOCK_CHUNK=1 npm run mock   # 본문 안 <think> 로
+MOCK_ECHO=1 npm run mock    # 꼬리 리마인더가 실려 나갔는지 ② 칸에서 확인
+```
+
 ```bash
 curl http://127.0.0.1:8787/v1/chat/completions \
   -H "Content-Type: application/json" -H "Authorization: Bearer anything" \
@@ -394,6 +436,8 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 ```
 
 `delta.tool_calls` 와 마지막 청크의 `finish_reason: "tool_calls"` 가 보이면 정상입니다.
+`MOCK_REASONING=field` 로 띄운 목업에도 **같은 결과**가 나와야 합니다 — 다르면 추론 채널이
+다시 스캐너를 우회하고 있다는 뜻입니다.
 
 실제 통합 경계는 그 위입니다 — OpenCode 를 프록시에 직접 물려 **빈 폴더에 파일이
 생기는지** 보는 것이 UI 전체를 띄우는 것보다 훨씬 빠릅니다.
@@ -430,6 +474,10 @@ ls /tmp/odtest
 
 - **SSE 프레임 형태** — `data:` 접두 유무, 종료 센티널. 현재는 양쪽 모두 처리합니다.
 - **`content` 가 누적인지 증분인지** — 두 번째 프레임에서 자동 판별하고 그 모드로 고정합니다.
+- **추론(`reasoningContent`)이 누적인지 증분인지** — 지금은 **증분으로만** 다룹니다.
+  목업도 `MOCK_STREAM=cumulative` 를 본문에만 적용합니다. 확인 안 된 모양을 목업이 흉내
+  내면 프록시의 진짜 결함과 목업의 상상이 구별되지 않기 때문입니다. 사내가 추론도 누적으로
+  준다면 추론 텍스트가 중복되므로, 샘플을 받으면 여기를 가장 먼저 확인해야 합니다.
 - **`repetion_penalty` · `tok_k`** — 스펙 문서의 철자 그대로 보냅니다(오타로 보이지만 서버가
   기대하는 키일 가능성이 높음). 다르면 `src-tauri/src/proxy/fabrix.rs` 의 `LlmConfig` 에서
   `rename` 두 줄만 고치면 됩니다.

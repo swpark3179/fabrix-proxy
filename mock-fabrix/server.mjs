@@ -17,6 +17,15 @@
 //                           malformed/unknown/fenced 는 원문 텍스트로 되돌아와야 합니다.
 //   MOCK_CHUNK=7            프레임당 글자 수. 3 이나 1 로 낮추면 <tool_call> 센티널이
 //                           여러 프레임에 걸쳐 쪼개집니다 — 파서가 깨지는 지점.
+//   MOCK_REASONING=field|think
+//                           답변을 **추론 쪽**으로 흘립니다. 사내 추론 모델이 센티널을
+//                           추론에 실어 보내는 상황을 재현합니다 — 프록시가 추론 채널을
+//                           스캔하지 않으면 호출이 영구히 0건이고 finish_reason 이 영구히
+//                           stop 이라, 에이전트가 한 스텝 만에 멈춥니다.
+//                            field = reasoningContent / reasoning_content 필드로 보냄
+//                            think = 본문 content 안에 <think>…</think> 로 감싸 보냄
+//                           MOCK_TOOLCALL 과 함께 쓰세요:
+//                            MOCK_TOOLCALL=single MOCK_REASONING=field MOCK_CHUNK=1
 //   MOCK_SPLITBYTES=1       SSE 한 줄을 임의 바이트 지점에서 두 번에 나눠 write
 //   MOCK_NOSTREAM=llm|rag|filter   비스트림 응답 형태 (기본 llm)
 //                            llm    = content 에 답변
@@ -120,6 +129,25 @@ const ECHO = process.env.MOCK_ECHO === '1'
 const USAGE = process.env.MOCK_USAGE === '1'
 const EMPTY = process.env.MOCK_EMPTY === '1'
 const FINISH = process.env.MOCK_FINISH ?? ''
+const REASONING = ['field', 'think'].includes(process.env.MOCK_REASONING)
+  ? process.env.MOCK_REASONING
+  : ''
+
+/**
+ * 답변을 (본문, 추론) 두 채널로 나눕니다. MOCK_REASONING 이 이 분배를 정합니다.
+ *
+ * 기본은 전부 본문 — 지금까지 목업이 할 수 있던 유일한 모양이고, 그래서 "추론 쪽에
+ * 센티널이 실린다" 는 실제 실패를 재현할 수단이 없었습니다.
+ */
+function channels(answer) {
+  if (!REASONING || !answer) return { content: answer, reasoning: '' }
+  if (REASONING === 'field') {
+    // 센티널을 추론 채널에만 싣습니다. 프록시가 추론을 스캔해야 호출이 잡힙니다.
+    return { content: '확인했습니다.', reasoning: answer }
+  }
+  // think — 본문 안에 태그로 감쌉니다. 프록시가 갈라내야 답변이 오염되지 않습니다.
+  return { content: `<think>${answer}</think>확인했습니다.`, reasoning: '' }
+}
 
 /** 프록시가 실제로 보낸 것을 답변으로 되돌려줍니다 — fold 결과를 눈으로 보는 용도. */
 function echoBody(body) {
@@ -237,6 +265,10 @@ async function handleMessages(req, res) {
 
   // 답변 본문. MOCK_EMPTY 는 빈 문자열(성공 표지는 그대로), MOCK_ECHO 는 받은 payload.
   const answer = EMPTY ? '' : ECHO ? echoBody(body) : BODY
+  // ECHO 는 받은 payload 를 그대로 보여 주는 용도라 채널을 나누지 않습니다.
+  const { content: answerContent, reasoning: answerReasoning } = ECHO
+    ? { content: answer, reasoning: '' }
+    : channels(answer)
 
   if (!body.isStream) {
     // 실제 FabriX 비스트림 응답 스키마를 재현합니다(mock 이 그동안 흉내 내지 않던 필드 포함).
@@ -256,8 +288,8 @@ async function handleMessages(req, res) {
     return json(res, 200, {
       userId: '00000000-0000-0000-0000-000000000000',
       modelType,
-      content: isRag || isFilter ? null : answer,
-      reasoningContent: null,
+      content: isRag || isFilter ? null : answerContent,
+      reasoningContent: isRag || isFilter ? null : answerReasoning || null,
       processingContent: [],
       contentReferences: isRag
         ? [{ plugin: 'RAG', answer: BODY, references: [], argumented_standalone_queries: '' }]
@@ -290,8 +322,15 @@ async function handleMessages(req, res) {
 
   // 의도적으로 한글 경계를 무시하고 잘라, 멀티바이트가 청크 경계에 걸리게 합니다.
   // MOCK_CHUNK 를 낮추면 <tool_call> 센티널도 여러 프레임에 걸쳐 쪼개집니다.
+  //
+  // 추론을 먼저 흘리고 그다음 본문 — 실제 추론 모델의 순서입니다. 각 조각은 자기
+  // 채널의 키(`reasoning_content` / `content`)로 나갑니다.
   const pieces = []
-  for (let i = 0; i < answer.length; i += CHUNK) pieces.push(answer.slice(i, i + CHUNK))
+  const cutInto = (text, key) => {
+    for (let i = 0; i < text.length; i += CHUNK) pieces.push({ key, text: text.slice(i, i + CHUNK) })
+  }
+  cutInto(answerReasoning, 'reasoningContent')
+  cutInto(answerContent, 'content')
 
   const send = (obj) => {
     const line = JSON.stringify(obj)
@@ -334,8 +373,14 @@ async function handleMessages(req, res) {
       return
     }
 
-    sent += pieces[index]
-    send(shape({ modelType, content: MODE === 'cumulative' ? sent : pieces[index] }))
+    const piece = pieces[index]
+    if (piece.key === 'content') sent += piece.text
+    // MOCK_STREAM=cumulative 는 **본문에만** 적용합니다. 추론은 언제나 증분입니다 —
+    // 사내가 추론도 누적으로 주는지 확인된 바 없고, 확인 안 된 모양을 목업이 흉내 내면
+    // 프록시의 진짜 결함과 목업의 상상이 구별되지 않습니다. 실서버 샘플이 오면 정합니다.
+    const value =
+      piece.key === 'content' && MODE === 'cumulative' ? sent : piece.text
+    send(shape({ modelType, [piece.key]: value }))
     index += 1
     setTimeout(tick, DELAY)
   }
@@ -410,6 +455,9 @@ const server = createServer((req, res) => {
 
 server.listen(PORT, '127.0.0.1', () => {
   log(`http://127.0.0.1:${PORT}`)
-  log(`표기 ${CASE} · content ${MODE}${RAW ? ' · raw(개행 구분)' : ' · SSE(data:)'}${FAIL ? ` · FAIL=${FAIL}` : ''}`)
+  log(
+    `표기 ${CASE} · content ${MODE}${RAW ? ' · raw(개행 구분)' : ' · SSE(data:)'}` +
+      `${REASONING ? ` · 추론=${REASONING}` : ''}${FAIL ? ` · FAIL=${FAIL}` : ''}`,
+  )
   log('프록시 온보딩에 이 주소를 넣고, 인증키/토큰은 아무 값이나 채우세요.')
 })
