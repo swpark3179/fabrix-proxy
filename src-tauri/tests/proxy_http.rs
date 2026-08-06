@@ -24,22 +24,80 @@ use fabrix_proxy_lib::state::{AppState, Shared};
 // ─────────────────────────── 가짜 사내 서버 ───────────────────────────
 
 /// 상위가 어떻게 답할지 — 테스트마다 갈아 끼웁니다.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct Upstream {
-    /// 비스트림·스트림 모두에서 답변으로 쓸 텍스트.
+    /// 비스트림·스트림 모두에서 답변으로 쓸 텍스트(`content` 채널).
     answer: String,
+    /// 추론 채널(`reasoningContent` / 스트림 `reasoning_content`)로 흘릴 텍스트.
+    ///
+    /// 사내 추론 모델이 센티널을 이쪽에 실어 보내는 것이 "추론 단계마다 stop" 의
+    /// 원인이었습니다. 그 경로를 재현할 수단이 여태 없었습니다.
+    reasoning: String,
     /// 마지막 프레임의 `finishReason`. `None` 이면 비스트림은 `null`, 스트림은 `"stop"`.
     finish: Option<String>,
     /// 상위가 토큰 수를 준 경우 `(input, output)`.
     tokens: Option<(u32, u32)>,
     /// 답변을 비우되 성공 표지는 남깁니다.
     empty: bool,
+    /// SSE 한 프레임에 담을 글자 수. 낮추면 센티널 한가운데가 갈립니다.
+    chunk: usize,
+    /// 답변을 흘리다 오류 프레임을 끼워 넣고 끊습니다.
+    fail_midstream: bool,
+    /// `isStream=false` 요청에도 SSE 로 답합니다 — 프록시의 폴백 경로를 태웁니다.
+    sse_always: bool,
+    /// 프록시가 실제로 보낸 payload 들 — 꼬리 리마인더 검증용.
+    seen: Vec<Value>,
+}
+
+impl Default for Upstream {
+    fn default() -> Self {
+        Self {
+            answer: String::new(),
+            reasoning: String::new(),
+            finish: None,
+            tokens: None,
+            empty: false,
+            chunk: 5,
+            fail_midstream: false,
+            sse_always: false,
+            seen: Vec::new(),
+        }
+    }
 }
 
 impl Upstream {
     fn answering(text: &str) -> Self {
         Self { answer: text.into(), ..Default::default() }
     }
+
+    /// 답변을 **추론 채널로만** 흘리는 상위. 이번 버그의 실제 모양입니다.
+    fn reasoning_only(text: &str) -> Self {
+        Self { reasoning: text.into(), ..Default::default() }
+    }
+}
+
+/// `write` 도구 한 건을 부르는 센티널 블록.
+fn sentinel() -> String {
+    format!(
+        "<tool_call>{}</tool_call>",
+        json!({ "name": "write", "arguments": { "filePath": "index.html" } })
+    )
+}
+
+/// `tools` 를 실은 요청 본문.
+fn with_write_tool(mut body: Value) -> Value {
+    body["tools"] = json!([{
+        "type": "function",
+        "function": {
+            "name": "write",
+            "description": "Write a file",
+            "parameters": {
+                "type": "object",
+                "properties": { "filePath": { "type": "string" } },
+            },
+        },
+    }]);
+    body
 }
 
 const MODEL_UUID: &str = "0196f1fc-2858-70a9-a232-74dbddb971d0";
@@ -72,13 +130,19 @@ async fn upstream_messages(
 ) -> Response {
     let req: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
     let stream = req.get("isStream").and_then(Value::as_bool).unwrap_or(false);
-    let up = up.lock().unwrap().clone();
+    let up = {
+        let mut guard = up.lock().unwrap();
+        guard.seen.push(req);
+        guard.clone()
+    };
     let answer = if up.empty { String::new() } else { up.answer.clone() };
+    let reasoning = if up.empty { String::new() } else { up.reasoning.clone() };
 
-    if !stream {
+    if !stream && !up.sse_always {
         let mut payload = json!({
             "modelType": "Chat 4",
             "content": answer,
+            "reasoningContent": reasoning,
             "truncated": false,
             "finishReason": up.finish,
             "status": "SUCCESS",
@@ -91,24 +155,44 @@ async fn upstream_messages(
         return Json(payload).into_response();
     }
 
-    // SSE — 답변을 몇 조각으로 쪼개 흘린 뒤 종료 프레임과 [DONE].
+    // SSE — 추론을 먼저, 그다음 본문을 조각으로 흘린 뒤 종료 프레임과 [DONE].
     let mut out = String::new();
-    let chars: Vec<char> = answer.chars().collect();
-    for piece in chars.chunks(5) {
-        let text: String = piece.iter().collect();
-        out.push_str(&format!("data: {}\n\n", json!({ "content": text })));
+    let mut frames = 0usize;
+    let chunk = up.chunk.max(1);
+
+    let push_frames = |out: &mut String, frames: &mut usize, text: &str, key: &str| -> bool {
+        let chars: Vec<char> = text.chars().collect();
+        for piece in chars.chunks(chunk) {
+            if up.fail_midstream && *frames == 2 {
+                let err = json!({ "status": "ERROR", "event_data": "사내 처리 중 오류(모의)" });
+                out.push_str(&format!("data: {err}\n\n"));
+                return false;
+            }
+            let body: String = piece.iter().collect();
+            out.push_str(&format!("data: {}\n\n", json!({ key: body })));
+            *frames += 1;
+        }
+        true
+    };
+
+    let mut alive = push_frames(&mut out, &mut frames, &reasoning, "reasoning_content");
+    if alive {
+        alive = push_frames(&mut out, &mut frames, &answer, "content");
     }
-    let mut last = json!({
-        "content": "",
-        "finish_reason": up.finish.clone().unwrap_or_else(|| "stop".into()),
-        "status": "SUCCESS",
-    });
-    if let Some((input, output)) = up.tokens {
-        last["input_tokens"] = json!(input);
-        last["output_tokens"] = json!(output);
+
+    if alive {
+        let mut last = json!({
+            "content": "",
+            "finish_reason": up.finish.clone().unwrap_or_else(|| "stop".into()),
+            "status": "SUCCESS",
+        });
+        if let Some((input, output)) = up.tokens {
+            last["input_tokens"] = json!(input);
+            last["output_tokens"] = json!(output);
+        }
+        out.push_str(&format!("data: {last}\n\n"));
+        out.push_str("data: [DONE]\n\n");
     }
-    out.push_str(&format!("data: {last}\n\n"));
-    out.push_str("data: [DONE]\n\n");
 
     ([("content-type", "text/event-stream")], out).into_response()
 }
@@ -437,6 +521,405 @@ async fn tool_calls_survive_the_new_stream_prologue() {
         .next_back()
         .unwrap();
     assert_eq!(finish, "tool_calls");
+}
+
+// ────────────── 2b. 추론 채널 도구 호출 (「추론 단계마다 stop」 회귀) ──────────────
+//
+// 예전 프록시는 `StreamEvent::Reasoning` 을 스캐너에 태우지 않고 곧바로
+// `reasoning_content` 델타로 내보냈고, 비스트림 경로도 `content` 만 훑었습니다.
+// 그래서 사내 추론 모델이 센티널을 추론 쪽에 실으면 호출이 **영구히 0건**이고
+// `finish_reason` 이 **영구히 stop** 이었습니다. opencode 는 그 값을 보고 한 스텝
+// 만에 루프를 끝냅니다 — 사용자가 본 증상이 정확히 이것입니다.
+
+/// 모든 델타 청크에서 한 필드를 모아 잇습니다.
+fn joined_delta(chunks: &[Value], field: &str) -> String {
+    chunks
+        .iter()
+        .filter_map(|c| c["choices"][0]["delta"][field].as_str())
+        .collect()
+}
+
+fn last_finish(chunks: &[Value]) -> &str {
+    chunks
+        .iter()
+        .filter_map(|c| c["choices"][0]["finish_reason"].as_str())
+        .next_back()
+        .expect("finish 청크가 있어야 합니다")
+}
+
+async fn stream_chunks(base: &str, body: Value) -> Vec<Value> {
+    let text = client()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    frames(&text).iter().filter_map(|f| serde_json::from_str(f).ok()).collect()
+}
+
+/// **이 테스트가 이번 작업의 합격 기준입니다.**
+#[tokio::test]
+async fn tool_call_only_in_reasoning_content_finishes_as_tool_calls() {
+    let answer = format!("먼저 파일을 써야겠다.{}", sentinel());
+    let (base, _state, _up) = harness(Upstream::reasoning_only(&answer)).await;
+
+    let chunks = stream_chunks(
+        &base,
+        with_write_tool(json!({
+            "model": "fabrix-chat-4", "stream": true,
+            "messages": [{ "role": "user", "content": "페이지 만들어줘" }],
+        })),
+    )
+    .await;
+
+    let call = chunks
+        .iter()
+        .find_map(|c| c["choices"][0]["delta"]["tool_calls"].as_array())
+        .expect("추론 채널의 도구 호출을 놓쳤습니다")[0]
+        .clone();
+    assert_eq!(call["index"], 0);
+    assert!(call["id"].as_str().unwrap().starts_with("call_"));
+    assert_eq!(call["type"], "function");
+    assert_eq!(call["function"]["name"], "write");
+    assert!(call["function"]["arguments"].as_str().unwrap().contains("index.html"));
+
+    assert_eq!(last_finish(&chunks), "tool_calls");
+
+    // 추론 산문은 살아 있고, 센티널은 그 안에 남아 있지 않아야 합니다.
+    let reasoning = joined_delta(&chunks, "reasoning_content");
+    assert_eq!(reasoning, "먼저 파일을 써야겠다.");
+    assert!(!reasoning.contains("tool_call"), "센티널이 추론 텍스트로 새어 나갔습니다");
+}
+
+#[tokio::test]
+async fn non_stream_tool_call_in_reasoning_content_finishes_as_tool_calls() {
+    let answer = format!("써야겠다.{}", sentinel());
+    let (base, _state, _up) = harness(Upstream::reasoning_only(&answer)).await;
+
+    let (status, body) = chat(
+        &base,
+        with_write_tool(json!({
+            "model": "fabrix-chat-4",
+            "messages": [{ "role": "user", "content": "페이지 만들어줘" }],
+        })),
+    )
+    .await;
+
+    assert_eq!(status, 200, "{body}");
+    let choice = &body["choices"][0];
+    assert_eq!(choice["finish_reason"], "tool_calls");
+    let calls = choice["message"]["tool_calls"].as_array().expect("tool_calls 가 없습니다");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["function"]["name"], "write");
+    // 도구 호출만 있는 턴의 content 는 null 이 규약입니다.
+    assert!(choice["message"]["content"].is_null(), "{choice}");
+    let reasoning = choice["message"]["reasoning_content"].as_str().unwrap();
+    assert_eq!(reasoning, "써야겠다.");
+    assert!(!reasoning.contains("tool_call"));
+}
+
+/// 파서가 깨지는 곳은 거의 언제나 프레임 경계입니다 — 추론 채널도 마찬가지여야 합니다.
+#[tokio::test]
+async fn reasoning_frames_split_mid_sentinel_still_yield_one_call() {
+    let answer = format!("생각.{}", sentinel());
+    let mut up = Upstream::reasoning_only(&answer);
+    up.chunk = 3; // 센티널 한가운데가 갈립니다 (목업의 MOCK_CHUNK=3 과 같은 상황)
+    let (base, _state, _up) = harness(up).await;
+
+    let chunks = stream_chunks(
+        &base,
+        with_write_tool(json!({
+            "model": "fabrix-chat-4", "stream": true,
+            "messages": [{ "role": "user", "content": "만들어줘" }],
+        })),
+    )
+    .await;
+
+    let calls: Vec<&Value> = chunks
+        .iter()
+        .filter_map(|c| c["choices"][0]["delta"]["tool_calls"].as_array())
+        .flatten()
+        .collect();
+    assert_eq!(calls.len(), 1, "프레임 경계에서 호출이 쪼개졌습니다: {calls:?}");
+    assert_eq!(calls[0]["function"]["name"], "write");
+    assert_eq!(last_finish(&chunks), "tool_calls");
+    assert!(!joined_delta(&chunks, "reasoning_content").contains("tool_call"));
+}
+
+/// 본문에 섞여 온 `<think>` 는 추론으로 갈라내고, 그 안의 호출도 잡습니다.
+#[tokio::test]
+async fn think_tags_are_split_into_reasoning_content() {
+    let answer = format!("<think>써야겠다{}</think>만들었습니다.", sentinel());
+    let (base, _state, _up) = harness(Upstream::answering(&answer)).await;
+
+    let chunks = stream_chunks(
+        &base,
+        with_write_tool(json!({
+            "model": "fabrix-chat-4", "stream": true,
+            "messages": [{ "role": "user", "content": "만들어줘" }],
+        })),
+    )
+    .await;
+
+    let content = joined_delta(&chunks, "content");
+    assert_eq!(content, "만들었습니다.");
+    assert!(!content.contains("<think>"), "<think> 가 답변으로 새어 나갔습니다: {content}");
+    assert_eq!(joined_delta(&chunks, "reasoning_content"), "써야겠다");
+    assert_eq!(last_finish(&chunks), "tool_calls");
+}
+
+#[tokio::test]
+async fn non_stream_think_tags_are_split_into_reasoning_content() {
+    let (base, _state, _up) =
+        harness(Upstream::answering("<think>고민했다</think>답입니다.")).await;
+
+    let (status, body) = chat(
+        &base,
+        json!({
+            "model": "fabrix-chat-4",
+            "messages": [{ "role": "user", "content": "hi" }],
+        }),
+    )
+    .await;
+
+    assert_eq!(status, 200, "{body}");
+    let message = &body["choices"][0]["message"];
+    assert_eq!(message["content"], "답입니다.");
+    assert_eq!(message["reasoning_content"], "고민했다");
+    assert_eq!(body["choices"][0]["finish_reason"], "stop");
+}
+
+/// 스트림이 끊겼어도 이미 완성된 호출은 살려야 합니다. 예전에는 무조건 `length` 라
+/// 뽑아 놓은 호출이 사장되고 에이전트 루프가 끊겼습니다.
+#[tokio::test]
+async fn midstream_error_after_a_complete_tool_call_finishes_as_tool_calls() {
+    // chunk 를 넉넉히 잡아 센티널이 오류 프레임 전에 완성되게 합니다.
+    let mut up = Upstream::answering(&sentinel());
+    up.chunk = 4096;
+    up.fail_midstream = true;
+    let (base, _state, _up) = harness(up).await;
+
+    let chunks = stream_chunks(
+        &base,
+        with_write_tool(json!({
+            "model": "fabrix-chat-4", "stream": true,
+            "messages": [{ "role": "user", "content": "만들어줘" }],
+        })),
+    )
+    .await;
+
+    assert!(
+        chunks.iter().any(|c| c["choices"][0]["delta"]["tool_calls"].is_array()),
+        "완성된 호출이 사라졌습니다: {chunks:?}"
+    );
+    assert_eq!(last_finish(&chunks), "tool_calls");
+}
+
+/// 규약 리마인더가 실제로 사내 `contents` 꼬리에 실려 나가야 합니다 — 규약이
+/// systemPrompt 앞머리에만 있으면 모델이 마지막에 읽는 자리에 없습니다.
+#[tokio::test]
+async fn tail_reminder_reaches_the_upstream_contents() {
+    let (base, _state, up) = harness(Upstream::answering("네")).await;
+
+    let (status, _) = chat(
+        &base,
+        with_write_tool(json!({
+            "model": "fabrix-chat-4",
+            "messages": [{ "role": "user", "content": "만들어줘" }],
+        })),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let payload = up.lock().unwrap().seen.last().cloned().expect("payload 를 못 봤습니다");
+    let contents = payload["contents"].as_array().unwrap();
+    let tail = contents.last().unwrap().as_str().unwrap();
+    assert!(tail.contains("# Reminder"), "꼬리 리마인더가 없습니다: {tail}");
+    assert!(tail.contains("<tool_call>"), "{tail}");
+    // 규약 전문은 systemPrompt 에만 — 꼬리에 두 번 싣지 않습니다.
+    assert!(payload["systemPrompt"].as_str().unwrap().contains("# Tool calling"));
+    assert!(!tail.contains("# Tool calling"), "규약 전문이 두 번 실렸습니다");
+}
+
+/// 벤더 샘플과 같은 대화가 **턴 배열**로 나가야 합니다. 예전에는
+/// `["User: …\n\nAssistant: …\n\nUser: …"]` 한 덩어리였습니다.
+#[tokio::test]
+async fn multi_turn_reaches_the_upstream_as_one_element_per_turn() {
+    let (base, _state, up) = harness(Upstream::answering("네")).await;
+
+    let (status, _) = chat(
+        &base,
+        json!({
+            "model": "fabrix-chat-4",
+            "messages": [
+                { "role": "user", "content": "안녕하세요?" },
+                { "role": "assistant", "content": "네 안녕하세요" },
+                { "role": "user", "content": "내 이름은 LCY인데 너 이름은 뭐니?" },
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let payload = up.lock().unwrap().seen.last().cloned().unwrap();
+    assert_eq!(
+        payload["contents"],
+        json!(["안녕하세요?", "네 안녕하세요", "내 이름은 LCY인데 너 이름은 뭐니?"]),
+        "{payload}"
+    );
+}
+
+/// 도구 왕복 한 바퀴가 `[user, assistant, user]` 로 접히고, 리마인더가 **user 자리**에
+/// 붙어야 합니다 — assistant 자리에 들어가면 지시문이 모델 자신의 발화가 됩니다.
+#[tokio::test]
+async fn a_tool_round_trip_keeps_alternation_and_the_reminder_in_a_user_slot() {
+    let (base, _state, up) = harness(Upstream::answering("네")).await;
+
+    let (status, _) = chat(
+        &base,
+        with_write_tool(json!({
+            "model": "fabrix-chat-4",
+            "messages": [
+                { "role": "user", "content": "페이지 만들어줘" },
+                { "role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_a1", "type": "function",
+                    "function": { "name": "write", "arguments": "{\"filePath\":\"a.html\"}" },
+                }]},
+                { "role": "tool", "tool_call_id": "call_a1", "content": "wrote 12 bytes" },
+            ],
+        })),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let payload = up.lock().unwrap().seen.last().cloned().unwrap();
+    let contents = payload["contents"].as_array().unwrap();
+    assert_eq!(contents.len(), 3, "{payload}");
+    assert_eq!(contents[0], "페이지 만들어줘");
+    assert!(contents[1].as_str().unwrap().contains("<tool_call>"), "{payload}");
+    let last = contents[2].as_str().unwrap();
+    assert!(last.contains("wrote 12 bytes"), "{last}");
+    // 리마인더는 도구 결과와 같은 user 원소에 붙습니다.
+    assert!(last.contains("# Reminder"), "리마인더가 user 자리에 없습니다: {last}");
+    assert!(!contents[1].as_str().unwrap().contains("# Reminder"), "{payload}");
+}
+
+/// 마지막 메시지가 assistant 면 리마인더는 **새 user 원소**로 나가야 합니다.
+#[tokio::test]
+async fn the_reminder_becomes_its_own_user_turn_after_an_assistant_message() {
+    let (base, _state, up) = harness(Upstream::answering("네")).await;
+
+    chat(
+        &base,
+        with_write_tool(json!({
+            "model": "fabrix-chat-4",
+            "messages": [
+                { "role": "user", "content": "만들어줘" },
+                { "role": "assistant", "content": "무엇을 만들까요?" },
+            ],
+        })),
+    )
+    .await;
+
+    let payload = up.lock().unwrap().seen.last().cloned().unwrap();
+    let contents = payload["contents"].as_array().unwrap();
+    assert_eq!(contents.len(), 3, "리마인더가 자기 턴을 갖지 못했습니다: {payload}");
+    assert_eq!(contents[1], "무엇을 만들까요?");
+    assert!(contents[2].as_str().unwrap().contains("# Reminder"), "{payload}");
+    // assistant 발화는 오염되지 않았습니다.
+    assert!(!contents[1].as_str().unwrap().contains("# Reminder"));
+}
+
+/// 사내 `temperature` 상한은 0–1 입니다. OpenAI 범위(0–2)를 보내는 클라이언트를 깨지
+/// 않으면서, 나가는 값만 줄이고 그 사실을 로그에 적습니다.
+#[tokio::test]
+async fn temperature_above_the_fabrix_ceiling_is_clamped_and_logged() {
+    let (base, state, up) = harness(Upstream::answering("네")).await;
+
+    let (status, _) = chat(
+        &base,
+        json!({
+            "model": "fabrix-chat-4", "temperature": 1.5,
+            "messages": [{ "role": "user", "content": "hi" }],
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "0–2 를 보내는 클라이언트를 거절하면 안 됩니다");
+
+    let payload = up.lock().unwrap().seen.last().cloned().unwrap();
+    assert_eq!(payload["llmConfig"]["temperature"], 1.0, "{payload}");
+
+    let meta = state.snapshot().recent[0].resp_meta.clone();
+    assert!(meta.contains("temperature 1.5 → 1 (사내 상한)"), "{meta}");
+}
+
+/// 두 철자를 모두 실어 보냅니다 — 문서와 샘플이 달라 어느 쪽을 읽는지 모릅니다.
+#[tokio::test]
+async fn llm_config_carries_both_spellings_upstream() {
+    let (base, _state, up) = harness(Upstream::answering("네")).await;
+
+    chat(
+        &base,
+        json!({
+            "model": "fabrix-chat-4", "frequency_penalty": 1.04, "top_k": 14,
+            "messages": [{ "role": "user", "content": "hi" }],
+        }),
+    )
+    .await;
+
+    let cfg = up.lock().unwrap().seen.last().cloned().unwrap()["llmConfig"].clone();
+    assert_eq!(cfg["repetition_penalty"], 1.04, "샘플 철자: {cfg}");
+    assert_eq!(cfg["repetion_penalty"], 1.04, "문서 철자: {cfg}");
+    assert_eq!(cfg["top_k"], 14, "샘플 철자: {cfg}");
+    assert_eq!(cfg["tok_k"], 14, "문서 철자: {cfg}");
+}
+
+/// 도구를 안 쓰는 요청은 문자 하나도 달라지지 않아야 합니다.
+#[tokio::test]
+async fn a_tool_free_request_carries_no_reminder() {
+    let (base, _state, up) = harness(Upstream::answering("네")).await;
+
+    chat(
+        &base,
+        json!({
+            "model": "fabrix-chat-4",
+            "messages": [{ "role": "user", "content": "안녕" }],
+        }),
+    )
+    .await;
+
+    let payload = up.lock().unwrap().seen.last().cloned().unwrap();
+    assert_eq!(payload["contents"], json!(["안녕"]));
+    assert!(payload["systemPrompt"].is_null(), "{payload}");
+}
+
+/// `isStream=false` 인데 SSE 를 흘려보내는 상위도 **같은 파이프라인**을 지나야 합니다.
+/// 추론 채널의 도구 호출까지 이 폴백 경로에서 잡히는지 봅니다.
+#[tokio::test]
+async fn non_stream_sse_body_goes_through_the_same_pipeline() {
+    let mut up = Upstream::reasoning_only(&format!("생각.{}", sentinel()));
+    up.answer = "답입니다.".into();
+    up.sse_always = true;
+    let (base, _state, _up) = harness(up).await;
+
+    let (status, body) = chat(
+        &base,
+        with_write_tool(json!({
+            "model": "fabrix-chat-4",
+            "messages": [{ "role": "user", "content": "만들어줘" }],
+        })),
+    )
+    .await;
+
+    assert_eq!(status, 200, "{body}");
+    let choice = &body["choices"][0];
+    assert_eq!(choice["finish_reason"], "tool_calls", "{choice}");
+    assert_eq!(choice["message"]["tool_calls"].as_array().unwrap().len(), 1);
+    assert_eq!(choice["message"]["content"], "답입니다.");
+    assert_eq!(choice["message"]["reasoning_content"], "생각.");
 }
 
 // ─────────────────────────── 3. 모델 해석 ───────────────────────────

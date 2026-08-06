@@ -167,19 +167,41 @@ pub struct MessagesRequest {
     pub llm_config: Option<LlmConfig>,
 }
 
-/// ⚠️ `repetion_penalty` 와 `tok_k` 는 **스펙 문서의 철자 그대로**입니다.
-/// 오타로 보이지만 서버가 기대하는 키일 가능성이 높아 그대로 보냅니다.
-/// 실서버 검증에서 다르면 이 두 `rename` 만 고치면 됩니다.
+/// 사내가 `temperature` 에 허용하는 상한. 스펙 문서가 "0에서 1 사이" 라고 못박습니다.
+///
+/// OpenAI 는 0–2 라, 그 범위를 기본값으로 보내는 클라이언트가 많습니다. 그래서 검증은
+/// 0–2 로 통과시키고(거절하면 그 클라이언트들이 전부 400 을 받습니다) **나갈 값만**
+/// 여기로 줄입니다. 조용히 줄이지는 않습니다 — 로그 ③ 칸 꼬리에 적습니다.
+pub const FABRIX_MAX_TEMPERATURE: f64 = 1.0;
+
+/// ⚠️ 반복 페널티와 top-k 의 철자가 **문서와 샘플에서 다릅니다.**
+///
+/// - 스펙 문서의 `llmConfig Properties` 목록: `repetion_penalty` · `tok_k`
+/// - 벤더가 준 **실행되는 샘플 코드**: `repetition_penalty` · `top_k`
+///
+/// 어느 쪽이 서버가 실제로 읽는 키인지 확인되지 않아 **양쪽 다** 보냅니다. 사내는
+/// `llmConfig` 의 모르는 키를 무시합니다 — 지금까지 문서 철자만 보내면서도 앱이 동작한
+/// 것이 그 증거입니다(엄격히 거절한다면 이미 깨져 있어야 합니다).
+///
+/// 실서버에서 어느 쪽인지 확정되면 해당 필드 두 줄만 지우면 됩니다.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct LlmConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f64>,
-    #[serde(rename = "repetion_penalty", skip_serializing_if = "Option::is_none")]
+    /// 샘플 코드의 철자.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub repetition_penalty: Option<f64>,
-    #[serde(rename = "tok_k", skip_serializing_if = "Option::is_none")]
+    /// 문서의 철자(오타로 보이지만 서버가 기대하는 키일 수 있습니다).
+    #[serde(rename = "repetion_penalty", skip_serializing_if = "Option::is_none")]
+    pub repetion_penalty: Option<f64>,
+    /// 샘플 코드의 철자.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub top_k: Option<u32>,
+    /// 문서의 철자.
+    #[serde(rename = "tok_k", skip_serializing_if = "Option::is_none")]
+    pub tok_k: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -188,11 +210,16 @@ pub struct LlmConfig {
 
 impl LlmConfig {
     pub fn from_request(req: &ChatRequest) -> Option<Self> {
+        // 두 철자에 같은 값을 싣습니다 — 서버가 어느 쪽을 읽든 전달되게.
+        let penalty = req.frequency_penalty;
+        let top_k = req.top_k;
         let cfg = Self {
-            temperature: req.temperature,
+            temperature: req.temperature.map(clamp_temperature),
             top_p: req.top_p,
-            repetition_penalty: req.frequency_penalty,
-            top_k: req.top_k,
+            repetition_penalty: penalty,
+            repetion_penalty: penalty,
+            top_k,
+            tok_k: top_k,
             seed: req.seed,
             max_new_tokens: req.max_new_tokens(),
         };
@@ -210,24 +237,61 @@ impl LlmConfig {
     }
 }
 
+/// OpenAI 범위(0–2)로 받은 값을 사내 범위(0–1)로 줄입니다.
+pub fn clamp_temperature(requested: f64) -> f64 {
+    requested.min(FABRIX_MAX_TEMPERATURE)
+}
+
+/// 클램프가 실제로 일어났는가 — 로그 한 줄을 붙일지 정하는 데 씁니다.
+pub fn temperature_was_clamped(requested: Option<f64>) -> Option<(f64, f64)> {
+    let requested = requested?;
+    let sent = clamp_temperature(requested);
+    (sent < requested).then_some((requested, sent))
+}
+
+/// `contents` 배열에서 한 원소가 누구의 발화인지. **위치가 롤입니다.**
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Speaker {
+    User,
+    Assistant,
+}
+
+/// 대화가 assistant 발화로 시작할 때 짝을 맞추려고 앞에 넣는 user 턴.
+///
+/// `chat.rs` 가 "시스템/규약만 있고 사용자 턴이 없는 라운드" 에 쓰는 것과 같은 문구입니다 —
+/// 같은 목적(사내가 거절하지 않을 최소한의 한 줄)이라 굳이 다르게 부를 이유가 없습니다.
+pub const CONTINUE_TURN: &str = "(continue)";
+
 /// OpenAI `messages` → FabriX `systemPrompt` + `contents`.
 ///
-/// FabriX 에는 롤 구조가 없어 멀티턴은 한 덩어리 트랜스크립트로 평탄화됩니다.
-/// 손실적이지만 대안이 없고, 로그 ② 칸에 변환 결과가 그대로 보이므로 사용자가
-/// 무엇이 어떻게 접혔는지 확인할 수 있습니다.
+/// **`contents` 는 턴 배열입니다** — 원소 하나가 한 턴이고, 배열 위치가 롤을 나타냅니다
+/// (짝수 = user, 홀수 = assistant). 근거는 벤더 샘플입니다:
+///
+/// ```text
+/// "contents": ["안녕하세요?", "네 안녕하세요", "내 이름은 LCY인데 너 이름은 뭐니?"]
+/// #              user           assistant        user
+/// ```
+///
+/// 예전에는 멀티턴을 `["User: …\n\nAssistant: …"]` 한 덩어리로 접었습니다. "FabriX 엔 롤
+/// 구조가 없다" 고 본 것인데, 롤 *라벨* 이 없을 뿐 배열이 턴을 담습니다. 한 덩어리로 보내면
+/// 사내 모델의 chat template 이 제대로 걸리지 않고, 모델은 "대화 중" 이 아니라 "대화록을
+/// 읽는 중" 으로 인식합니다 — 프롬프트 기반 툴콜은 모델이 자기 턴의 시작을 알아야 잘
+/// 동작하므로 도구 준수율에 직접 영향을 줍니다.
+///
+/// 교대는 **구조적으로 보장**합니다:
+/// 1. 연속 동일 롤은 하나로 병합합니다. 안 하면 원소가 하나 밀려 그 뒤 전체의 롤이 뒤집힙니다.
+/// 2. 첫 턴이 assistant 면 앞에 [`CONTINUE_TURN`] 을 넣습니다.
 ///
 /// 도구를 쓰는 대화에서 조심할 것이 둘 있습니다.
 ///
-/// 1. 도구 호출만 있는 assistant 턴은 `content` 가 `null` 이라 본문이 빕니다. 공백
-///    이라고 버리면 모델은 다음 턴에 **자기가 호출한 적 없는 결과**를 보게 되고,
-///    같은 도구를 다시 부르는 루프에 빠집니다. 그래서 공백 판정을 역할별 분기
-///    안으로 내렸습니다.
-/// 2. 라벨을 `Option` 으로 둔 이유는 도구 결과 줄이 자기 머리말을 이미 갖고 있어서
-///    입니다. 그대로 롤 라벨을 붙이면 `Tool: Tool result (id=…)` 가 됩니다.
+/// 1. 도구 호출만 있는 assistant 턴은 `content` 가 `null` 이라 본문이 빕니다. 공백이라고
+///    버리면 모델은 다음 턴에 **자기가 호출한 적 없는 결과**를 보게 되고, 같은 도구를 다시
+///    부르는 루프에 빠집니다. 그래서 공백 판정을 역할별 분기 안으로 내렸습니다.
+/// 2. `role: "tool"` 결과는 **user 턴**으로 들어갑니다. 사내엔 tool 롤이 없고, 결과를
+///    모델에게 돌려주는 쪽은 우리(=user)입니다. 프롬프트 기반 툴콜의 표준 모양이기도 합니다.
 pub fn fold_messages(messages: &[crate::openai::Message]) -> (Option<String>, Vec<String>) {
     let mut system: Vec<String> = Vec::new();
-    // 라벨이 `None` 이면 본문에 이미 머리말이 들어 있다는 뜻입니다.
-    let mut turns: Vec<(Option<&'static str>, String)> = Vec::new();
+    let mut turns: Vec<(Speaker, String)> = Vec::new();
 
     // 병렬 호출을 상관시키려면 결과 줄에 함수 이름이 필요한데, `role:"tool"` 메시지는
     // `tool_call_id` 만 갖고 이름은 그 호출을 낸 assistant 턴에 있습니다.
@@ -258,7 +322,7 @@ pub fn fold_messages(messages: &[crate::openai::Message]) -> (Option<String>, Ve
                     parts.push(super::tools::render_history_call(c));
                 }
                 if !parts.is_empty() {
-                    turns.push((Some("Assistant"), parts.join("\n")));
+                    turns.push((Speaker::Assistant, parts.join("\n")));
                 }
             }
             "tool" | "function" => {
@@ -273,15 +337,16 @@ pub fn fold_messages(messages: &[crate::openai::Message]) -> (Option<String>, Ve
                     (None, None) => "Tool result".to_string(),
                 };
                 // 본문이 비어도 남깁니다 — "불렀고 결과가 비었다"도 정보입니다.
-                turns.push((None, format!("{head}:\n{body}")));
+                turns.push((Speaker::User, format!("{head}:\n{body}")));
             }
             role => {
                 let text = m.text();
                 if !text.trim().is_empty() {
-                    // 모르는 롤은 본문에 머리말을 직접 넣고 라벨은 비웁니다.
                     match role {
-                        "user" => turns.push((Some("User"), text)),
-                        other => turns.push((None, format!("{other}: {text}"))),
+                        "user" => turns.push((Speaker::User, text)),
+                        // 모르는 롤은 user 턴에 머리말을 붙여 넣습니다 — 사내에 실을 자리가
+                        // user/assistant 둘뿐이라, 버리는 것보다 누가 말했는지 적는 편이 낫습니다.
+                        other => turns.push((Speaker::User, format!("{other}: {text}"))),
                     }
                 }
             }
@@ -289,25 +354,42 @@ pub fn fold_messages(messages: &[crate::openai::Message]) -> (Option<String>, Ve
     }
 
     let system_prompt = if system.is_empty() { None } else { Some(system.join("\n\n")) };
+    (system_prompt, alternating(turns))
+}
 
-    let content = match turns.len() {
-        0 => String::new(),
-        1 if turns[0].0 == Some("User") => turns.remove(0).1,
-        _ => turns
-            .iter()
-            .map(|(label, text)| match label {
-                Some(l) => format!("{l}: {text}"),
-                None => text.clone(),
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n"),
-    };
-
-    if content.is_empty() {
-        (system_prompt, Vec::new())
-    } else {
-        (system_prompt, vec![content])
+/// 턴 목록을 교대가 보장된 `contents` 배열로 만듭니다.
+fn alternating(turns: Vec<(Speaker, String)>) -> Vec<String> {
+    if turns.is_empty() {
+        return Vec::new();
     }
+
+    let mut out: Vec<(Speaker, String)> = Vec::with_capacity(turns.len());
+    for (speaker, text) in turns {
+        match out.last_mut() {
+            // 연속 동일 롤 병합 — 이게 교대 보장의 핵심입니다.
+            Some((last, body)) if *last == speaker => {
+                body.push_str("\n\n");
+                body.push_str(&text);
+            }
+            _ => out.push((speaker, text)),
+        }
+    }
+
+    let mut contents: Vec<String> = Vec::with_capacity(out.len() + 1);
+    // 첫 원소는 언제나 user 자리입니다.
+    if out[0].0 == Speaker::Assistant {
+        contents.push(CONTINUE_TURN.to_string());
+    }
+    contents.extend(out.into_iter().map(|(_, text)| text));
+    contents
+}
+
+/// `contents` 의 마지막 원소가 user 자리인가.
+///
+/// index 0 이 user 이므로 길이가 홀수면 마지막이 user 입니다. 꼬리 리마인더를 붙일 자리를
+/// 고르는 데 씁니다 — assistant 자리에 지시문을 넣으면 **모델 자신의 발화**가 됩니다.
+pub fn last_is_user_turn(contents: &[String]) -> bool {
+    contents.len() % 2 == 1
 }
 
 // ─────────────────────────── 응답 파싱 ───────────────────────────
@@ -443,9 +525,16 @@ impl FabrixChunk {
         filled(&self.status) || filled(&self.response_code) || filled(&self.finish_reason)
     }
 
-    /// 비스트리밍 답변 텍스트를 폴백 순서로 추출합니다.
-    /// content → contentReferences[].answer(결합) → eventData.
-    /// 순수 LLM 답변은 content 에, 플러그인/RAG 답변은 contentReferences 에 오기 때문입니다.
+    /// 비스트리밍 답변 텍스트: `content` → `contentReferences[].answer`(결합).
+    ///
+    /// 스펙 문서상 답변은 `content` 입니다. `contentReferences` 는 "References used while
+    /// generating the answer" 이고 `answer` 하위 필드는 문서에 없습니다 — 즉 이 폴백은
+    /// **미확인**이고 죽은 코드일 수 있습니다. 그래도 남기는 이유: 살아 있다면(플러그인/RAG
+    /// 응답이 정말 거기 답을 싣는다면) 지우는 순간 그 답변을 잃고, `content` 가 있을 때는
+    /// 발동하지 않아 비용이 0 입니다. 실서버에서 확정되면 지우세요.
+    ///
+    /// `eventData` 폴백은 **지웠습니다** — 문서가 `Event Data` 라고만 하고, 내부 이벤트
+    /// 문자열이 assistant 답변으로 나가면 안 됩니다.
     pub fn answer_text(&self) -> Option<String> {
         if let Some(text) = self.content.as_deref().filter(|s| !s.is_empty()) {
             return Some(text.to_string());
@@ -457,13 +546,7 @@ impl FabrixChunk {
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
             .join("\n");
-        if !joined.is_empty() {
-            return Some(joined);
-        }
-        self.event_data
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
+        (!joined.is_empty()).then_some(joined)
     }
 
     /// 필터 차단 사유 메시지를 추출합니다(모두 비어 있으면 None).
@@ -485,7 +568,9 @@ impl FabrixChunk {
 /// 상한에 걸려 잘린 답변이 클라이언트에는 깔끔한 `"stop"` 으로 보였습니다 —
 /// 도구 호출 인자 한가운데서 잘려도 마찬가지라, 파일이 반쪽만 써지고도 성공으로
 /// 보입니다.
-pub fn map_finish_reason(raw: Option<&str>, truncated: bool) -> Option<String> {
+/// `decide_finish` 만 호출합니다 — 종료 사유 판단이 한 자리에 모여 있게 하려고
+/// 밖으로 내보내지 않습니다.
+fn map_finish_reason(raw: Option<&str>, truncated: bool) -> Option<String> {
     if truncated {
         return Some("length".into());
     }
@@ -514,7 +599,7 @@ pub fn map_finish_reason(raw: Option<&str>, truncated: bool) -> Option<String> {
 ///
 /// 중단 계열(`abort`·`timeout`·`error`…)은 `stop` 이 아니라 `length` 로 접습니다 —
 /// 끊긴 답변을 완성된 것처럼 부르면 안 됩니다.
-pub fn clamp_finish_reason(mapped: Option<&str>) -> &'static str {
+fn clamp_finish_reason(mapped: Option<&str>) -> &'static str {
     match mapped.unwrap_or("stop").trim().to_ascii_lowercase().as_str() {
         "stop" => "stop",
         "length" => "length",
@@ -527,41 +612,50 @@ pub fn clamp_finish_reason(mapped: Option<&str>) -> &'static str {
     }
 }
 
+/// 이 턴의 `finish_reason` 을 정하는 **단 하나의** 자리.
+///
+/// 예전에는 스트림 경로와 비스트림 경로가 각자 이 판단을 했습니다. 두 사본이 어긋나면
+/// 같은 답변이 `stream` 여부에 따라 다른 종료 사유를 받습니다 — 클라이언트는 이 값으로
+/// 에이전트 루프를 계속할지 정하므로, 어긋남이 곧 "한쪽에서만 루프가 끊김" 입니다.
+///
+/// 우선순위: **도구 호출 > 절단 > 상위가 준 사유 > stop**.
+///
+/// 도구 호출이 절단보다 앞서는 것은 의도입니다. 스캐너는 닫는 태그를 보고 이름 검증까지
+/// 끝난 **완성된 호출만** 내보내므로, 뒤가 잘렸어도 이미 뽑은 호출은 실행할 수 있습니다.
+/// 절단 사실은 로그 ③ 칸 꼬리에 남습니다.
+///
+/// 스트림이 중간에 끊긴 경우는 호출부가 `upstream` 자리에 `"error"` 를 넣어 알립니다 —
+/// `clamp_finish_reason` 의 중단 계열 갈래가 그것을 `length` 로 접습니다. 별도 상수를
+/// 두지 않는 이유: 상수와 clamp 표가 따로 있으면 둘이 어긋날 수 있습니다.
+pub fn decide_finish(saw_call: bool, upstream: Option<&str>, truncated: bool) -> &'static str {
+    if saw_call {
+        return "tool_calls";
+    }
+    clamp_finish_reason(map_finish_reason(upstream, truncated).as_deref())
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamEvent {
     Delta(String),
     Reasoning(String),
-    /// 누적 모드에서 상위가 답변을 **통째로 다시 쓴** 지점.
-    ///
-    /// 이때 `Delta` 로 전체 본문이 다시 흘러나오므로, 텍스트를 누적해 파싱하는
-    /// 소비자(도구 호출 스캐너)는 상태를 버려야 합니다. 그러지 않으면 이미
-    /// 내보낸 도구 호출을 두 번 냅니다.
-    Reset,
     Finish(String),
     Error(String),
     Done,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-enum DeltaMode {
-    #[default]
-    Unknown,
-    /// 매 프레임이 지금까지의 **전체** 텍스트.
-    Cumulative,
-    /// 매 프레임이 **증분**.
-    Incremental,
 }
 
 /// 바이트 스트림 → OpenAI 델타.
 ///
 /// 줄 단위로만 잘라 쓰기 때문에 청크 경계에서 UTF-8 문자가 쪼개져도 안전합니다
 /// (개행은 항상 단일 바이트라 멀티바이트 문자 중간에 걸리지 않습니다).
+///
+/// `content` 는 **증분**입니다. 벤더 샘플이 `result_message += ch_json['content']` 로
+/// 이어 붙이는 것이 근거입니다 — 누적이면 `+=` 가 아니라 대입이어야 합니다. 예전에는
+/// 누적/증분을 두 번째 프레임에서 자동 판별하고 재작성(`Reset`)까지 다뤘는데, 확인된
+/// 지금은 그 갈래가 전부 죽은 코드였습니다.
 #[derive(Debug, Default)]
 pub struct StreamDecoder {
     buf: Vec<u8>,
     acc: String,
-    reasoning: String,
-    mode: DeltaMode,
     pub finish_reason: Option<String>,
     pub model_type: Option<String>,
     pub done: bool,
@@ -583,10 +677,6 @@ impl StreamDecoder {
     /// 지금까지 합쳐진 전체 답변.
     pub fn text(&self) -> &str {
         &self.acc
-    }
-
-    pub fn reasoning(&self) -> &str {
-        &self.reasoning
     }
 
     pub fn push(&mut self, chunk: &[u8]) -> Vec<StreamEvent> {
@@ -617,13 +707,12 @@ impl StreamDecoder {
             return; // 프레임 구분자 또는 SSE 주석
         }
 
-        let payload = if let Some(rest) = line.strip_prefix("data:") {
-            rest.trim()
-        } else if line.starts_with("event:") || line.starts_with("id:") || line.starts_with("retry:") {
-            return;
-        } else {
-            // `data:` 없이 개행 구분 JSON 을 흘리는 서버도 받아들입니다.
-            line
+        // 표준 SSE 만 받습니다. 벤더 샘플이 `sseclient.SSEClient(response)` 를 쓰는 것이
+        // 근거입니다 — `data:` 프레이밍이 확정입니다. 예전에는 `data:` 없이 개행 구분
+        // JSON 을 흘리는 서버도 받아들였는데, 그러면 아무 텍스트 줄이나 프레임으로
+        // 오인할 여지가 남습니다.
+        let Some(payload) = line.strip_prefix("data:").map(str::trim) else {
+            return; // `event:` · `id:` · `retry:` 등 다른 SSE 필드
         };
 
         if payload.is_empty() {
@@ -667,82 +756,46 @@ impl StreamDecoder {
         if let Some(tokens) = chunk.upstream_tokens() {
             self.upstream_tokens = Some(tokens);
         }
+        // 텍스트 누적은 소비자(`proxy::turn::Turn`)가 합니다 — 디코더가 따로 모으면 두
+        // 곳이 어긋납니다. `acc` 는 로그·테스트가 보는 전체 답변용으로만 씁니다.
         if let Some(reasoning) = chunk.reasoning_content.as_deref() {
             if !reasoning.is_empty() {
-                self.reasoning.push_str(reasoning);
                 out.push(StreamEvent::Reasoning(reasoning.to_string()));
             }
         }
-        if let Some(content) = chunk.content.as_deref() {
-            match self.absorb(content) {
-                Absorbed::Append(delta) => out.push(StreamEvent::Delta(delta)),
-                Absorbed::Rewrite(whole) => {
-                    out.push(StreamEvent::Reset);
-                    out.push(StreamEvent::Delta(whole));
-                }
-                Absorbed::Nothing => {}
-            }
+        if let Some(content) = chunk.content.as_deref().filter(|c| !c.is_empty()) {
+            self.acc.push_str(content);
+            out.push(StreamEvent::Delta(content.to_string()));
         }
         if let Some(reason) = chunk.finish_reason.as_deref().filter(|r| !r.is_empty()) {
             self.finish_reason = Some(reason.to_string());
             out.push(StreamEvent::Finish(reason.to_string()));
         }
     }
-
-    /// 누적/증분 판별. 두 번째 프레임에서 모드를 확정하고 이후로는 고정합니다 —
-    /// 매 프레임 접두사 검사를 하면 "안" 다음에 증분 "안녕"이 왔을 때 오판합니다.
-    fn absorb(&mut self, content: &str) -> Absorbed {
-        if content.is_empty() {
-            return Absorbed::Nothing;
-        }
-        if self.acc.is_empty() {
-            self.acc.push_str(content);
-            return Absorbed::Append(content.to_string());
-        }
-
-        match self.mode {
-            DeltaMode::Unknown => {
-                if content == self.acc {
-                    self.mode = DeltaMode::Cumulative;
-                    Absorbed::Nothing
-                } else if content.len() > self.acc.len() && content.starts_with(self.acc.as_str()) {
-                    self.mode = DeltaMode::Cumulative;
-                    let delta = content[self.acc.len()..].to_string();
-                    self.acc = content.to_string();
-                    Absorbed::Append(delta)
-                } else {
-                    self.mode = DeltaMode::Incremental;
-                    self.acc.push_str(content);
-                    Absorbed::Append(content.to_string())
-                }
-            }
-            DeltaMode::Cumulative => {
-                if content == self.acc {
-                    Absorbed::Nothing
-                } else if content.len() > self.acc.len() && content.starts_with(self.acc.as_str()) {
-                    let delta = content[self.acc.len()..].to_string();
-                    self.acc = content.to_string();
-                    Absorbed::Append(delta)
-                } else {
-                    // 서버가 답변을 다시 쓴 경우 — 통째로 교체합니다. 이건 증분이
-                    // 아니라 재작성이므로 소비자에게 그 사실을 알려야 합니다.
-                    self.acc = content.to_string();
-                    Absorbed::Rewrite(content.to_string())
-                }
-            }
-            DeltaMode::Incremental => {
-                self.acc.push_str(content);
-                Absorbed::Append(content.to_string())
-            }
-        }
-    }
 }
 
-/// `absorb` 의 결과. 추가인지 재작성인지 구분해야 소비자가 상태를 언제 버릴지 압니다.
-enum Absorbed {
-    Nothing,
-    Append(String),
-    Rewrite(String),
+/// 비스트림 응답 한 덩어리를 스트림과 **같은 이벤트 열**로 바꿉니다.
+///
+/// 이 함수가 있어서 비스트림 경로가 자기만의 조립 코드를 갖지 않습니다 — 두 경로가
+/// 같은 상태 기계(`proxy::turn::Turn`)를 지나가는 것이 이 변환의 목적입니다.
+/// 순서는 스트림 프레임과 같습니다: 추론 → 본문 → 종료.
+///
+/// `contentReferences`·`eventData` 폴백은 **여기서만** 일어납니다(스트림 프레임에는
+/// 적용하지 않습니다). 실서버 와이어를 확인하면 줄어드는 것도 이 함수 하나입니다.
+pub fn nonstream_events(chunk: &FabrixChunk) -> Vec<StreamEvent> {
+    let mut out = Vec::new();
+    if let Some(reasoning) = chunk.reasoning_content.as_deref().filter(|s| !s.is_empty()) {
+        out.push(StreamEvent::Reasoning(reasoning.to_string()));
+    }
+    if let Some(text) = chunk.answer_text().filter(|s| !s.is_empty()) {
+        out.push(StreamEvent::Delta(text));
+    }
+    // 공백만 있는 사유로 이벤트를 만들지 않습니다 — `map_finish_reason` 이 어차피
+    // 트림해서 버리므로 와이어 결과는 같고, 빈 이벤트만 사라집니다.
+    if let Some(reason) = chunk.finish_reason.as_deref().filter(|r| !r.trim().is_empty()) {
+        out.push(StreamEvent::Finish(reason.to_string()));
+    }
+    out
 }
 
 // ─────────────────────────── 오류 ───────────────────────────
@@ -1019,10 +1072,15 @@ mod tests {
         assert_eq!(d.text(), "안녕하세요");
     }
 
+    /// 카멜케이스 표기도 받습니다 — 문서상 비스트림이 카멜이고, `isStream=false` 인데
+    /// SSE 를 흘리는 상위를 위해 디코더도 양쪽을 받습니다.
     #[test]
-    fn parses_bare_json_lines_and_camel_case() {
+    fn parses_camel_case_field_names() {
         let mut d = StreamDecoder::new();
-        let out = events(&mut d, "{\"content\":\"A\"}\n{\"content\":\"B\",\"finishReason\":\"stop\"}\n");
+        let out = events(
+            &mut d,
+            "data: {\"content\":\"A\"}\ndata: {\"content\":\"B\",\"finishReason\":\"stop\"}\n",
+        );
         assert_eq!(
             out,
             vec![
@@ -1031,23 +1089,6 @@ mod tests {
                 StreamEvent::Finish("stop".into())
             ]
         );
-    }
-
-    #[test]
-    fn cumulative_frames_emit_only_the_new_suffix() {
-        let mut d = StreamDecoder::new();
-        let mut all = events(&mut d, "data: {\"content\":\"안녕\"}\n");
-        all.extend(events(&mut d, "data: {\"content\":\"안녕하세\"}\n"));
-        all.extend(events(&mut d, "data: {\"content\":\"안녕하세요\"}\n"));
-        assert_eq!(
-            all,
-            vec![
-                StreamEvent::Delta("안녕".into()),
-                StreamEvent::Delta("하세".into()),
-                StreamEvent::Delta("요".into())
-            ]
-        );
-        assert_eq!(d.text(), "안녕하세요");
     }
 
     #[test]
@@ -1125,17 +1166,18 @@ mod tests {
         assert_eq!(chunk.filter_message(), None);
     }
 
+    /// `eventData` 는 **답변이 아닙니다** — 문서가 `Event Data` 라고만 합니다. 내부
+    /// 이벤트 문자열이 assistant 답변으로 나가면 안 됩니다.
     #[test]
-    fn nostream_falls_back_to_event_data() {
-        // content 도 contentReferences 도 없고 eventData 에만 답이 있는 경우.
+    fn nostream_does_not_treat_event_data_as_the_answer() {
         let raw = r#"{
             "content": null,
             "contentReferences": [],
-            "eventData": "이벤트 데이터 답변",
+            "eventData": "이벤트 데이터",
             "status": "SUCCESS"
         }"#;
         let chunk = parse_nostream(raw);
-        assert_eq!(chunk.answer_text().as_deref(), Some("이벤트 데이터 답변"));
+        assert_eq!(chunk.answer_text(), None);
     }
 
     #[test]
@@ -1337,24 +1379,94 @@ mod tests {
         assert_eq!(contents, vec!["연차 이월 규정 알려줘".to_string()]);
     }
 
-    #[test]
-    fn multi_turn_flattens_into_a_labelled_transcript() {
-        use crate::openai::{Content, Message};
-        let msgs = vec![
-            Message { role: "user".into(), content: Some(Content::Text("안녕".into())), ..Default::default() },
-            Message { role: "assistant".into(), content: Some(Content::Text("네".into())), ..Default::default() },
-            Message { role: "user".into(), content: Some(Content::Text("규정은?".into())), ..Default::default() },
-        ];
-        let (system, contents) = fold_messages(&msgs);
-        assert!(system.is_none());
-        assert_eq!(contents, vec!["User: 안녕\n\nAssistant: 네\n\nUser: 규정은?".to_string()]);
-    }
-
-    // ── 도구 대화 평탄화 ──
+    // ── contents 는 턴 배열 (위치가 롤) ──
 
     fn msg(json: &str) -> crate::openai::Message {
         serde_json::from_str(json).unwrap()
     }
+
+    /// 벤더 샘플과 **같은 대화**로 못박습니다:
+    /// `["안녕하세요?", "네 안녕하세요", "내 이름은 LCY인데 너 이름은 뭐니?"]`
+    #[test]
+    fn multi_turn_becomes_one_element_per_turn() {
+        let msgs = vec![
+            msg(r#"{"role":"user","content":"안녕하세요?"}"#),
+            msg(r#"{"role":"assistant","content":"네 안녕하세요"}"#),
+            msg(r#"{"role":"user","content":"내 이름은 LCY인데 너 이름은 뭐니?"}"#),
+        ];
+        let (system, contents) = fold_messages(&msgs);
+        assert!(system.is_none());
+        assert_eq!(
+            contents,
+            vec![
+                "안녕하세요?".to_string(),
+                "네 안녕하세요".to_string(),
+                "내 이름은 LCY인데 너 이름은 뭐니?".to_string(),
+            ]
+        );
+        // 라벨을 붙이지 않습니다 — 위치가 롤입니다.
+        assert!(!contents.iter().any(|c| c.starts_with("User:") || c.starts_with("Assistant:")));
+    }
+
+    /// 연속 동일 롤을 병합하지 않으면 원소가 하나 밀려 그 뒤 전체의 롤이 뒤집힙니다.
+    /// 이 테스트가 교대 보장을 지킵니다.
+    #[test]
+    fn consecutive_same_role_messages_merge_to_keep_alternation() {
+        let msgs = vec![
+            msg(r#"{"role":"user","content":"첫 질문"}"#),
+            msg(r#"{"role":"user","content":"덧붙임"}"#),
+            msg(r#"{"role":"assistant","content":"답 앞"}"#),
+            msg(r#"{"role":"assistant","content":"답 뒤"}"#),
+            msg(r#"{"role":"user","content":"마지막"}"#),
+        ];
+        let (_, contents) = fold_messages(&msgs);
+        assert_eq!(
+            contents,
+            vec![
+                "첫 질문\n\n덧붙임".to_string(),
+                "답 앞\n\n답 뒤".to_string(),
+                "마지막".to_string(),
+            ]
+        );
+        assert!(last_is_user_turn(&contents));
+    }
+
+    /// 대화가 assistant 로 시작하면 앞에 user 턴을 넣어 짝을 맞춥니다 — 안 하면 그
+    /// assistant 발화가 user 자리에 앉습니다.
+    #[test]
+    fn a_conversation_starting_with_assistant_gets_a_continue_turn() {
+        let msgs = vec![
+            msg(r#"{"role":"assistant","content":"이어서 말하자면"}"#),
+            msg(r#"{"role":"user","content":"계속해"}"#),
+        ];
+        let (_, contents) = fold_messages(&msgs);
+        assert_eq!(
+            contents,
+            vec![
+                CONTINUE_TURN.to_string(),
+                "이어서 말하자면".to_string(),
+                "계속해".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_single_user_turn_is_one_bare_element() {
+        let (_, contents) = fold_messages(&[msg(r#"{"role":"user","content":"안녕"}"#)]);
+        assert_eq!(contents, vec!["안녕".to_string()]);
+        assert!(last_is_user_turn(&contents));
+    }
+
+    #[test]
+    fn last_is_user_turn_tracks_the_alternation() {
+        assert!(last_is_user_turn(&["u".into()]));
+        assert!(!last_is_user_turn(&["u".into(), "a".into()]));
+        assert!(last_is_user_turn(&["u".into(), "a".into(), "u".into()]));
+        // 빈 배열에는 붙일 자리가 없습니다.
+        assert!(!last_is_user_turn(&[]));
+    }
+
+    // ── 도구 대화 평탄화 ──
 
     /// 회귀 방지: 예전에는 `content: null` 이라 공백 드롭에 걸려 이 턴이 통째로
     /// 사라졌고, 모델은 자기가 부른 적 없는 결과를 보게 됐습니다.
@@ -1370,13 +1482,19 @@ mod tests {
             msg(r#"{"role":"tool","tool_call_id":"call_a1","content":"wrote 12 bytes"}"#),
         ];
         let (_, contents) = fold_messages(&msgs);
-        let t = &contents[0];
-        assert!(t.contains("<tool_call>"), "도구 호출이 사라졌습니다:\n{t}");
-        assert!(t.contains("\"name\":\"write\""), "{t}");
-        assert!(t.contains("call_a1"), "{t}");
-        assert!(t.contains("wrote 12 bytes"), "{t}");
+        // user / assistant(호출) / user(결과) — 도구 결과는 user 자리입니다.
+        assert_eq!(contents.len(), 3, "{contents:?}");
+        assert_eq!(contents[0], "페이지 만들어줘");
+        let call = &contents[1];
+        assert!(call.contains("<tool_call>"), "도구 호출이 사라졌습니다:\n{call}");
+        assert!(call.contains("\"name\":\"write\""), "{call}");
+        assert!(call.contains("call_a1"), "{call}");
+        assert!(contents[2].contains("wrote 12 bytes"), "{}", contents[2]);
+        assert!(last_is_user_turn(&contents));
     }
 
+    /// 도구 결과 줄은 자기 머리말을 이미 갖고 있습니다. 롤 라벨을 또 붙이면
+    /// `Tool: Tool result (id=…)` 가 됩니다.
     #[test]
     fn tool_result_is_not_double_labelled() {
         let msgs = vec![
@@ -1388,13 +1506,16 @@ mod tests {
             msg(r#"{"role":"tool","tool_call_id":"c1","content":"body"}"#),
         ];
         let (_, contents) = fold_messages(&msgs);
-        assert!(!contents[0].contains("Tool: Tool result"), "이중 라벨:\n{}", contents[0]);
+        let result = &contents[2];
+        assert!(!result.contains("Tool: Tool result"), "이중 라벨:\n{result}");
         // 이름은 호출을 낸 assistant 턴에서 끌어옵니다.
-        assert!(contents[0].contains("Tool result (id=c1, name=read)"), "{}", contents[0]);
+        assert!(result.contains("Tool result (id=c1, name=read)"), "{result}");
     }
 
+    /// 병렬 호출의 결과는 assistant 턴 하나 뒤에 연달아 오므로 **한 user 원소로
+    /// 병합**되어야 합니다 — 따로 두면 두 번째 결과가 assistant 자리에 앉습니다.
     #[test]
-    fn parallel_calls_correlate_by_id() {
+    fn parallel_call_results_merge_into_one_user_turn() {
         let msgs = vec![
             msg(r#"{"role":"user","content":"go"}"#),
             msg(
@@ -1406,10 +1527,12 @@ mod tests {
             msg(r#"{"role":"tool","tool_call_id":"c1","content":"첫번째"}"#),
         ];
         let (_, contents) = fold_messages(&msgs);
-        let t = &contents[0];
+        assert_eq!(contents.len(), 3, "결과가 교대를 깨뜨렸습니다: {contents:?}");
+        let results = &contents[2];
         // 결과가 호출 순서와 다르게 와도 id 로 짝지어져야 합니다.
-        assert!(t.contains("Tool result (id=c2, name=read)"), "{t}");
-        assert!(t.contains("Tool result (id=c1, name=write)"), "{t}");
+        assert!(results.contains("Tool result (id=c2, name=read)"), "{results}");
+        assert!(results.contains("Tool result (id=c1, name=write)"), "{results}");
+        assert!(last_is_user_turn(&contents));
     }
 
     /// 회귀 방지: AI SDK v5 는 결과를 파트 배열로 보냅니다. `text` 파트가 없어
@@ -1444,14 +1567,17 @@ mod tests {
         assert!(contents[0].contains("Tool result (name=calc)"), "{}", contents[0]);
     }
 
+    /// 모르는 롤은 user 자리에 머리말을 붙여 실립니다 — 사내에 자리가 user/assistant
+    /// 둘뿐이라, 버리는 것보다 누가 말했는지 적는 편이 낫습니다. 앞의 user 턴과 연달아
+    /// 있으므로 한 원소로 병합됩니다.
     #[test]
-    fn unknown_roles_keep_their_label() {
+    fn unknown_roles_keep_their_label_inside_a_user_turn() {
         let msgs = vec![
             msg(r#"{"role":"user","content":"안녕"}"#),
             msg(r#"{"role":"critic","content":"별로"}"#),
         ];
         let (_, contents) = fold_messages(&msgs);
-        assert_eq!(contents[0], "User: 안녕\n\ncritic: 별로");
+        assert_eq!(contents, vec!["안녕\n\ncritic: 별로".to_string()]);
     }
 
     // ── 종료 사유와 절단 ──
@@ -1482,6 +1608,128 @@ mod tests {
         assert_eq!(map_finish_reason(None, false), None);
     }
 
+    // ── llmConfig ──
+
+    fn llm_config(body: &str) -> Value {
+        let req: crate::openai::ChatRequest = serde_json::from_str(body).unwrap();
+        serde_json::to_value(LlmConfig::from_request(&req).unwrap()).unwrap()
+    }
+
+    /// 문서와 샘플의 철자가 달라 **양쪽 다** 보냅니다. 한쪽만 보내면 서버가 다른 쪽을
+    /// 읽는 경우 값이 조용히 버려집니다 — 지금까지 그럴 수 있었습니다.
+    #[test]
+    fn llm_config_sends_both_spellings() {
+        let cfg = llm_config(
+            r#"{"messages":[{"role":"user","content":"hi"}],"frequency_penalty":1.04,"top_k":14}"#,
+        );
+        assert_eq!(cfg["repetition_penalty"], 1.04, "샘플 철자: {cfg}");
+        assert_eq!(cfg["repetion_penalty"], 1.04, "문서 철자: {cfg}");
+        assert_eq!(cfg["top_k"], 14, "샘플 철자: {cfg}");
+        assert_eq!(cfg["tok_k"], 14, "문서 철자: {cfg}");
+    }
+
+    /// 안 보낸 값은 두 철자 모두 키가 없어야 합니다 — 빈 키를 보내면 서버가 기본값을
+    /// 덮어쓸 수 있습니다.
+    #[test]
+    fn llm_config_omits_both_spellings_when_absent() {
+        let cfg = llm_config(r#"{"messages":[{"role":"user","content":"hi"}],"temperature":0.4}"#);
+        for key in ["repetition_penalty", "repetion_penalty", "top_k", "tok_k"] {
+            assert!(cfg.get(key).is_none(), "{key} 가 실려 나갔습니다: {cfg}");
+        }
+        assert_eq!(cfg["temperature"], 0.4);
+    }
+
+    /// 문서가 사내 `temperature` 를 0–1 로 못박습니다. OpenAI 는 0–2 라 그 범위를
+    /// 기본값으로 보내는 클라이언트가 많아, 거절하지 않고 줄여서 보냅니다.
+    #[test]
+    fn temperature_is_clamped_to_the_fabrix_ceiling() {
+        let cfg = llm_config(r#"{"messages":[{"role":"user","content":"hi"}],"temperature":1.5}"#);
+        assert_eq!(cfg["temperature"], 1.0);
+
+        // 범위 안의 값은 그대로.
+        let ok = llm_config(r#"{"messages":[{"role":"user","content":"hi"}],"temperature":0.4}"#);
+        assert_eq!(ok["temperature"], 0.4);
+    }
+
+    /// 줄였을 때만 로그 한 줄이 붙어야 합니다.
+    #[test]
+    fn temperature_clamp_is_reported_only_when_it_happens() {
+        assert_eq!(temperature_was_clamped(Some(1.5)), Some((1.5, 1.0)));
+        assert_eq!(temperature_was_clamped(Some(2.0)), Some((2.0, 1.0)));
+        assert_eq!(temperature_was_clamped(Some(1.0)), None);
+        assert_eq!(temperature_was_clamped(Some(0.4)), None);
+        assert_eq!(temperature_was_clamped(None), None);
+    }
+
+    /// 두 경로가 공유하는 유일한 종료 사유 판단. 표로 못박아 둡니다.
+    #[test]
+    fn decide_finish_puts_tool_calls_first() {
+        // 도구 호출이 있으면 절단이든 상위 사유든 이깁니다 — 뽑은 호출은 실행 가능합니다.
+        assert_eq!(decide_finish(true, Some("stop"), false), "tool_calls");
+        assert_eq!(decide_finish(true, None, true), "tool_calls");
+        assert_eq!(decide_finish(true, Some("weird"), true), "tool_calls");
+        // 호출이 없으면 절단이 상위 사유를 이깁니다.
+        assert_eq!(decide_finish(false, Some("stop"), true), "length");
+        // 상위가 모르는 값을 줘도 와이어에는 열거값만 나갑니다.
+        assert_eq!(decide_finish(false, Some("weird"), false), "stop");
+        assert_eq!(decide_finish(false, Some("content_filter"), false), "content_filter");
+        assert_eq!(decide_finish(false, None, false), "stop");
+    }
+
+    /// 스트림 중단은 호출부가 `"error"` 로 알리고, clamp 가 `length` 로 접습니다 —
+    /// 끊긴 답변을 완성된 것처럼 `stop` 으로 부르면 안 됩니다.
+    #[test]
+    fn decide_finish_folds_a_midstream_break_to_length() {
+        assert_eq!(decide_finish(false, Some("error"), false), "length");
+        // 다만 이미 완성된 호출을 뽑았다면 그것이 우선입니다 — 사장시킬 이유가 없습니다.
+        assert_eq!(decide_finish(true, Some("error"), false), "tool_calls");
+    }
+
+    /// 비스트림 본문도 스트림과 **같은 순서**의 이벤트가 되어야 합니다.
+    #[test]
+    fn nonstream_events_order_reasoning_then_content_then_finish() {
+        let chunk = FabrixChunk {
+            content: Some("답변".into()),
+            reasoning_content: Some("생각".into()),
+            finish_reason: Some("stop".into()),
+            ..FabrixChunk::default()
+        };
+        assert_eq!(
+            nonstream_events(&chunk),
+            vec![
+                StreamEvent::Reasoning("생각".into()),
+                StreamEvent::Delta("답변".into()),
+                StreamEvent::Finish("stop".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn nonstream_events_skip_empty_fields() {
+        let chunk = FabrixChunk {
+            content: Some(String::new()),
+            reasoning_content: Some(String::new()),
+            finish_reason: Some("   ".into()),
+            ..FabrixChunk::default()
+        };
+        // 빈 값으로 이벤트를 만들면 소비자가 빈 델타 청크를 내보냅니다.
+        assert_eq!(nonstream_events(&chunk), Vec::new());
+    }
+
+    /// 추론만 있고 본문이 빈 응답 — 이번 버그의 실제 모양입니다.
+    #[test]
+    fn nonstream_events_carry_reasoning_only_answers() {
+        let chunk = FabrixChunk {
+            content: None,
+            reasoning_content: Some("<tool_call>{\"name\":\"read\"}</tool_call>".into()),
+            ..FabrixChunk::default()
+        };
+        assert_eq!(
+            nonstream_events(&chunk),
+            vec![StreamEvent::Reasoning("<tool_call>{\"name\":\"read\"}</tool_call>".into())]
+        );
+    }
+
     #[test]
     fn decoder_records_the_truncated_flag() {
         let mut d = StreamDecoder::new();
@@ -1491,103 +1739,107 @@ mod tests {
         assert!(d.truncated);
     }
 
-    /// 누적 모드에서 상위가 답변을 다시 쓰면 전체 본문이 델타로 재방출됩니다.
-    /// 그 사실을 알려 주지 않으면 텍스트를 누적해 파싱하는 소비자가 이미 처리한
-    /// 것을 두 번 처리합니다.
+    /// `content` 는 증분입니다 — 벤더 샘플이 `result_message += …` 로 이어 붙입니다.
+    /// 프레임이 접두사처럼 보여도 누적으로 오판하면 안 됩니다.
     #[test]
-    fn cumulative_rewrite_emits_reset_before_the_replacement() {
+    fn content_frames_are_always_incremental() {
         let mut d = StreamDecoder::new();
-        assert_eq!(d.push("data: {\"content\":\"안녕\"}\n".as_bytes()), vec![StreamEvent::Delta("안녕".into())]);
-        // 두 번째 프레임이 접두사라 누적 모드로 확정됩니다.
         assert_eq!(
-            d.push("data: {\"content\":\"안녕하세요\"}\n".as_bytes()),
-            vec![StreamEvent::Delta("하세요".into())]
+            d.push("data: {\"content\":\"안\"}\n".as_bytes()),
+            vec![StreamEvent::Delta("안".into())]
         );
-        // 접두사가 아닌 본문 → 재작성.
         assert_eq!(
-            d.push("data: {\"content\":\"전혀 다른 답\"}\n".as_bytes()),
-            vec![StreamEvent::Reset, StreamEvent::Delta("전혀 다른 답".into())]
+            d.push("data: {\"content\":\"녕\"}\n".as_bytes()),
+            vec![StreamEvent::Delta("녕".into())]
         );
-        assert_eq!(d.text(), "전혀 다른 답");
+        // "안" 다음에 "안녕" 이 와도 접두사 판별을 하지 않습니다 — 증분이니 그대로 잇습니다.
+        assert_eq!(
+            d.push("data: {\"content\":\"안녕\"}\n".as_bytes()),
+            vec![StreamEvent::Delta("안녕".into())]
+        );
+        assert_eq!(d.text(), "안녕안녕");
     }
 
+    /// `data:` 없는 줄은 프레임이 아닙니다 — 벤더가 표준 SSE(`sseclient`)를 씁니다.
     #[test]
-    fn incremental_mode_never_emits_reset() {
+    fn lines_without_the_data_prefix_are_ignored() {
         let mut d = StreamDecoder::new();
-        d.push("data: {\"content\":\"안\"}\n".as_bytes());
-        let events = d.push("data: {\"content\":\"녕\"}\n".as_bytes());
-        assert_eq!(events, vec![StreamEvent::Delta("녕".into())]);
-        assert_eq!(d.text(), "안녕");
+        assert_eq!(d.push("{\"content\":\"생 JSON\"}\n".as_bytes()), Vec::new());
+        assert_eq!(d.push("event: message\n".as_bytes()), Vec::new());
+        assert_eq!(d.push(": keep-alive 주석\n".as_bytes()), Vec::new());
+        assert_eq!(d.text(), "");
+        // 제대로 된 프레임만 통과합니다.
+        assert_eq!(
+            d.push("data: {\"content\":\"본문\"}\n".as_bytes()),
+            vec![StreamEvent::Delta("본문".into())]
+        );
     }
 
     // ── 디코더 + 스캐너 결합 (펌프가 실제로 하는 일) ──
 
     /// 목업이 `MOCK_CHUNK=3` 으로 흘리는 것과 같은 모양의 SSE 프레임을 만듭니다.
     /// 센티널 한가운데가 갈립니다: `.\n<` `too` `l_c` `all` `>\n{` …
-    fn sse_frames(body: &str, chunk: usize, cumulative: bool) -> Vec<String> {
-        let chars: Vec<char> = body.chars().collect();
-        let mut frames = Vec::new();
-        let mut sent = String::new();
-        for piece in chars.chunks(chunk) {
-            let piece: String = piece.iter().collect();
-            sent.push_str(&piece);
-            let content = if cumulative { sent.clone() } else { piece };
-            frames.push(format!(
-                "data: {}\n",
-                serde_json::json!({ "content": content })
-            ));
-        }
-        frames
+    ///
+    /// `key` 로 채널을 고릅니다 — `content` 또는 `reasoning_content`.
+    fn sse_frames(body: &str, chunk: usize, key: &str) -> Vec<String> {
+        body.chars()
+            .collect::<Vec<char>>()
+            .chunks(chunk)
+            .map(|piece| {
+                let piece: String = piece.iter().collect();
+                format!("data: {}\n", serde_json::json!({ key: piece }))
+            })
+            .collect()
     }
 
     /// 프레임을 디코더에 먹이고 스캐너까지 태워, 펌프가 내보낼 텍스트와 도구 호출을
     /// 그대로 재현합니다.
     fn decode_and_scan(frames: &[String], names: &[&str]) -> (String, Vec<(u32, String, String)>) {
-        use super::super::tools::ToolCallScanner;
+        use super::super::tools::{Channel, ScanOut, ToolCallScanner};
         let mut decoder = StreamDecoder::new();
         let mut scanner =
             ToolCallScanner::new(names.iter().map(|s| s.to_string()).collect::<Vec<_>>(), true);
         let mut text = String::new();
         let mut calls = Vec::new();
 
-        let absorb = |out: super::super::tools::ScanOut,
-                          text: &mut String,
-                          calls: &mut Vec<(u32, String, String)>| {
+        let absorb = |out: ScanOut, text: &mut String, calls: &mut Vec<(u32, String, String)>| {
             text.push_str(&out.text);
             for c in out.calls {
                 calls.push((c.index, c.name, c.arguments));
             }
         };
 
-        for frame in frames {
-            for event in decoder.push(frame.as_bytes()) {
-                match event {
-                    StreamEvent::Delta(d) => absorb(scanner.push(&d), &mut text, &mut calls),
-                    StreamEvent::Reset => scanner.reset(),
-                    _ => {}
+        let mut events: Vec<StreamEvent> =
+            frames.iter().flat_map(|f| decoder.push(f.as_bytes())).collect();
+        events.extend(decoder.finish());
+        for event in events {
+            match event {
+                StreamEvent::Delta(d) => {
+                    absorb(scanner.push_on(Channel::Content, &d), &mut text, &mut calls)
                 }
+                StreamEvent::Reasoning(r) => {
+                    absorb(scanner.push_on(Channel::Reasoning, &r), &mut text, &mut calls)
+                }
+                _ => {}
             }
         }
-        for event in decoder.finish() {
-            if let StreamEvent::Delta(d) = event {
-                absorb(scanner.push(&d), &mut text, &mut calls);
-            }
-        }
-        absorb(scanner.finish(), &mut text, &mut calls);
+        absorb(scanner.finish_on(Channel::Content), &mut text, &mut calls);
+        absorb(scanner.finish_on(Channel::Reasoning), &mut text, &mut calls);
         (text, calls)
     }
 
     const TOOL_BODY: &str = "만들겠습니다.\n<tool_call>\n{\"name\":\"write\",\"arguments\":{\"filePath\":\"index.html\",\"content\":\"<!doctype html>\"}}\n</tool_call>";
 
-    /// README 가 요구하는 불변식: snake|camel × delta|cumulative 네 조합이 같은
-    /// 결과를 내야 합니다. 도구 호출도 예외가 아닙니다.
+    /// 프레임 경계가 어디로 떨어져도, **어느 채널로 와도** 같은 결과여야 합니다.
+    /// 추론 채널 축이 이번에 추가된 것입니다 — 예전에는 누적/증분 축이 있었지만
+    /// 실서버가 증분으로 확정되어 그 축은 사라졌습니다.
     #[test]
-    fn tool_call_survives_frame_splitting_in_both_stream_modes() {
-        for cumulative in [false, true] {
+    fn tool_call_survives_frame_splitting_on_both_channels() {
+        for key in ["content", "reasoning_content"] {
             for chunk in [1usize, 3, 7, 200] {
-                let frames = sse_frames(TOOL_BODY, chunk, cumulative);
+                let frames = sse_frames(TOOL_BODY, chunk, key);
                 let (text, calls) = decode_and_scan(&frames, &["write", "read"]);
-                let label = format!("cumulative={cumulative} chunk={chunk}");
+                let label = format!("key={key} chunk={chunk}");
 
                 assert_eq!(calls.len(), 1, "{label} — 도구 호출 수");
                 assert_eq!(calls[0].0, 0, "{label} — index");
@@ -1606,21 +1858,13 @@ mod tests {
 
     #[test]
     fn ordinary_answer_is_untouched_by_the_scanner() {
-        for cumulative in [false, true] {
-            let frames = sse_frames(ANSWER_SAMPLE, 3, cumulative);
+        for key in ["content", "reasoning_content"] {
+            let frames = sse_frames(ANSWER_SAMPLE, 3, key);
             let (text, calls) = decode_and_scan(&frames, &["write"]);
-            assert!(calls.is_empty(), "cumulative={cumulative}");
-            assert_eq!(text, ANSWER_SAMPLE, "cumulative={cumulative}");
+            assert!(calls.is_empty(), "key={key}");
+            assert_eq!(text, ANSWER_SAMPLE, "key={key}");
         }
     }
 
     const ANSWER_SAMPLE: &str = "시연차는 입사 1년 차에 15일이 부여됩니다. 자세한 내용은 규정을 보세요.";
-
-    #[test]
-    fn single_user_turn_stays_bare() {
-        // 도구 분기를 넣어도 가장 흔한 단일 턴은 라벨 없이 그대로 나가야 합니다.
-        let msgs = vec![msg(r#"{"role":"user","content":"안녕"}"#)];
-        let (_, contents) = fold_messages(&msgs);
-        assert_eq!(contents, vec!["안녕".to_string()]);
-    }
 }

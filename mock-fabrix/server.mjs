@@ -2,13 +2,15 @@
 //
 //   npm run mock
 //
-// 스펙 문서에 SSE 프레임 형식이 없어 프록시의 파서를 방어적으로 짰습니다.
-// 이 서버는 그 방어 경로를 **강제로 골라 실행**하기 위한 것입니다.
+// 벤더 샘플로 와이어 포맷이 확정된 뒤로, 이 서버는 **실서버와 같은 모양**을 기본값으로
+// 흘립니다: 표준 SSE(`data:`) · `content` 는 증분 · 종료 센티널 없음. 나머지 스위치는
+// 프록시가 견뎌야 하는 경계(프레임 분할·멀티바이트·실패)를 강제로 고르는 데 씁니다.
 //
 //   MOCK_PORT=9900          포트
 //   MOCK_CASE=camel|snake   스트림 필드 표기 (기본 snake — 문서상 스트림은 스네이크)
-//   MOCK_STREAM=delta|cumulative   content 가 증분인지 누적인지
-//   MOCK_RAW=1              `data: ` 접두 없이 개행 구분 JSON 으로 흘림
+//   MOCK_DONE=1             끝에 `data: [DONE]` 을 붙입니다. **실서버는 보내지 않습니다**
+//                           (샘플이 모든 이벤트에 json.loads 를 그대로 걸므로 — [DONE] 이면
+//                           죽습니다). 프록시가 있어도 견디는지 볼 때만 켭니다.
 //   MOCK_FAIL=429|500|timeout|midstream   실패 경로 재현
 //   MOCK_DELAY=40           프레임 간 지연(ms)
 //   MOCK_TOOLCALL=single|parallel|prose|malformed|unknown|fenced
@@ -17,6 +19,15 @@
 //                           malformed/unknown/fenced 는 원문 텍스트로 되돌아와야 합니다.
 //   MOCK_CHUNK=7            프레임당 글자 수. 3 이나 1 로 낮추면 <tool_call> 센티널이
 //                           여러 프레임에 걸쳐 쪼개집니다 — 파서가 깨지는 지점.
+//   MOCK_REASONING=field|think
+//                           답변을 **추론 쪽**으로 흘립니다. 사내 추론 모델이 센티널을
+//                           추론에 실어 보내는 상황을 재현합니다 — 프록시가 추론 채널을
+//                           스캔하지 않으면 호출이 영구히 0건이고 finish_reason 이 영구히
+//                           stop 이라, 에이전트가 한 스텝 만에 멈춥니다.
+//                            field = reasoningContent / reasoning_content 필드로 보냄
+//                            think = 본문 content 안에 <think>…</think> 로 감싸 보냄
+//                           MOCK_TOOLCALL 과 함께 쓰세요:
+//                            MOCK_TOOLCALL=single MOCK_REASONING=field MOCK_CHUNK=1
 //   MOCK_SPLITBYTES=1       SSE 한 줄을 임의 바이트 지점에서 두 번에 나눠 write
 //   MOCK_NOSTREAM=llm|rag|filter   비스트림 응답 형태 (기본 llm)
 //                            llm    = content 에 답변
@@ -36,7 +47,7 @@
 //                            모델이 정말 빈 답을 준 경우 — 502 가 아니라 200 content:"" 여야 합니다.
 //
 // 조합 예시:
-//   MOCK_CASE=camel MOCK_STREAM=cumulative npm run mock
+//   MOCK_TOOLCALL=single MOCK_REASONING=field MOCK_CHUNK=1 npm run mock
 //   MOCK_NOSTREAM=rag npm run mock
 //   MOCK_ECHO=1 npm run mock
 //   MOCK_FINISH=weird npm run mock
@@ -45,8 +56,8 @@ import { createServer } from 'node:http'
 
 const PORT = Number(process.env.MOCK_PORT ?? 9900)
 const CASE = process.env.MOCK_CASE === 'camel' ? 'camel' : 'snake'
-const MODE = process.env.MOCK_STREAM === 'cumulative' ? 'cumulative' : 'delta'
-const RAW = process.env.MOCK_RAW === '1'
+// 실서버는 종료 센티널을 보내지 않습니다. 기본 off — 프록시의 관용을 볼 때만 켭니다.
+const DONE = process.env.MOCK_DONE === '1'
 const FAIL = process.env.MOCK_FAIL ?? ''
 const DELAY = Number(process.env.MOCK_DELAY ?? 40)
 const NOSTREAM = ['rag', 'filter'].includes(process.env.MOCK_NOSTREAM)
@@ -120,6 +131,25 @@ const ECHO = process.env.MOCK_ECHO === '1'
 const USAGE = process.env.MOCK_USAGE === '1'
 const EMPTY = process.env.MOCK_EMPTY === '1'
 const FINISH = process.env.MOCK_FINISH ?? ''
+const REASONING = ['field', 'think'].includes(process.env.MOCK_REASONING)
+  ? process.env.MOCK_REASONING
+  : ''
+
+/**
+ * 답변을 (본문, 추론) 두 채널로 나눕니다. MOCK_REASONING 이 이 분배를 정합니다.
+ *
+ * 기본은 전부 본문 — 지금까지 목업이 할 수 있던 유일한 모양이고, 그래서 "추론 쪽에
+ * 센티널이 실린다" 는 실제 실패를 재현할 수단이 없었습니다.
+ */
+function channels(answer) {
+  if (!REASONING || !answer) return { content: answer, reasoning: '' }
+  if (REASONING === 'field') {
+    // 센티널을 추론 채널에만 싣습니다. 프록시가 추론을 스캔해야 호출이 잡힙니다.
+    return { content: '확인했습니다.', reasoning: answer }
+  }
+  // think — 본문 안에 태그로 감쌉니다. 프록시가 갈라내야 답변이 오염되지 않습니다.
+  return { content: `<think>${answer}</think>확인했습니다.`, reasoning: '' }
+}
 
 /** 프록시가 실제로 보낸 것을 답변으로 되돌려줍니다 — fold 결과를 눈으로 보는 용도. */
 function echoBody(body) {
@@ -217,13 +247,20 @@ async function handleMessages(req, res) {
     return json(res, 400, { message: 'JSON 파싱 실패' })
   }
 
+  // `contents` 는 턴 배열입니다(위치가 롤 — 짝수 user, 홀수 assistant). 원소 수와 각
+  // 원소의 앞부분을 찍어, 프록시가 멀티턴을 제대로 나눠 보냈는지 MOCK_ECHO 없이도
+  // 한눈에 보이게 합니다. 예전 프록시는 전부 한 덩어리로 접어 원소가 언제나 1개였습니다.
+  const turns = body.contents ?? []
   log('POST /openapi/chat/v1/messages', JSON.stringify({
     modelIds: body.modelIds,
     isStream: body.isStream,
     systemPrompt: body.systemPrompt ? `${body.systemPrompt.slice(0, 24)}…` : undefined,
-    contents: (body.contents ?? []).map((c) => `${String(c).slice(0, 24)}…`),
+    contents: `${turns.length}턴`,
     llmConfig: body.llmConfig,
   }))
+  turns.forEach((c, i) => {
+    log(`  contents[${i}] ${i % 2 === 0 ? 'user     ' : 'assistant'} ${String(c).slice(0, 60)}…`)
+  })
 
   if (FAIL === '429') return json(res, 429, { message: '사내 쿼터를 초과했습니다(모의)' })
   if (FAIL === '500') return json(res, 500, { message: '사내 서버 내부 오류(모의)' })
@@ -237,6 +274,10 @@ async function handleMessages(req, res) {
 
   // 답변 본문. MOCK_EMPTY 는 빈 문자열(성공 표지는 그대로), MOCK_ECHO 는 받은 payload.
   const answer = EMPTY ? '' : ECHO ? echoBody(body) : BODY
+  // ECHO 는 받은 payload 를 그대로 보여 주는 용도라 채널을 나누지 않습니다.
+  const { content: answerContent, reasoning: answerReasoning } = ECHO
+    ? { content: answer, reasoning: '' }
+    : channels(answer)
 
   if (!body.isStream) {
     // 실제 FabriX 비스트림 응답 스키마를 재현합니다(mock 이 그동안 흉내 내지 않던 필드 포함).
@@ -256,8 +297,8 @@ async function handleMessages(req, res) {
     return json(res, 200, {
       userId: '00000000-0000-0000-0000-000000000000',
       modelType,
-      content: isRag || isFilter ? null : answer,
-      reasoningContent: null,
+      content: isRag || isFilter ? null : answerContent,
+      reasoningContent: isRag || isFilter ? null : answerReasoning || null,
       processingContent: [],
       contentReferences: isRag
         ? [{ plugin: 'RAG', answer: BODY, references: [], argumented_standalone_queries: '' }]
@@ -290,12 +331,19 @@ async function handleMessages(req, res) {
 
   // 의도적으로 한글 경계를 무시하고 잘라, 멀티바이트가 청크 경계에 걸리게 합니다.
   // MOCK_CHUNK 를 낮추면 <tool_call> 센티널도 여러 프레임에 걸쳐 쪼개집니다.
+  //
+  // 추론을 먼저 흘리고 그다음 본문 — 실제 추론 모델의 순서입니다. 각 조각은 자기
+  // 채널의 키(`reasoning_content` / `content`)로 나갑니다.
   const pieces = []
-  for (let i = 0; i < answer.length; i += CHUNK) pieces.push(answer.slice(i, i + CHUNK))
+  const cutInto = (text, key) => {
+    for (let i = 0; i < text.length; i += CHUNK) pieces.push({ key, text: text.slice(i, i + CHUNK) })
+  }
+  cutInto(answerReasoning, 'reasoningContent')
+  cutInto(answerContent, 'content')
 
   const send = (obj) => {
     const line = JSON.stringify(obj)
-    const frame = RAW ? `${line}\n` : `data: ${line}\n\n`
+    const frame = `data: ${line}\n\n`
     if (!SPLITBYTES) return res.write(frame)
     // SSE 한 줄을 임의 바이트 지점에서 두 번에 나눠 씁니다 — 디코더가 줄 단위로만
     // 자르는지, 멀티바이트 문자가 write 경계에 걸려도 견디는지 봅니다.
@@ -305,7 +353,6 @@ async function handleMessages(req, res) {
     res.write(buf.subarray(cut))
   }
 
-  let sent = ''
   let index = 0
 
   const tick = () => {
@@ -319,23 +366,30 @@ async function handleMessages(req, res) {
     }
 
     if (index >= pieces.length) {
+      // 종료 프레임 — 샘플이 `status == 'SUCCESS' and response_code == 'R20000'` 으로
+      // 끝을 판정하므로 그 두 값을 실어 보냅니다.
       send(
         shape({
           modelType,
           content: '',
           finishReason: FINISH || 'stop',
+          eventStatus: 'CHUNK',
           status: 'SUCCESS',
+          responseCode: 'R20000',
           ...usageFields(812, 240),
         }),
       )
-      if (!RAW) res.write('data: [DONE]\n\n')
+      if (DONE) res.write('data: [DONE]\n\n')
       res.end()
-      log(`스트림 종료 · ${pieces.length}프레임 · ${CASE}/${MODE}${RAW ? '/raw' : ''}`)
+      log(`스트림 종료 · ${pieces.length}프레임 · ${CASE}${DONE ? ' · [DONE]' : ''}`)
       return
     }
 
-    sent += pieces[index]
-    send(shape({ modelType, content: MODE === 'cumulative' ? sent : pieces[index] }))
+    // 증분입니다 — 벤더 샘플이 `result_message += ch_json['content']` 로 이어 붙입니다.
+    // 예전에는 MOCK_STREAM=cumulative 로 누적도 흉내 냈지만, 실서버가 증분으로 확정되어
+    // 있지도 않은 모드를 시험하는 스위치였습니다.
+    const piece = pieces[index]
+    send(shape({ modelType, eventStatus: 'CHUNK', [piece.key]: piece.text }))
     index += 1
     setTimeout(tick, DELAY)
   }
@@ -410,6 +464,9 @@ const server = createServer((req, res) => {
 
 server.listen(PORT, '127.0.0.1', () => {
   log(`http://127.0.0.1:${PORT}`)
-  log(`표기 ${CASE} · content ${MODE}${RAW ? ' · raw(개행 구분)' : ' · SSE(data:)'}${FAIL ? ` · FAIL=${FAIL}` : ''}`)
+  log(
+    `표기 ${CASE} · content 증분 · SSE(data:)${DONE ? ' · [DONE]' : ''}` +
+      `${REASONING ? ` · 추론=${REASONING}` : ''}${FAIL ? ` · FAIL=${FAIL}` : ''}`,
+  )
   log('프록시 온보딩에 이 주소를 넣고, 인증키/토큰은 아무 값이나 채우세요.')
 })
