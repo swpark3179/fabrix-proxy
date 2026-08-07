@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use uuid::Uuid;
 
-use crate::logstore::{self, Kind, LogEntry};
+use crate::logstore::{self, Kind, LogEntry, RawWire};
 use crate::openai::{ErrorEnvelope, ModelCard, ModelList};
 use crate::state::{self, ModelsCache, Shared, MODELS_CACHE_TTL};
 
@@ -111,6 +111,8 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap) -> Response
             fabrix_url,
             resp_body: envelope.error.message.clone(),
             resp_meta: format!("거부 · HTTP {status}"),
+            // 모델 목록에는 와이어 원문 칸을 쓰지 않습니다 — 진단이 필요한 곳은 채팅입니다.
+            raw: RawWire::default(),
         });
         return error_response(status, envelope);
     }
@@ -153,6 +155,7 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap) -> Response
                     models.len(),
                     if cached { "캐시에서 반환" } else { "사내에서 새로 조회" }
                 ),
+                raw: RawWire::default(),
             });
 
             Json(list).into_response()
@@ -185,6 +188,7 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap) -> Response
                 fabrix_url,
                 resp_body: err.message(),
                 resp_meta: format!("실패 · HTTP {status}"),
+                raw: RawWire::default(),
             });
 
             error_response(status, err.envelope())
@@ -249,6 +253,7 @@ pub async fn retrieve(
         fabrix_url: fabrix_url.clone(),
         resp_body,
         resp_meta,
+        raw: RawWire::default(),
     };
 
     if let Err((status, envelope)) = authorize(&cfg, &headers) {

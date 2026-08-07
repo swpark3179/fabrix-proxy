@@ -48,6 +48,13 @@ pub struct Config {
     /// 규약을 `systemPrompt` 에 심고 답변에서 `<tool_call>` 을 걷어내는 방식으로
     /// 흉내 냅니다. 요청에 `tools` 가 없으면 아무 영향이 없습니다.
     pub tool_emulation: bool,
+    /// 와이어 원문 기록. 사내가 준 응답과 클라이언트로 나간 응답을 **가공 없이**
+    /// 로그 한 건에 함께 담습니다(각 [`crate::logstore::RAW_CAP`] 상한).
+    ///
+    /// 기본이 켜짐인 이유: 이 앱이 답해야 하는 질문의 대부분이 "우리가 뭘 받았고 뭘
+    /// 보냈나" 이고, 그 답은 일이 벌어진 **그때** 기록해 두지 않으면 되살릴 수 없습니다.
+    /// 재현이 안 되는 한 번짜리 응답이 특히 그렇습니다. 메모리를 아껴야 하면 끕니다.
+    pub raw_wire_log: bool,
 }
 
 impl Default for Config {
@@ -67,6 +74,7 @@ impl Default for Config {
             vision_model: String::new(),
             image_stub_mode: false,
             tool_emulation: true,
+            raw_wire_log: true,
         }
     }
 }

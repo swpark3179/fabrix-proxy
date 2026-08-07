@@ -282,6 +282,11 @@
   background: var(--run);
 }
 
+/* ④ 와이어 원문 — 진단용 칸이라 앞의 세 단계보다 한 톤 물러섭니다. */
+.step__num--4 {
+  background: var(--ink-5);
+}
+
 .step__title {
   font: 600 12.5px var(--font-sans);
   color: var(--ink);
@@ -324,6 +329,12 @@
   background: rgba(191, 53, 36, 0.05);
   border-color: rgba(191, 53, 36, 0.26);
   color: #a12c1e;
+}
+
+/* 와이어 원문은 한 글자도 다르면 안 되는 칸이라 언제나 고정폭으로 읽힙니다. */
+.code--raw {
+  font-family: var(--font-mono);
+  color: var(--ink-4);
 }
 
 /* 답변 본문은 코드가 아니라 글이므로 본문 폰트로 읽힙니다. */

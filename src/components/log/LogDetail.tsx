@@ -112,6 +112,10 @@ export function LogDetail({ entry, baseUrl, onCopyCurl }: Props) {
         />
       </section>
 
+      {/* ④ 와이어 원문 — 채팅에만 붙습니다. ③ 칸은 이미 가공된 답변이라, "0자" 가
+          모델이 말을 안 한 것인지 우리가 프레임을 못 읽은 것인지 여기서만 갈립니다. */}
+      {chat && <RawWireStep entry={entry} onExpand={setFull} />}
+
       {!chat && !entry.isError && (
         <div className="footnote">
           여기 나온 <code>id</code> 가 클라이언트의 <code>model</code> 칸에 넣는 값입니다.
@@ -137,6 +141,64 @@ export function LogDetail({ entry, baseUrl, onCopyCurl }: Props) {
 
       {full && <FullTextModal open={full} onClose={() => setFull(null)} />}
     </div>
+  )
+}
+
+/**
+ * ④ 와이어 원문 — 사내가 준 바이트와 클라이언트로 나간 바이트를 가공 없이 보여 줍니다.
+ *
+ * 두 쪽을 함께 두는 이유: 답변이 비었을 때 원인이 어느 쪽에 있는지가 한눈에 갈립니다.
+ * 위쪽이 비어 있으면 사내가 아무것도 안 준 것이고, 위쪽에 글이 보이는데 아래쪽이
+ * 비어 있으면 우리가 흘린 것입니다. "전체보기 → 본문 복사" 로 그대로 공유할 수 있습니다.
+ */
+function RawWireStep({
+  entry,
+  onExpand,
+}: {
+  entry: LogEntry
+  onExpand: (full: FullText) => void
+}) {
+  const { captured, upstream, client } = entry.raw
+
+  return (
+    <section className="step">
+      <div className="step__head">
+        <span className="step__num step__num--4">4</span>
+        <span className="step__title">와이어 원문</span>
+        <span className="step__hint">
+          {captured
+            ? '가공 전 · 사내가 준 바이트와 클라이언트로 나간 바이트'
+            : '기록이 꺼져 있습니다'}
+        </span>
+      </div>
+
+      {captured ? (
+        <>
+          <CollapsibleCode
+            text={upstream || '(사내가 아무 바이트도 주지 않았습니다)'}
+            className="code code--raw"
+            title="사내 원문"
+            modalClassName="code--raw"
+            header={<span className="code__headers">사내 → 프록시</span>}
+            onExpand={onExpand}
+          />
+          <CollapsibleCode
+            text={client || '(클라이언트로 나간 본문이 없습니다)'}
+            className="code code--raw"
+            title="클라이언트로 나간 원문"
+            modalClassName="code--raw"
+            header={<span className="code__headers">프록시 → 클라이언트</span>}
+            onExpand={onExpand}
+          />
+        </>
+      ) : (
+        <div className="footnote">
+          설정의 <strong>와이어 원문 기록</strong>을 켜면 이 칸에 사내가 준 응답과
+          클라이언트로 나간 응답이 가공 없이 남습니다. 답변이 비었을 때 원인이 사내에
+          있는지 프록시에 있는지 가리는 유일한 근거입니다.
+        </div>
+      )}
+    </section>
   )
 }
 

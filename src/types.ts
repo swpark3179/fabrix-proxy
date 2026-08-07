@@ -48,6 +48,22 @@ export interface LogEntry {
   /** ③ 돌려준 응답 — 자르지 않은 전문. 화면에서 앞부분만 보이고 전체보기로 펼칩니다. */
   respBody: string
   respMeta: string
+  /** ④ 가공하지 않은 와이어 원문. Rust `logstore::RawWire` 와 1:1. */
+  raw: RawWire
+}
+
+/**
+ * 와이어 원문 두 쪽. ③ 칸은 이미 가공된 답변(`<think>` 를 갈라내고 `<tool_call>` 을
+ * 걷어낸 뒤)이라, "0자" 가 모델이 말을 안 한 것인지 우리가 프레임을 못 읽은 것인지
+ * 가리려면 이 원문이 필요합니다.
+ */
+export interface RawWire {
+  /** 기록 스위치가 켜져 있었는가. 꺼져서 빈 것과 켰는데 안 온 것은 뜻이 다릅니다. */
+  captured: boolean
+  /** 사내가 준 바이트 그대로 (SSE 는 `data:` 줄까지). */
+  upstream: string
+  /** 클라이언트로 나간 본문 그대로. */
+  client: string
 }
 
 export interface Snapshot {
@@ -92,6 +108,11 @@ export interface Config {
    * 요청에 `tools` 가 없으면 아무 영향이 없습니다.
    */
   toolEmulation: boolean
+  /**
+   * 와이어 원문 기록. 사내가 준 응답과 클라이언트로 나간 응답을 가공 없이 로그 한
+   * 건에 함께 담습니다(각 256KiB 상한, 메모리에만).
+   */
+  rawWireLog: boolean
 }
 
 /** 모델 목록 한 줄. Rust `commands::ModelRow` 와 1:1. */

@@ -45,6 +45,13 @@
 //                            프록시가 그것을 그대로 흘리지 않는지 봅니다.
 //   MOCK_EMPTY=1            답변을 빈 문자열로 주면서 성공 표지는 남깁니다.
 //                            모델이 정말 빈 답을 준 경우 — 502 가 아니라 200 content:"" 여야 합니다.
+//   MOCK_GARBLE=1           스트림 맨 앞에 **모양이 어긋난 프레임 두 개**를 끼워 넣습니다.
+//                            (1) contentReferences: null — 값이 명시적 null 이면 예전 프록시는
+//                                프레임을 통째로 버렸습니다. 그 안의 content 까지 함께.
+//                                이제는 살아서 답변에 "(널 참조 프레임)" 이 보여야 합니다.
+//                            (2) content 가 문자열이 아니라 객체 — 이건 여전히 읽지 못합니다.
+//                                다만 조용히 사라지지 않고 로그 ③ 칸 꼬리에
+//                                `해석하지 못한 프레임 1개` 로 세어지고, 바이트는 ④ 칸에 남습니다.
 //
 // 조합 예시:
 //   MOCK_TOOLCALL=single MOCK_REASONING=field MOCK_CHUNK=1 npm run mock
@@ -63,6 +70,7 @@ const DELAY = Number(process.env.MOCK_DELAY ?? 40)
 const NOSTREAM = ['rag', 'filter'].includes(process.env.MOCK_NOSTREAM)
   ? process.env.MOCK_NOSTREAM
   : 'llm'
+const GARBLE = process.env.MOCK_GARBLE === '1'
 
 const CLIENT_HEADER = 'x-fabrix-client'
 const TOKEN_HEADER = 'x-openapi-token'
@@ -354,6 +362,16 @@ async function handleMessages(req, res) {
   }
 
   let index = 0
+
+  // 모양이 어긋난 프레임 둘 — 하나는 살아야 하고(널 참조), 하나는 세어져야 합니다(객체 content).
+  // 스트림 맨 앞에 둡니다: 답변이 시작되기도 전에 프록시가 프레임을 버리는지 보는 것이 목적입니다.
+  if (GARBLE) {
+    log('MOCK_GARBLE=1 — 어긋난 프레임 두 개를 앞에 끼웁니다')
+    res.write(
+      `data: ${JSON.stringify({ content: '(널 참조 프레임)', contentReferences: null })}\n\n`,
+    )
+    res.write(`data: ${JSON.stringify({ content: { text: '우리가 못 읽는 모양' } })}\n\n`)
+  }
 
   const tick = () => {
     if (res.writableEnded) return

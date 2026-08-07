@@ -9,6 +9,7 @@
     "gen:fonts": "node scripts/gen-fonts-css.mjs",
     "preview": "vite preview",
     "mock": "node mock-fabrix/server.mjs",
+    "probe": "node scripts/probe-fabrix.mjs",
     "tauri": "tauri"
   },
   "dependencies": {
