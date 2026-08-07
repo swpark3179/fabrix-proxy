@@ -24,6 +24,13 @@ interface Props {
   header?: ReactNode
   /** ③ 하단 메타 줄 등 본문 뒤에 항상 붙는 요소. */
   footer?: ReactNode
+  /**
+   * `전체보기` 옆에 함께 놓을 버튼들.
+   *
+   * 자기 `전체보기` 는 본문이 잘렸을 때만 뜨지만 여기 넘어온 것은 **길이와 무관하게
+   * 늘 보입니다** — ③ 칸의 "사내 원문 보기" 가 짧은 답변에서 사라지면 안 됩니다.
+   */
+  actions?: ReactNode
   onExpand: (full: FullText) => void
 }
 
@@ -39,6 +46,7 @@ export function CollapsibleCode({
   modalClassName,
   header,
   footer,
+  actions,
   onExpand,
 }: Props) {
   const lines = text.split('\n')
@@ -65,13 +73,18 @@ export function CollapsibleCode({
         )}
         {footer}
       </pre>
-      {clipped && (
-        <button
-          className="btn-mini code__more"
-          onClick={() => onExpand({ title, text, className: modalClassName })}
-        >
-          전체보기 ({clippedByLines ? `${lines.length}줄` : `${text.length}자`})
-        </button>
+      {(clipped || actions) && (
+        <div className="code__actions">
+          {clipped && (
+            <button
+              className="btn-mini"
+              onClick={() => onExpand({ title, text, className: modalClassName })}
+            >
+              전체보기 ({clippedByLines ? `${lines.length}줄` : `${text.length}자`})
+            </button>
+          )}
+          {actions}
+        </div>
       )}
     </>
   )

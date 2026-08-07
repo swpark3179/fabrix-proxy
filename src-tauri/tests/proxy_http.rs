@@ -49,8 +49,13 @@ struct Upstream {
     /// 필드 하나가 어긋나면 프레임 전체가 떨어지던 갈래를 재현합니다.
     garble: bool,
     /// 0 이 아니면 이 상태 코드로 거절하고 `reject_body` 를 본문으로 돌려줍니다.
+    /// (`/messages` 만 — 목록 거절은 아래 `models_reject_*` 입니다.)
     reject_status: u16,
     reject_body: String,
+    /// `/models` 거절. 채팅 거절과 따로 두지 않으면 채팅 테스트가 모델 해석 단계에서
+    /// 먼저 막혀, 정작 보려던 갈래에 닿지 못합니다.
+    models_reject_status: u16,
+    models_reject_body: String,
     /// 프록시가 실제로 보낸 payload 들 — 꼬리 리마인더 검증용.
     seen: Vec<Value>,
 }
@@ -69,6 +74,8 @@ impl Default for Upstream {
             garble: false,
             reject_status: 0,
             reject_body: String::new(),
+            models_reject_status: 0,
+            models_reject_body: String::new(),
             seen: Vec::new(),
         }
     }
@@ -112,7 +119,18 @@ fn with_write_tool(mut body: Value) -> Value {
 const MODEL_UUID: &str = "0196f1fc-2858-70a9-a232-74dbddb971d0";
 const KO_ONLY_UUID: &str = "01970a3b-91d4-7c8e-9a11-2f3c4d5e6f75";
 
-async fn upstream_models() -> Json<Value> {
+/// `models_reject_status` 는 `reject_status` 와 **따로** 둡니다 — 채팅 거절을 시험하는
+/// 테스트가 모델 해석 단계에서 먼저 막혀 버리면 정작 보려던 갈래에 닿지 못합니다.
+async fn upstream_models(AxState(up): AxState<Arc<Mutex<Upstream>>>) -> Response {
+    let up = up.lock().unwrap().clone();
+    if up.models_reject_status != 0 {
+        return (
+            axum::http::StatusCode::from_u16(up.models_reject_status).unwrap(),
+            [("content-type", "application/json")],
+            up.models_reject_body.clone(),
+        )
+            .into_response();
+    }
     Json(json!({
         "data": [
             {
@@ -131,6 +149,7 @@ async fn upstream_models() -> Json<Value> {
             },
         ]
     }))
+    .into_response()
 }
 
 async fn upstream_messages(
@@ -984,7 +1003,8 @@ async fn streaming_records_both_sides_of_the_wire() {
     .await;
 
     let raw = newest_chat_log(&state).await.raw;
-    assert!(raw.captured);
+    assert!(raw.upstream_captured);
+    assert!(raw.client_captured);
     // 맨 앞은 상태 줄과 헤더 — ④ 칸 하나로 "무엇이 어떤 모양으로 왔나" 가 답해져야 합니다.
     assert!(raw.upstream.starts_with("HTTP/1.1 200 OK"), "{}", raw.upstream);
     assert!(raw.upstream.contains("content-type: text/event-stream"), "{}", raw.upstream);
@@ -1008,16 +1028,19 @@ async fn non_stream_records_the_upstream_body_and_the_client_body() {
     .await;
 
     let raw = newest_chat_log(&state).await.raw;
-    assert!(raw.captured);
+    assert!(raw.upstream_captured);
+    assert!(raw.client_captured);
     assert!(raw.upstream.contains("\"responseCode\":\"R20000\""), "{}", raw.upstream);
     assert!(raw.client.contains("\"object\":\"chat.completion\""), "{}", raw.client);
     assert!(raw.client.contains("연차는 15일입니다."), "{}", raw.client);
 }
 
-/// 끄면 아무것도 담기지 않습니다. `captured` 가 거짓이라 화면은 "꺼져 있어 비었다" 와
-/// "켰는데 아무것도 안 왔다" 를 다르게 말할 수 있습니다.
+/// 토글을 꺼도 **사내가 준 쪽은 남습니다.** ③ 칸의 "사내 원문 보기" 는 사용자가 답변을
+/// 의심하는 바로 그때 눌리는 버튼이라, 그 순간 설정이 꺼져 있었다면 되살릴 방법이 없습니다.
+/// 토글이 끄는 것은 클라이언트로 나간 쪽뿐이고, 플래그가 쪽마다 있어 화면은 "꺼져 있어
+/// 비었다" 와 "켰는데 아무것도 안 왔다" 를 여전히 다르게 말할 수 있습니다.
 #[tokio::test]
-async fn raw_wire_log_off_keeps_the_buffers_empty() {
+async fn raw_wire_log_off_still_keeps_the_upstream_side() {
     let (upstream_url, _handle) = spawn_upstream(Upstream::answering("답변")).await;
     let mut cfg = config_for(&upstream_url);
     cfg.raw_wire_log = false;
@@ -1030,8 +1053,11 @@ async fn raw_wire_log_off_keeps_the_buffers_empty() {
     .await;
 
     let raw = newest_chat_log(&state).await.raw;
-    assert!(!raw.captured);
-    assert_eq!(raw.upstream, "");
+    assert!(raw.upstream_captured);
+    assert!(raw.upstream.starts_with("HTTP/1.1 200 OK"), "{}", raw.upstream);
+    assert!(raw.upstream.contains("답변"), "{}", raw.upstream);
+
+    assert!(!raw.client_captured);
     assert_eq!(raw.client, "");
 }
 
@@ -1079,6 +1105,77 @@ async fn a_rejected_call_keeps_the_whole_upstream_body() {
 
     let raw = newest_chat_log(&state).await.raw;
     assert!(raw.upstream.starts_with("HTTP/1.1 400 Bad Request"), "{}", raw.upstream);
+    assert!(raw.upstream.contains(reason), "거절 사유가 잘려 나갔습니다: {}", raw.upstream);
+}
+
+/// `/v1/models` 로그의 최신 한 건.
+fn newest_models_log(state: &Shared) -> fabrix_proxy_lib::logstore::LogEntry {
+    state
+        .logs
+        .lock()
+        .unwrap()
+        .snapshot()
+        .into_iter()
+        .find(|e| e.path == "/v1/models")
+        .expect("모델 목록 로그가 남지 않았습니다")
+}
+
+/// ③ 칸이 보여 주는 목록은 우리가 **다시 그린** 것입니다. 사내가 실제로 어떤 JSON 을
+/// 줬는지는 원문에만 있고, 그게 있어야 "우리가 이 이름을 왜 이렇게 읽었나" 를 댈 수 있습니다.
+#[tokio::test]
+async fn models_list_keeps_the_upstream_original() {
+    let (base, state, _up) = harness(Upstream::answering("답변")).await;
+
+    client().get(format!("{base}/v1/models")).send().await.unwrap();
+
+    let raw = newest_models_log(&state).raw;
+    assert!(raw.upstream_captured);
+    // 클라이언트로 나간 쪽은 남기지 않습니다 — 그 본문은 ③ 칸이 이미 목록으로 보여 줍니다.
+    assert!(!raw.client_captured);
+    assert!(raw.upstream.starts_with("HTTP/1.1 200 OK"), "{}", raw.upstream);
+    assert!(raw.upstream.contains("\"modelId\""), "{}", raw.upstream);
+    assert!(raw.upstream.contains("챗 4"), "{}", raw.upstream);
+}
+
+/// 60초 캐시가 살아 있는 동안에는 사내를 부르지 않습니다. 그 호출의 원문 칸을 비워 두면
+/// "사내가 아무것도 안 줬다" 로 읽히므로, 캐시를 채운 조회의 바이트를 **캐시에서 왔다고
+/// 적어서** 보여 줍니다.
+#[tokio::test]
+async fn a_cached_models_call_shows_the_bytes_that_filled_the_cache() {
+    let (base, state, _up) = harness(Upstream::answering("답변")).await;
+
+    client().get(format!("{base}/v1/models")).send().await.unwrap();
+    client().get(format!("{base}/v1/models")).send().await.unwrap();
+
+    let entry = newest_models_log(&state);
+    assert!(entry.cached, "두 번째 호출은 캐시 히트여야 합니다");
+    assert!(entry.raw.upstream_captured);
+    assert!(
+        entry.raw.upstream.starts_with("(60초 캐시가 유효해"),
+        "캐시에서 왔다고 먼저 적어야 합니다: {}",
+        entry.raw.upstream
+    );
+    assert!(entry.raw.upstream.contains("\"modelId\""), "{}", entry.raw.upstream);
+}
+
+/// 목록 조회가 거절당하면 그 응답 전문이 원문 칸에 남습니다 — 채팅 거절과 같은 이유로,
+/// 사내가 *왜* 막았는지는 오류 메시지 뒤에 있을 수 있습니다.
+#[tokio::test]
+async fn a_rejected_models_call_keeps_the_whole_upstream_body() {
+    let reason = "client key is not allowed to list models";
+    let body = json!({ "message": "거절", "padding": "x".repeat(400), "detail": reason }).to_string();
+    let up = Upstream {
+        models_reject_status: 403,
+        models_reject_body: body,
+        ..Upstream::answering("답변")
+    };
+    let (base, state, _up) = harness(up).await;
+
+    client().get(format!("{base}/v1/models")).send().await.unwrap();
+
+    let raw = newest_models_log(&state).raw;
+    assert!(raw.upstream_captured);
+    assert!(raw.upstream.starts_with("HTTP/1.1 403 Forbidden"), "{}", raw.upstream);
     assert!(raw.upstream.contains(reason), "거절 사유가 잘려 나갔습니다: {}", raw.upstream);
 }
 

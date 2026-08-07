@@ -32,6 +32,12 @@ pub struct ModelsCache {
     /// 띄우기 위한 벽시계입니다. `Instant` 는 사람이 읽는 시각으로 되돌릴 수 없습니다.
     pub fetched_at_iso: String,
     pub models: Vec<ResolvedModel>,
+    /// 이 캐시를 채운 조회의 사내 응답 원문(상태 줄·헤더·본문).
+    ///
+    /// 캐시가 따뜻한 동안 `/v1/models` 는 사내를 부르지 않습니다. 그 호출들의 로그
+    /// 원문 칸을 빈손으로 두면 "사내가 아무것도 안 줬다" 로 읽히므로, 목록을 만든
+    /// 바로 그 바이트를 함께 들고 다닙니다(화면에는 캐시에서 왔다고 적습니다).
+    pub raw: String,
 }
 
 pub struct AppState {

@@ -113,18 +113,18 @@ pub async fn list_models(app: AppHandle, refresh: bool) -> Result<ModelListResul
     let state = app.state::<Shared>().inner().clone();
     let cfg = state.config();
 
-    let (models, cached, fetched_at) = proxy::models::load_models(&state, refresh)
+    let loaded = proxy::models::load_models(&state, refresh)
         .await
-        .map_err(|err| err.message())?;
+        .map_err(|(err, _)| err.message())?;
 
-    if !cached {
+    if !loaded.cached {
         state.emit_state();
     }
 
     Ok(ModelListResult {
-        models: ModelRow::rows(&models, &cfg.default_model_alias),
-        cached,
-        fetched_at,
+        models: ModelRow::rows(&loaded.models, &cfg.default_model_alias),
+        cached: loaded.cached,
+        fetched_at: loaded.fetched_at,
         default_alias: cfg.default_model_alias.clone(),
         source_url: cfg.normalized_base_url(),
         cache_ttl_secs: MODELS_CACHE_TTL.as_secs(),
@@ -148,8 +148,12 @@ pub async fn set_default_model(app: AppHandle, alias: String) -> Result<Snapshot
     Ok(state.snapshot())
 }
 
+/// `async` 인 이유: 이 커맨드는 모델 목록 창을 **처음 열 때 만듭니다**. 동기 커맨드
+/// 안에서 창을 만들면 Windows 에서 교착합니다(tauri#5306) — `windows::show_models` 가
+/// 생성을 async 런타임으로 넘겨 이미 막고 있지만, 커맨드 자체도 문서가 권하는 형태로
+/// 둡니다. 창을 만드는 코드가 언제 이 자리로 되돌아올지 모릅니다.
 #[tauri::command]
-pub fn open_models_window(app: AppHandle) {
+pub async fn open_models_window(app: AppHandle) {
     windows::show_models(&app);
 }
 
@@ -193,7 +197,7 @@ pub async fn test_connection(
         token: openapi_token,
     };
 
-    let raw = client.list_models().await.map_err(|err| err.message())?;
+    let (raw, _) = client.list_models().await.map_err(|(err, _)| err.message())?;
     let models = build_aliases(&raw);
     Ok(TestResult {
         model_count: models.len(),

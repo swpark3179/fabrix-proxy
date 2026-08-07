@@ -75,13 +75,17 @@ struct Ctx {
     /// 클라이언트의 `messages` 가 아니라 이걸로 토큰을 추정합니다 — 모델이 실제로 본
     /// 글이 이것이고, 주입된 도구 규약까지 포함해야 값이 맞습니다.
     prompt_text: String,
-    /// 사내가 준 바이트 그대로. 설정에서 끄면 아무것도 담지 않습니다.
+    /// 사내가 준 바이트 그대로. **설정과 무관하게 언제나 담습니다.**
     ///
     /// 로그 ③ 칸은 이미 **가공된** 답변입니다(`<think>` 를 갈라내고 `<tool_call>` 을
     /// 걷어낸 뒤). 그래서 "0자" 가 나왔을 때 모델이 아무 말도 안 한 것인지, 우리가
     /// 프레임을 못 읽은 것인지 구분할 방법이 없었습니다. 이 두 버퍼가 그 자리입니다.
+    ///
+    /// 이쪽만 토글에서 뺀 이유: ③ 칸의 "사내 원문 보기" 는 사용자가 답변을 의심하는
+    /// **바로 그때** 눌리는 버튼입니다. 그 순간 설정이 꺼져 있었다면 되살릴 방법이
+    /// 없고, 재현되지 않는 한 번짜리 응답이 특히 그렇습니다.
     raw_upstream: RawBuf,
-    /// 클라이언트로 나간 본문 그대로.
+    /// 클라이언트로 나간 본문 그대로. 이쪽은 `rawWireLog` 토글이 제어합니다.
     raw_client: RawBuf,
 }
 
@@ -261,7 +265,8 @@ impl Ctx {
             resp_body,
             resp_meta,
             raw: RawWire {
-                captured: self.raw_upstream.enabled(),
+                upstream_captured: self.raw_upstream.enabled(),
+                client_captured: self.raw_client.enabled(),
                 upstream: self.raw_upstream.text(),
                 client: self.raw_client.text(),
             },
@@ -333,7 +338,8 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Body)
         model_defaulted: false,
         temperature_requested: None,
         prompt_text: String::new(),
-        raw_upstream: RawBuf::new(cfg.raw_wire_log),
+        // 사내가 준 쪽은 토글을 보지 않습니다 — ③ 칸의 원문 보기가 늘 동작해야 합니다.
+        raw_upstream: RawBuf::new(true),
         raw_client: RawBuf::new(cfg.raw_wire_log),
     };
 
@@ -402,8 +408,10 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Body)
 
     // ── 모델 해석 ───────────────────────────────────────────
     let models = match ensure_models(&state).await {
-        Ok((models, _)) => models,
-        Err(err) => {
+        Ok(loaded) => loaded.models,
+        // 목록 조회의 응답 원문은 흘려보냅니다 — 이 로그 한 건의 ④ 칸은 채팅 호출의
+        // 원문 자리이고, 목록 조회는 자기 로그(`/v1/models`)에 이미 남습니다.
+        Err((err, _)) => {
             // 목록 조회가 실패해도 클라이언트가 UUID 를 직접 보냈다면 진행합니다.
             match req.model.as_deref().filter(|m| Uuid::parse_str(m).is_ok()) {
                 Some(uuid) => vec![ResolvedModel {

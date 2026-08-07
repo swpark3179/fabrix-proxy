@@ -411,7 +411,12 @@
   font-family: var(--font-mono);
 }
 
-.code__more {
+/* `전체보기` 와 ③ 칸의 `사내 원문 보기` 가 한 줄에 나란히 섭니다. 둘 중 하나만
+   있어도 같은 자리에 같은 여백으로 떨어지도록 정렬은 이 줄이 갖습니다. */
+.code__actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   align-self: flex-start;
   margin-top: 1px;
 }
