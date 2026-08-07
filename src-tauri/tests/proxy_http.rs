@@ -48,6 +48,9 @@ struct Upstream {
     /// 우리가 읽지 못하는 모양의 프레임을 하나 끼워 넣습니다(`content` 가 객체).
     /// 필드 하나가 어긋나면 프레임 전체가 떨어지던 갈래를 재현합니다.
     garble: bool,
+    /// 0 이 아니면 이 상태 코드로 거절하고 `reject_body` 를 본문으로 돌려줍니다.
+    reject_status: u16,
+    reject_body: String,
     /// 프록시가 실제로 보낸 payload 들 — 꼬리 리마인더 검증용.
     seen: Vec<Value>,
 }
@@ -64,6 +67,8 @@ impl Default for Upstream {
             fail_midstream: false,
             sse_always: false,
             garble: false,
+            reject_status: 0,
+            reject_body: String::new(),
             seen: Vec::new(),
         }
     }
@@ -139,6 +144,15 @@ async fn upstream_messages(
         guard.seen.push(req);
         guard.clone()
     };
+    if up.reject_status != 0 {
+        return (
+            axum::http::StatusCode::from_u16(up.reject_status).unwrap(),
+            [("content-type", "application/json")],
+            up.reject_body.clone(),
+        )
+            .into_response();
+    }
+
     let answer = if up.empty { String::new() } else { up.answer.clone() };
     let reasoning = if up.empty { String::new() } else { up.reasoning.clone() };
 
@@ -971,6 +985,9 @@ async fn streaming_records_both_sides_of_the_wire() {
 
     let raw = newest_chat_log(&state).await.raw;
     assert!(raw.captured);
+    // 맨 앞은 상태 줄과 헤더 — ④ 칸 하나로 "무엇이 어떤 모양으로 왔나" 가 답해져야 합니다.
+    assert!(raw.upstream.starts_with("HTTP/1.1 200 OK"), "{}", raw.upstream);
+    assert!(raw.upstream.contains("content-type: text/event-stream"), "{}", raw.upstream);
     // 위쪽: 사내가 준 프레임 그대로. 우리가 못 알아본 프레임도 여기 남습니다.
     assert!(raw.upstream.contains("data: {\"content\":"), "{}", raw.upstream);
     assert!(raw.upstream.contains("[DONE]"), "{}", raw.upstream);
@@ -1036,6 +1053,33 @@ async fn frames_we_cannot_read_are_reported_and_their_bytes_kept() {
     let entry = newest_chat_log(&state).await;
     assert!(entry.resp_meta.contains("해석하지 못한 프레임 1개"), "{}", entry.resp_meta);
     assert!(entry.raw.upstream.contains("\"content\":{"), "{}", entry.raw.upstream);
+}
+
+/// 사내가 **왜** 거절했는지는 오류 본문 뒤쪽에 있을 수 있습니다. 오류 메시지에는 앞
+/// 200자만 들어가므로, 전문을 ④ 칸에 남기지 않으면 그 답을 영영 못 봅니다.
+#[tokio::test]
+async fn a_rejected_call_keeps_the_whole_upstream_body() {
+    let reason = "maxNewTokens 32000 exceeds the model limit of 4096";
+    let body = json!({
+        "message": "요청을 처리할 수 없습니다",
+        // 앞 200자를 넘겨 밀어낸 자리에 진짜 이유를 둡니다.
+        "padding": "x".repeat(400),
+        "detail": reason,
+    })
+    .to_string();
+    let up = Upstream { reject_status: 400, reject_body: body, ..Default::default() };
+    let (base, state, _up) = harness(up).await;
+
+    let (status, _) = chat(
+        &base,
+        json!({ "model": "fabrix-chat-4", "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+    assert_eq!(status, 400, "상위 상태 코드를 그대로 전달해야 합니다");
+
+    let raw = newest_chat_log(&state).await.raw;
+    assert!(raw.upstream.starts_with("HTTP/1.1 400 Bad Request"), "{}", raw.upstream);
+    assert!(raw.upstream.contains(reason), "거절 사유가 잘려 나갔습니다: {}", raw.upstream);
 }
 
 // ─────────────────────────── 3. 모델 해석 ───────────────────────────

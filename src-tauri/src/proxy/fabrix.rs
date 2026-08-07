@@ -960,7 +960,15 @@ impl FabrixClient {
 
     /// 스트리밍이면 `timeout` 을 걸지 않습니다 — 긴 답변이 정상적으로 30초를
     /// 넘길 수 있고, 청크가 끊기는 것은 클라이언트의 read_timeout 이 잡습니다.
-    pub async fn messages(&self, body: &MessagesRequest) -> Result<reqwest::Response, FabrixError> {
+    ///
+    /// 실패하면 오류와 **응답 원문**(상태 줄·헤더·본문 전문)을 함께 돌려줍니다.
+    /// 오류 메시지에는 앞 200자만 들어가는데, 사내가 **왜** 거절했는지는 그 뒤에
+    /// 있을 수 있습니다. 여기서 버리면 그 답을 영영 못 봅니다 — 호출부가 이 문자열을
+    /// 로그 ④ 칸으로 넘깁니다.
+    pub async fn messages(
+        &self,
+        body: &MessagesRequest,
+    ) -> Result<reqwest::Response, (FabrixError, String)> {
         let mut req = self
             .request(reqwest::Method::POST, self.messages_url())
             .header("Accept", if body.is_stream { "text/event-stream" } else { "application/json" })
@@ -970,14 +978,34 @@ impl FabrixClient {
             req = req.timeout(REQUEST_TIMEOUT);
         }
 
-        let res = req.send().await?;
+        // 연결 자체가 실패하면 응답이 없으므로 원문도 없습니다.
+        let res = req.send().await.map_err(|err| (FabrixError::from(err), String::new()))?;
         let status = res.status();
         if !status.is_success() {
+            let head = response_head(&res);
             let text = res.text().await.unwrap_or_default();
-            return Err(classify_status(status.as_u16(), &text));
+            return Err((classify_status(status.as_u16(), &text), format!("{head}\n{text}")));
         }
         Ok(res)
     }
+}
+
+/// 응답의 상태 줄과 헤더 — 본문 앞에 붙여 로그 ④ 칸을 **자족적인 HTTP 기록**으로 만듭니다.
+///
+/// 본문만 있으면 답할 수 없는 질문들이 여기 걸립니다: 200 인데 비었나 아니면 4xx 였나,
+/// `text/event-stream` 으로 왔나 `application/json` 으로 왔나, 사내가 붙여 준 추적 id 는
+/// 무엇인가(사내 담당자에게 문의할 때 이 값 하나가 대화를 줄여 줍니다).
+///
+/// `set-cookie` 만 뺍니다 — 세션 값이 로그 화면에 뜨고 그대로 복사돼 나갈 이유가 없습니다.
+pub fn response_head(res: &reqwest::Response) -> String {
+    let mut out = format!("{:?} {}\n", res.version(), res.status());
+    for (name, value) in res.headers() {
+        if name.as_str().eq_ignore_ascii_case("set-cookie") {
+            continue;
+        }
+        out.push_str(&format!("{name}: {}\n", value.to_str().unwrap_or("(비 ASCII 값)")));
+    }
+    out
 }
 
 pub fn build_http_client(insecure: bool) -> reqwest::Client {

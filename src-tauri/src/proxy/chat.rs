@@ -555,11 +555,17 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap, body: Body)
 
     let res = match client.messages(&payload).await {
         Ok(res) => res,
-        Err(err) => {
+        Err((err, raw)) => {
+            // 거절 응답의 전문입니다. 오류 메시지에는 앞 200자만 들어가므로, 사내가
+            // **왜** 거절했는지는 여기에만 남습니다.
+            ctx.raw_upstream.push_str(&raw);
             state.record(ctx.fail(&err));
             return error_response(err.status(), err.envelope());
         }
     };
+    // 상태 줄과 헤더를 본문 앞에 붙입니다 — ④ 칸이 그 자체로 HTTP 기록이 되도록.
+    ctx.raw_upstream.push_str(&fabrix::response_head(&res));
+    ctx.raw_upstream.push_str("\n");
 
     // ── ③ 돌려준 응답 ───────────────────────────────────────
     //
