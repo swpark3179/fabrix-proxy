@@ -486,6 +486,36 @@ pub struct FilterBlockReason {
     pub result_code: Option<String>,
 }
 
+/// 필터가 **통과**시켰다고 말하는 판정 코드들.
+///
+/// 이 필드 이름은 `filterBlockReason` 이지만 담기는 것은 "차단 사유" 가 아니라
+/// **필터 판정**입니다. 실서버 와이어에서 확인된 모양:
+///
+/// ```text
+/// FR-200  요청 분석 단계 — 모든 문구가 null
+/// FR-201  통과 — message "The content was allowed by the filter", ko/en "Default"
+/// FR-403  차단 — ko 에 실제 사유
+/// ```
+///
+/// 목업은 FR-200 과 FR-403 만 흉내 냈고 둘 다 문구가 없거나 진짜 차단이라, 통과
+/// 판정에 **문구가 실려 온다**는 사실이 드러나지 않았습니다. 그래서 빈 답변 + FR-201
+/// 인 응답이 `502 The content was allowed by the filter` 로 나갔습니다 — 통과 판정을
+/// 차단 사유로 되읽어, 사용자에게는 원인이 정반대로 적힌 오류였습니다.
+///
+/// 모르는 코드는 **차단으로 봅니다.** 차단 사유를 통과로 오해해 삼키는 쪽이, 통과를
+/// 차단으로 오해해 시끄러운 쪽보다 나쁩니다.
+const FILTER_ALLOW_CODES: [&str; 2] = ["FR-200", "FR-201"];
+
+impl FilterBlockReason {
+    /// 이 판정이 통과인가 — 통과면 문구가 있어도 차단 사유가 아닙니다.
+    fn is_allow(&self) -> bool {
+        self.result_code.as_deref().is_some_and(|code| {
+            let code = code.trim();
+            FILTER_ALLOW_CODES.iter().any(|allow| code.eq_ignore_ascii_case(allow))
+        })
+    }
+}
+
 impl FabrixChunk {
     pub fn looks_like_error(&self) -> bool {
         let bad = |s: &Option<String>| {
@@ -555,9 +585,12 @@ impl FabrixChunk {
         (!joined.is_empty()).then_some(joined)
     }
 
-    /// 필터 차단 사유 메시지를 추출합니다(모두 비어 있으면 None).
+    /// 필터 **차단** 사유 메시지를 추출합니다(통과 판정이거나 문구가 없으면 None).
     pub fn filter_message(&self) -> Option<String> {
         let reason = self.filter_block_reason.as_ref()?;
+        if reason.is_allow() {
+            return None;
+        }
         reason
             .message
             .as_deref()
@@ -1284,6 +1317,45 @@ mod tests {
         let chunk = parse_nostream(raw);
         assert_eq!(chunk.answer_text(), None);
         assert_eq!(chunk.filter_message().as_deref(), Some("부적절한 표현이 감지되었습니다."));
+    }
+
+    /// 실서버는 **통과** 판정에도 `filterBlockReason` 을 채워 보냅니다(FR-201). 그걸
+    /// 차단 사유로 읽으면, 빈 답변이 왔을 때 `502 The content was allowed by the filter`
+    /// 라는 앞뒤가 맞지 않는 오류가 클라이언트로 나갑니다 — 실제로 그렇게 나갔습니다.
+    #[test]
+    fn nostream_allow_verdict_is_not_a_block_reason() {
+        let raw = r#"{
+            "content": "",
+            "reasoningContent": null,
+            "contentReferences": [],
+            "truncated": false,
+            "finishReason": "stop",
+            "filterBlockReason": {
+                "ko": "Default",
+                "en": "Default",
+                "policy_id": "49",
+                "message": "The content was allowed by the filter",
+                "result_code": "FR-201",
+                "filter_log_id": "0"
+            },
+            "status": "SUCCESS",
+            "responseCode": "R20000",
+            "plugins": ["LLM"]
+        }"#;
+        let chunk = parse_nostream(raw);
+        assert_eq!(chunk.filter_message(), None, "통과 판정은 차단 사유가 아닙니다");
+        assert!(chunk.looks_successful());
+    }
+
+    /// 모르는 코드는 차단으로 봅니다 — 사유를 삼키는 쪽이 더 나쁩니다.
+    #[test]
+    fn nostream_unknown_filter_code_still_surfaces() {
+        let raw = r#"{
+            "content": null,
+            "filterBlockReason": { "ko": "정책 위반", "result_code": "FR-999" },
+            "status": "SUCCESS"
+        }"#;
+        assert_eq!(parse_nostream(raw).filter_message().as_deref(), Some("정책 위반"));
     }
 
     #[test]

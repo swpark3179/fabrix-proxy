@@ -39,6 +39,12 @@ struct Upstream {
     tokens: Option<(u32, u32)>,
     /// 답변을 비우되 성공 표지는 남깁니다.
     empty: bool,
+    /// 실서버가 **통과**했을 때 채워 보내는 `filterBlockReason`(FR-201)을 함께 실습니다.
+    ///
+    /// 필드 이름은 "차단 사유" 지만 담기는 것은 필터 **판정**이라, 통과에도 문구가
+    /// 옵니다. 이걸 차단으로 되읽으면 빈 답변이 `502 The content was allowed by the
+    /// filter` 로 나갑니다 — 원인이 정반대로 적힌 오류입니다.
+    allow_verdict: bool,
     /// SSE 한 프레임에 담을 글자 수. 낮추면 센티널 한가운데가 갈립니다.
     chunk: usize,
     /// 답변을 흘리다 오류 프레임을 끼워 넣고 끊습니다.
@@ -68,6 +74,7 @@ impl Default for Upstream {
             finish: None,
             tokens: None,
             empty: false,
+            allow_verdict: false,
             chunk: 5,
             fail_midstream: false,
             sse_always: false,
@@ -188,6 +195,16 @@ async fn upstream_messages(
         if let Some((input, output)) = up.tokens {
             payload["inputTokens"] = json!(input);
             payload["outputTokens"] = json!(output);
+        }
+        if up.allow_verdict {
+            payload["filterBlockReason"] = json!({
+                "ko": "Default",
+                "en": "Default",
+                "policy_id": "49",
+                "message": "The content was allowed by the filter",
+                "result_code": "FR-201",
+                "filter_log_id": "0",
+            });
         }
         return Json(payload).into_response();
     }
@@ -406,6 +423,29 @@ async fn empty_answer_with_success_markers_is_200_not_502() {
         !body["choices"][0]["message"]["content"].is_null(),
         "도구 호출 턴만 null 이어야 합니다"
     );
+}
+
+/// 빈 답변 + **통과** 판정(FR-201). 통과를 차단 사유로 되읽으면 클라이언트는
+/// `502 The content was allowed by the filter` 를 받습니다 — 앞뒤가 맞지 않는 오류이고,
+/// 사용자를 없는 원인(필터) 쪽으로 보냅니다. 실서버가 실제로 이 모양을 보냅니다.
+#[tokio::test]
+async fn empty_answer_with_an_allow_verdict_is_not_reported_as_a_filter_block() {
+    let up = Upstream {
+        empty: true,
+        allow_verdict: true,
+        finish: Some("stop".into()),
+        ..Default::default()
+    };
+    let (base, _state, _up) = harness(up).await;
+
+    let (status, body) = chat(
+        &base,
+        json!({ "model": "fabrix-chat-4", "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["choices"][0]["message"]["content"], "");
+    assert_eq!(body["choices"][0]["finish_reason"], "stop");
 }
 
 // ─────────────────────────── 2. 스트리밍 순서 ───────────────────────────

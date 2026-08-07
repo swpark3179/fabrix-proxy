@@ -93,11 +93,16 @@ struct Ctx {
 ///
 /// "요청에 도구가 있었는데 프록시가 버렸다" 와 "도구는 전달됐는데 모델이 안 썼다" 를
 /// 사용자가 구분할 수 있어야 합니다 — 지금까지는 둘 다 똑같이 조용히 실패했습니다.
+///
+/// `answered` 는 상위가 **한 글자라도** 줬는가입니다. 0자 응답에까지 "모델이 규약을
+/// 따르지 않음" 이라고 적으면 사용자는 주입한 도구 규약을 뜯어보게 되는데, 그 턴의
+/// 모델은 규약을 지킬 기회조차 없었습니다 — 다음에 볼 곳이 정반대입니다.
 fn tool_meta(
     declared: usize,
     emulated: bool,
     choice_none: bool,
     stats: &ToolStats,
+    answered: bool,
 ) -> Option<String> {
     if declared == 0 {
         return None; // 평범한 채팅에는 아무 것도 붙이지 않습니다.
@@ -110,9 +115,10 @@ fn tool_meta(
             format!("도구 {declared}개 선언 · 에뮬레이션 꺼짐 — 무시함")
         });
     }
-    let mut line = match stats.calls {
-        0 => format!("도구 {declared}개 선언 · 호출 0건 — 모델이 규약을 따르지 않음"),
-        n => format!("도구 {declared}개 선언 · 호출 {n}건"),
+    let mut line = match (stats.calls, answered) {
+        (0, false) => format!("도구 {declared}개 선언 · 사내 응답이 비어 판단할 근거가 없음"),
+        (0, true) => format!("도구 {declared}개 선언 · 호출 0건 — 모델이 규약을 따르지 않음"),
+        (n, _) => format!("도구 {declared}개 선언 · 호출 {n}건"),
     };
     // 이 숫자가 "추론 단계마다 stop" 수정이 실제로 물었는지를 말해 줍니다.
     if stats.in_reasoning > 0 {
@@ -122,6 +128,20 @@ fn tool_meta(
         line.push_str(&format!(" · 형식 오류 {}건은 텍스트로 되돌림", stats.rejected));
     }
     Some(line)
+}
+
+/// 실패는 아니지만 사용자가 알아야 할 조용한 결말에 붙일 이름.
+///
+/// 순서가 이 함수의 전부입니다. 사내가 0자를 줬다면 그것이 이 호출에 대해 할 수 있는
+/// 가장 중요한 말입니다 — `도구 미사용` 은 그 사실의 **결과**일 뿐인데 먼저 적으면
+/// 사용자를 도구 규약 쪽으로 잘못 보냅니다. 실제로 그렇게 보냈습니다: opencode 에서
+/// 한 질문에 답이 없던 호출이 로그에는 `도구 미사용` 으로만 남아, 원인이 사내 응답에
+/// 있다는 사실을 사내 원문을 직접 뜯어보기 전에는 알 수 없었습니다.
+fn quiet_note(turn: &Turn, tools_emulated: bool, stats: &ToolStats) -> Option<String> {
+    if turn.received_nothing() {
+        return Some("사내가 빈 응답".to_string());
+    }
+    (tools_emulated && stats.calls == 0).then(|| "도구 미사용".to_string())
 }
 
 /// 로그 꼬리에 붙일 추론 채널 한 줄.
@@ -726,6 +746,7 @@ impl Drop for StreamLog {
             self.ctx.tools_emulated,
             self.ctx.tools_choice_none,
             &stats,
+            !self.turn.received_nothing(),
         ) {
             meta.push(line);
         }
@@ -734,12 +755,10 @@ impl Drop for StreamLog {
         let note = match (aborted, failure.is_some()) {
             (true, _) => Some("클라이언트가 연결을 끊음".to_string()),
             (false, true) => Some("스트리밍 중 끊김".to_string()),
-            // 도구를 줬는데 모델이 한 번도 안 썼다 — 실패는 아니지만 눈에 띄어야
-            // 합니다. Open Design 같은 클라이언트는 이 경우 조용히 빈손이 됩니다.
-            (false, false) if self.ctx.tools_emulated && stats.calls == 0 => {
-                Some("도구 미사용".to_string())
-            }
-            (false, false) => None,
+            // 사내가 빈 응답을 줬거나, 도구를 줬는데 모델이 한 번도 안 썼다 — 실패는
+            // 아니지만 눈에 띄어야 합니다. opencode 나 Open Design 같은 에이전트는 이
+            // 경우 아무 말 없이 턴을 끝냅니다.
+            (false, false) => quiet_note(&self.turn, self.ctx.tools_emulated, &stats),
         };
 
         // 받은 답변은 자르지 않고 통째로 담습니다 — 화면이 앞부분만 보여 주고
@@ -749,7 +768,8 @@ impl Drop for StreamLog {
             (Some(msg), true) => msg.clone(),
             (Some(msg), false) => format!("{text}\n\n[중단] {msg}"),
             (None, true) if aborted => "(클라이언트가 먼저 끊어 받은 내용이 없습니다)".into(),
-            (None, true) => "(빈 응답)".into(),
+            // ④ 칸을 가리켜 둡니다 — 이 문장 다음에 사용자가 할 일이 정확히 그것입니다.
+            (None, true) => "(빈 응답 — 사내가 한 글자도 주지 않았습니다. ④ 칸의 사내 원문에서 프레임을 확인하세요)".into(),
             (None, false) => text,
         };
 
@@ -1072,14 +1092,18 @@ async fn collect_response(
     if let Some(line) = reasoning_meta(&turn) {
         meta.push(line);
     }
-    if let Some(line) =
-        tool_meta(ctx.tools_declared, ctx.tools_emulated, ctx.tools_choice_none, &stats)
-    {
+    if let Some(line) = tool_meta(
+        ctx.tools_declared,
+        ctx.tools_emulated,
+        ctx.tools_choice_none,
+        &stats,
+        !turn.received_nothing(),
+    ) {
         meta.push(line);
     }
     meta.extend(plan_meta(&ctx));
 
-    let note = (ctx.tools_emulated && stats.calls == 0).then(|| "도구 미사용".to_string());
+    let note = quiet_note(&turn, ctx.tools_emulated, &stats);
 
     // 클라이언트가 받는 바이트 그대로. `Json` 도 `serde_json` 으로 직렬화하므로 같은
     // 문자열이고, 여기서 한 번 더 만드는 비용은 요청당 한 번뿐입니다.
@@ -1112,8 +1136,8 @@ mod tests {
 
     #[test]
     fn tool_meta_stays_silent_for_ordinary_chats() {
-        assert_eq!(tool_meta(0, false, false, &stats(0, 0, 0)), None);
-        assert_eq!(tool_meta(0, true, false, &stats(0, 0, 0)), None);
+        assert_eq!(tool_meta(0, false, false, &stats(0, 0, 0), true), None);
+        assert_eq!(tool_meta(0, true, false, &stats(0, 0, 0), true), None);
     }
 
     /// 이 두 경우를 구분하는 것이 이 줄의 존재 이유입니다. 지금까지는 도구를 버린
@@ -1121,16 +1145,26 @@ mod tests {
     #[test]
     fn tool_meta_separates_dropped_from_unused() {
         assert_eq!(
-            tool_meta(12, false, false, &stats(0, 0, 0)).unwrap(),
+            tool_meta(12, false, false, &stats(0, 0, 0), true).unwrap(),
             "도구 12개 선언 · 에뮬레이션 꺼짐 — 무시함"
         );
         assert_eq!(
-            tool_meta(12, true, false, &stats(0, 0, 0)).unwrap(),
+            tool_meta(12, true, false, &stats(0, 0, 0), true).unwrap(),
             "도구 12개 선언 · 호출 0건 — 모델이 규약을 따르지 않음"
         );
         assert_eq!(
-            tool_meta(12, true, false, &stats(2, 0, 0)).unwrap(),
+            tool_meta(12, true, false, &stats(2, 0, 0), true).unwrap(),
             "도구 12개 선언 · 호출 2건"
+        );
+    }
+
+    /// 사내가 0자를 준 턴을 "모델이 규약을 따르지 않음" 으로 부르면, 사용자는 주입한
+    /// 도구 규약을 뜯어보게 됩니다 — 그 턴의 모델은 규약을 지킬 기회조차 없었습니다.
+    #[test]
+    fn tool_meta_does_not_blame_the_model_for_a_silent_upstream() {
+        assert_eq!(
+            tool_meta(12, true, false, &stats(0, 0, 0), false).unwrap(),
+            "도구 12개 선언 · 사내 응답이 비어 판단할 근거가 없음"
         );
     }
 
@@ -1139,14 +1173,14 @@ mod tests {
     #[test]
     fn tool_meta_names_who_turned_tools_off() {
         assert_eq!(
-            tool_meta(4, false, true, &stats(0, 0, 0)).unwrap(),
+            tool_meta(4, false, true, &stats(0, 0, 0), true).unwrap(),
             "도구 4개 선언 · 클라이언트가 tool_choice: none 으로 껐음"
         );
     }
 
     #[test]
     fn tool_meta_reports_rejected_blocks() {
-        let line = tool_meta(3, true, false, &stats(1, 0, 2)).unwrap();
+        let line = tool_meta(3, true, false, &stats(1, 0, 2), true).unwrap();
         assert!(line.contains("호출 1건"), "{line}");
         assert!(line.contains("형식 오류 2건"), "{line}");
     }
@@ -1154,12 +1188,30 @@ mod tests {
     /// 이 한 줄이 "추론 단계마다 stop" 수정이 실제로 물었는지를 말해 줍니다.
     #[test]
     fn tool_meta_names_the_reasoning_channel() {
-        let line = tool_meta(3, true, false, &stats(3, 2, 0)).unwrap();
+        let line = tool_meta(3, true, false, &stats(3, 2, 0), true).unwrap();
         assert!(line.contains("호출 3건"), "{line}");
         assert!(line.contains("그중 2건은 추론 채널에서"), "{line}");
         // 추론에서 안 나왔으면 붙지 않습니다.
-        let quiet = tool_meta(3, true, false, &stats(3, 0, 0)).unwrap();
+        let quiet = tool_meta(3, true, false, &stats(3, 0, 0), true).unwrap();
         assert!(!quiet.contains("추론"), "{quiet}");
+    }
+
+    /// 로그 목록에 뜨는 이름 — 0자 응답이 `도구 미사용` 뒤에 숨으면 안 됩니다.
+    #[test]
+    fn quiet_note_names_the_silent_upstream_first() {
+        let mut silent = Turn::new(HashSet::new(), true);
+        silent.push(super::super::fabrix::StreamEvent::Finish("stop".into()));
+        silent.finish();
+        assert_eq!(quiet_note(&silent, true, &stats(0, 0, 0)).as_deref(), Some("사내가 빈 응답"));
+
+        // 말은 했는데 도구를 안 쓴 턴은 그대로 `도구 미사용` 입니다.
+        let mut talked = Turn::new(HashSet::new(), true);
+        talked.push(super::super::fabrix::StreamEvent::Delta("파일을 만들까요?".into()));
+        talked.finish();
+        assert_eq!(quiet_note(&talked, true, &stats(0, 0, 0)).as_deref(), Some("도구 미사용"));
+
+        // 도구를 안 쓰는 평범한 채팅에는 아무 것도 붙지 않습니다.
+        assert_eq!(quiet_note(&talked, false, &stats(0, 0, 0)), None);
     }
 
     fn ctx_with(plan: validate::Plan, model_defaulted: bool) -> Ctx {
