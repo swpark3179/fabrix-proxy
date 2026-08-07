@@ -301,7 +301,18 @@ async function handleMessages(req, res) {
           result_code: 'FR-403',
           filter_log_id: null,
         }
-      : { ko: null, en: null, policy_id: null, message: null, result_code: 'FR-200', filter_log_id: null }
+      // 실서버는 **통과**했을 때도 이 필드를 채웁니다 — 문구까지 실어서(FR-201). 목업이
+      // FR-200(문구 전부 null)만 흉내 내던 동안, 통과 판정을 차단 사유로 되읽는 결함이
+      // 목업에서는 보이지 않았습니다. 목업이 실서버보다 관대하면 딱 그만큼 결함이 숨습니다.
+      // `MOCK_EMPTY=1` 과 함께 쓰면 그 갈래(빈 답변 + 통과 판정)를 그대로 재현합니다.
+      : {
+          ko: 'Default',
+          en: 'Default',
+          policy_id: '49',
+          message: 'The content was allowed by the filter',
+          result_code: 'FR-201',
+          filter_log_id: '0',
+        }
     return json(res, 200, {
       userId: '00000000-0000-0000-0000-000000000000',
       modelType,

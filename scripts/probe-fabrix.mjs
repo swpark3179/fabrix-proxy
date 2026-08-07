@@ -119,6 +119,42 @@ const TOOL_BLOCK = [
 const SHORT_Q = '한 문장으로 자기소개를 해 주세요.'
 const LONG_Q = '현재 폴더 목록을 담고 있는 md 파일의 내용을 만들어 주세요. 30줄 정도면 됩니다.'
 
+/** 프록시가 `contents` 꼬리에 실제로 덧붙이는 리마인더(축약본). `proxy/tools.rs` 와 같은 글입니다. */
+const TAIL_REMINDER = [
+  '# Reminder',
+  'To use a tool, emit a block exactly like ' +
+    '<tool_call>{"name": "<one of the names in <tools>>", "arguments": {…}}</tool_call> ' +
+    '— one block per call, no Markdown code fence, and nothing but JSON inside the block. ' +
+    'Put the block in your reply itself, not only in your private reasoning.',
+  'If no tool is needed, just answer.',
+].join('\n')
+
+/**
+ * 센티널 되읽기 시험 한 쌍.
+ *
+ * 프록시는 `<tool_call>…</tool_call>` 을 도구 호출의 센티널로 씁니다. 그 모양을 고른
+ * 이유는 Qwen·Hermes·GLM 계열의 **네이티브** 툴콜 형식이기 때문인데, 같은 이유로
+ * 게이트웨이(vLLM 의 `--tool-call-parser` 등)가 그 블록을 자기 것으로 알고 응답 본문에서
+ * **걷어내 버릴** 수 있습니다. 그러면 우리에게 도착하는 `content` 는 정확히 0자입니다 —
+ * 모델은 도구를 불렀는데 프록시는 아무 말도 못 들은 상태가 됩니다.
+ *
+ * 그 갈래를 확정하려면 변인이 태그 하나여야 합니다. `sentinel-echo` 는 `<tool_call>` 을,
+ * `sentinel-control` 은 아무도 파싱하지 않는 `<demo_block>` 을 그대로 따라 적게 시킵니다.
+ * 둘 다 같은 문장, 같은 길이입니다.
+ *
+ * - 둘 다 ✔ → 센티널은 와이어를 통과합니다. 빈 응답의 원인은 다른 데 있습니다.
+ * - control 만 ✔ → **게이트웨이가 `<tool_call>` 을 먹습니다.** 프롬프트 기반 툴콜은 이
+ *   센티널로는 성립하지 않습니다 — 다른 센티널을 쓰거나 사내 네이티브 툴콜을 받아야 합니다.
+ * - 둘 다 △ → 태그와 무관합니다. 모델이 따라 적기를 거부한 것이니 이 시험은 판단 근거가
+ *   못 됩니다(다른 항목으로 가르세요).
+ */
+function echoCase(tag) {
+  return (
+    `다음 한 줄을 **그대로** 따라 적어 주세요. 설명하지 말고 그 줄만 출력하세요.\n` +
+    `<${tag}>{"name": "write", "arguments": {"filePath": "a.md"}}</${tag}>`
+  )
+}
+
 /**
  * 시험 항목. 하나가 변인 하나입니다 — 두 항목의 차이가 하나뿐이어야 결과를 읽을 수 있습니다.
  *
@@ -177,6 +213,26 @@ function variants(modelId) {
         ...base,
         contents: ['현재 폴더 목록을 파일로 적어 줘.'],
         systemPrompt: `${sys}\n\n${TOOL_BLOCK}`,
+      },
+    },
+    {
+      name: 'sentinel-control',
+      why: '아무도 파싱하지 않는 태그를 따라 적게 — 되읽기 시험의 대조군',
+      body: { ...base, contents: [echoCase('demo_block')] },
+    },
+    {
+      name: 'sentinel-echo',
+      why: '같은 문장에 태그만 <tool_call> — 위는 ✔ 인데 여기가 △ 면 게이트웨이가 센티널을 먹습니다',
+      body: { ...base, contents: [echoCase('tool_call')] },
+    },
+    {
+      name: 'opencode',
+      why: '프록시가 실제로 보내는 모양 그대로 — 재현되면 위 항목들로 변인을 좁힙니다',
+      body: {
+        ...base,
+        contents: [`현재 폴더 목록을 담은 md 파일을 만들어 줘.\n\n${TAIL_REMINDER}`],
+        systemPrompt: `${sys}\n\n${TOOL_BLOCK}`,
+        llmConfig: { max_new_tokens: 32000, temperature: 1 },
       },
     },
   ]
@@ -350,6 +406,8 @@ if (WANTED.includes('sweep')) {
   console.log(
     '\n읽는 법: ✔ 는 답이 온 것, △ 는 200 인데 **빈 답**, ✖ 는 오류나 시간 초과입니다.\n' +
       '이웃한 두 항목의 차이가 곧 원인입니다 — 예를 들어 `system` 이 ✔ 인데 `system+turns` 가 △ 면\n' +
-      'contents 턴 배열이 범인입니다.',
+      'contents 턴 배열이 범인입니다.\n' +
+      '`sentinel-control` 이 ✔ 인데 `sentinel-echo` 가 △ 면 게이트웨이가 <tool_call> 을 걷어냅니다 —\n' +
+      '그 경우 프롬프트 기반 툴콜은 이 센티널로 성립하지 않습니다.',
   )
 }

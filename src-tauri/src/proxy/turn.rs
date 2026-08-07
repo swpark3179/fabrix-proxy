@@ -252,6 +252,19 @@ impl Turn {
         self.content.is_empty() && self.reasoning.is_empty() && self.calls.is_empty()
     }
 
+    /// 상위가 **한 글자도** 주지 않았는가 — 걷어내기 **전** 원문 기준.
+    ///
+    /// [`Self::is_empty`] 와 묻는 것이 다릅니다. `is_empty` 는 가공 뒤를 보므로 답변
+    /// 전체가 도구 호출 하나였던 턴도 산문은 비어 있고, 반대로 이 함수는 그 턴을
+    /// "받았다" 라고 답합니다.
+    ///
+    /// 이 구분이 필요한 이유는 로그가 가리키는 곳이 달라지기 때문입니다. 사내가 0자를
+    /// 준 턴에 `호출 0건 — 모델이 규약을 따르지 않음` 이라고 적으면 사용자는 주입한
+    /// 도구 규약을 의심하지만, 실제로는 모델이 규약을 지킬 기회조차 없었습니다.
+    pub fn received_nothing(&self) -> bool {
+        self.raw_content.is_empty() && self.raw_reasoning.is_empty()
+    }
+
     /// `message.reasoning_content` — 비어 있으면 키를 내보내지 않습니다.
     pub fn reasoning_field(&self) -> Option<String> {
         Some(self.reasoning.clone()).filter(|s| !s.is_empty())
@@ -616,5 +629,89 @@ mod tests {
         assert_eq!(t.upstream_finish(), Some("weird"));
         // 상위가 모르는 값을 줘도 와이어에는 열거값만 나갑니다.
         assert_eq!(t.finish_reason(), "stop");
+    }
+
+    // ── 실서버 와이어 재생 ──
+    //
+    // opencode 에서 "폴더 목록을 담은 md 파일을 만들어 줘" 한 번에 사내가 돌려준 두
+    // 응답의 **본문 그대로**입니다(`user_id`·`filter_log_id` 만 0 으로 지웠습니다).
+    // 앞이 제목 생성 호출, 뒤가 진짜 질문 — 뒤가 0자로 와서 에이전트 루프가 한 스텝
+    // 만에 끝났습니다.
+    //
+    // 이 두 상수를 남기는 이유는 하나입니다. "우리가 프레임을 못 읽은 것" 과 "사내가
+    // 아무 말도 안 한 것" 은 다음 행동이 정반대인데, 재현되지 않는 한 번짜리 응답이라
+    // 다시 뜨지 않으면 영영 가릴 수 없습니다. 아래 두 시험이 그 갈래를 못박습니다.
+
+    /// 제목 생성 호출 — 도구 없음, 짧은 프롬프트. 답이 **한 프레임에 통째로** 옵니다.
+    const WIRE_TITLE: &str = concat!(
+        "data: {\"user_id\":\"0\",\"model_type\":\"vllm_glm5.2\",\"content\":\"\",\"reasoning_content\":null,\"processing_content\":[],\"content_references\":[],\"truncated\":null,\"finish_reason\":null,\"filter_block_reason\":null,\"status\":\"SUCCESS\",\"response_code\":null,\"plugins\":[],\"orchestrator_type\":null,\"references\":null,\"actions\":null,\"recommend_queries\":[],\"event_status\":\"CHUNK\",\"event_data\":\"\"}\n\n",
+        "data: {\"user_id\":\"0\",\"model_type\":\"vllm_glm5.2\",\"content\":null,\"reasoning_content\":null,\"processing_content\":[],\"content_references\":[],\"truncated\":null,\"finish_reason\":null,\"filter_block_reason\":{\"ko\":null,\"en\":null,\"policy_id\":null,\"message\":null,\"result_code\":\"FR-200\",\"filter_log_id\":null},\"status\":\"SUCCESS\",\"response_code\":null,\"plugins\":[],\"event_status\":\"REQUEST_ANALYSIS\",\"event_data\":\"{}\"}\n\n",
+        "data: {\"user_id\":\"0\",\"model_type\":\"vllm_glm5.2\",\"content\":null,\"reasoning_content\":null,\"processing_content\":[],\"content_references\":[],\"truncated\":null,\"finish_reason\":null,\"filter_block_reason\":{\"ko\":\"Default\",\"en\":\"Default\",\"policy_id\":\"49\",\"message\":\"The content was allowed by the filter\",\"result_code\":\"FR-201\",\"filter_log_id\":\"0\"},\"status\":\"SUCCESS\",\"response_code\":null,\"plugins\":[],\"event_status\":\"FINAL_ANSWER\",\"event_data\":\"{}\"}\n\n",
+        "data: {\"user_id\":\"0\",\"model_type\":\"vllm_glm5.2\",\"content\":\"폴더 목록 MD 파일 생성\",\"reasoning_content\":null,\"processing_content\":[],\"content_references\":[],\"truncated\":null,\"finish_reason\":null,\"filter_block_reason\":{\"ko\":\"Default\",\"en\":\"Default\",\"policy_id\":\"49\",\"message\":\"The content was allowed by the filter\",\"result_code\":\"FR-201\",\"filter_log_id\":\"0\"},\"status\":\"SUCCESS\",\"response_code\":null,\"plugins\":[],\"event_status\":\"CHUNK\",\"event_data\":\"\"}\n\n",
+        "data: {\"user_id\":\"0\",\"model_type\":\"vllm_glm5.2\",\"content\":\"\",\"reasoning_content\":null,\"processing_content\":[],\"content_references\":[],\"truncated\":false,\"finish_reason\":\"stop\",\"filter_block_reason\":{\"ko\":\"Default\",\"en\":\"Default\",\"policy_id\":\"49\",\"message\":\"The content was allowed by the filter\",\"result_code\":\"FR-201\",\"filter_log_id\":\"0\"},\"status\":\"SUCCESS\",\"response_code\":\"R20000\",\"plugins\":[\"LLM\"],\"references\":[],\"actions\":[],\"recommend_queries\":[],\"event_status\":\"CHUNK\",\"event_data\":\"\"}\n\n",
+    );
+
+    /// 진짜 질문 — 도구 규약이 실린 호출. 제목 호출과 **같은 프레임 열인데 답변만
+    /// 통째로 빠져** 있습니다. 산문도, 추론도, 센티널도 없습니다.
+    const WIRE_ANSWER: &str = concat!(
+        "data: {\"user_id\":\"0\",\"model_type\":\"vllm_glm5.2\",\"content\":\"\",\"reasoning_content\":null,\"processing_content\":[],\"content_references\":[],\"truncated\":null,\"finish_reason\":null,\"filter_block_reason\":null,\"status\":\"SUCCESS\",\"response_code\":null,\"plugins\":[],\"orchestrator_type\":null,\"references\":null,\"actions\":null,\"recommend_queries\":[],\"event_status\":\"CHUNK\",\"event_data\":\"\"}\n\n",
+        "data: {\"user_id\":\"0\",\"model_type\":\"vllm_glm5.2\",\"content\":null,\"reasoning_content\":null,\"processing_content\":[],\"content_references\":[],\"truncated\":null,\"finish_reason\":null,\"filter_block_reason\":{\"ko\":null,\"en\":null,\"policy_id\":null,\"message\":null,\"result_code\":\"FR-200\",\"filter_log_id\":null},\"status\":\"SUCCESS\",\"response_code\":null,\"plugins\":[],\"event_status\":\"REQUEST_ANALYSIS\",\"event_data\":\"{}\"}\n\n",
+        "data: {\"user_id\":\"0\",\"model_type\":\"vllm_glm5.2\",\"content\":null,\"reasoning_content\":null,\"processing_content\":[],\"content_references\":[],\"truncated\":null,\"finish_reason\":null,\"filter_block_reason\":{\"ko\":\"Default\",\"en\":\"Default\",\"policy_id\":\"49\",\"message\":\"The content was allowed by the filter\",\"result_code\":\"FR-201\",\"filter_log_id\":\"0\"},\"status\":\"SUCCESS\",\"response_code\":null,\"plugins\":[],\"event_status\":\"FINAL_ANSWER\",\"event_data\":\"{}\"}\n\n",
+        "data: {\"user_id\":\"0\",\"model_type\":\"vllm_glm5.2\",\"content\":\"\",\"reasoning_content\":null,\"processing_content\":[],\"content_references\":[],\"truncated\":false,\"finish_reason\":\"stop\",\"filter_block_reason\":{\"ko\":\"Default\",\"en\":\"Default\",\"policy_id\":\"49\",\"message\":\"The content was allowed by the filter\",\"result_code\":\"FR-201\",\"filter_log_id\":\"0\"},\"status\":\"SUCCESS\",\"response_code\":\"R20000\",\"plugins\":[\"LLM\"],\"references\":[],\"actions\":[],\"recommend_queries\":[],\"event_status\":\"CHUNK\",\"event_data\":\"\"}\n\n",
+    );
+
+    /// 바이트를 실제 경로대로(디코더 → 턴) 태우고, 디코더가 못 읽은 프레임 수까지
+    /// 함께 돌려줍니다 — 그 숫자가 0 이어야 "사내가 안 준 것" 이 확정됩니다.
+    fn replay(wire: &str) -> (Turn, u32) {
+        let mut decoder = super::super::fabrix::StreamDecoder::new();
+        let mut turn = Turn::new(names(), true);
+        let mut events = decoder.push(wire.as_bytes());
+        events.extend(decoder.finish());
+        for event in events {
+            turn.feed(event);
+        }
+        turn.finish();
+        (turn, decoder.undecodable)
+    }
+
+    #[test]
+    fn replays_the_title_call_that_answered() {
+        let (turn, undecodable) = replay(WIRE_TITLE);
+        assert_eq!(undecodable, 0);
+        assert_eq!(turn.content(), "폴더 목록 MD 파일 생성");
+        assert!(!turn.received_nothing());
+        assert_eq!(turn.finish_reason(), "stop");
+    }
+
+    /// 이 시험이 지키는 사실: **프록시는 프레임을 전부 읽었고, 사내가 0자를 줬습니다.**
+    /// `undecodable` 이 0 이라는 것이 그 증거입니다 — 프레임을 흘렸다면 여기서 셉니다.
+    #[test]
+    fn replays_the_answer_call_that_came_back_empty() {
+        let (turn, undecodable) = replay(WIRE_ANSWER);
+        assert_eq!(undecodable, 0, "네 프레임 모두 읽혔습니다 — 흘린 프레임이 없습니다");
+        assert!(turn.received_nothing(), "답변·추론 어느 채널에도 한 글자도 오지 않았습니다");
+        assert!(turn.calls().is_empty(), "센티널이 없으니 걷어낼 도구 호출도 없습니다");
+        assert_eq!(turn.upstream_finish(), Some("stop"));
+        // 그래서 클라이언트는 `stop` 을 받습니다 — opencode 는 여기서 턴을 끝냅니다.
+        assert_eq!(turn.finish_reason(), "stop");
+    }
+
+    /// `received_nothing` 은 `is_empty` 와 다른 질문에 답합니다. 도구 호출만 있는 턴은
+    /// 산문이 비어도 **받은 것이 있습니다** — 둘을 같은 함수로 물으면 로그가 규약을
+    /// 의심하게 만듭니다.
+    #[test]
+    fn received_nothing_separates_a_silent_upstream_from_a_tool_only_turn() {
+        let mut call_only = turn();
+        drive(
+            &mut call_only,
+            vec![StreamEvent::Delta(
+                "<tool_call>{\"name\":\"read\",\"arguments\":{}}</tool_call>".into(),
+            )],
+        );
+        assert!(!call_only.received_nothing());
+
+        let mut silent = turn();
+        drive(&mut silent, vec![StreamEvent::Finish("stop".into())]);
+        assert!(silent.received_nothing());
     }
 }
