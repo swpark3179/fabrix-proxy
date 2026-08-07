@@ -112,6 +112,7 @@ src-tauri/src/
 src-tauri/tests/
   proxy_http.rs        HTTP 표면 통합 테스트 — 가짜 사내 서버를 띄워 규약을 확인
 mock-fabrix/server.mjs 개발용 FabriX 스텁 (의존성 0)
+scripts/probe-fabrix.mjs 실서버 프로브 — 변인 하나씩 바꿔 어디서 답이 끊기는지 (의존성 0)
 ```
 
 ---
@@ -540,6 +541,37 @@ ls /tmp/odtest
 > 고르고 ④ 칸의 "전체보기 → 본문 복사" 를 누르면, 사내가 준 바이트가 가공 없이 그대로 나옵니다.
 > 아래 미확인 항목들은 그 한 장이면 대부분 확정됩니다.
 
+### 실서버 프로브 — `npm run probe`
+
+로그는 "이 요청이 이렇게 됐다" 를 말해 주지만, **어떤 요청 모양이 문제인지**는 말해 주지
+못합니다. 클라이언트 하나로는 변인을 하나씩 바꿔 볼 수 없기 때문입니다. `scripts/probe-fabrix.mjs`
+는 프록시도 클라이언트도 빼고 **사내 서버를 직접** 두드립니다 — 변인 하나만 다른 요청들을
+차례로 보내고, 어디서 답이 끊기는지 표로 보여 줍니다.
+
+```bash
+npm run probe                 # 전체 (8항목)
+npm run probe -- turns        # 이름으로 골라서 (부분 일치)
+npm run probe -- sweep        # systemPrompt 길이를 2k→64k 로 늘려 가며 어디서 끊기는지
+npm run probe -- --raw        # 사내가 준 프레임 원문까지
+```
+
+인증 정보는 `~/.fabrix-proxy/config.json` 에서 읽습니다 — 키를 명령줄에 붙이지 않기 위함입니다
+(셸 히스토리에 남습니다). 모델은 목록의 첫 모델이고 `--model=<UUID>` 로 고를 수 있습니다.
+
+| 항목 | 무엇을 가르는가 |
+| --- | --- |
+| `baseline` | 기준선 — systemPrompt 없음 · 1턴 |
+| `system` | 큰 systemPrompt + 1턴 (프롬프트 크기만 다름) |
+| `turns` | 3턴 교대. `B` 라고 답하면 `contents` 가 정말 턴 배열입니다 |
+| `system+turns` | 큰 systemPrompt + 3턴 |
+| `maxtokens-32000` / `maxtokens-2048` | `llmConfig.maxNewTokens` 상한 |
+| `long-output` | 긴 출력 요구 — 첫 토큰이 늦는지, 아예 안 오는지 |
+| `toolblock` | 주입한 도구 규약 자체가 답을 막는지 |
+
+읽는 법: `✔` 은 답이 온 것, `△` 는 **200 인데 빈 답**, `✖` 는 오류·시간 초과입니다. **이웃한 두
+항목의 차이가 곧 원인입니다** — `system` 이 ✔ 인데 `system+turns` 가 △ 면 턴 배열이 범인이고,
+`maxtokens-32000` 만 △ 면 상한이 범인입니다.
+
 **샘플로 확정된 것** — 더 이상 추측하지 않습니다.
 
 - **SSE 프레임 형태** — 표준 `data:` 프레이밍입니다(샘플이 `sseclient` 를 씁니다). 종료
@@ -563,9 +595,10 @@ ls /tmp/odtest
   **프레임 한 통째가** — 그 안의 `content` 까지 — 조용히 사라지기 때문입니다.)
 - **`processing_content`** — 문서화된 필드지만(스트리밍 중간 처리 과정, list) 파싱하지
   않습니다. 무엇이 담기는지 보고 필요하면 로그에 실으면 됩니다.
-- **`contents` 가 정말 턴 교대인가** — 샘플이 3턴 대화라 그렇게 읽었습니다. 확인하려면
-  `contents: ["\"B\"라고만 답해", "B", "네가 방금 뭐라고 답했지? 한 단어로."]` 를 보내
-  보세요. `B` 라고 답하면 턴 교대가 맞습니다. 아니면 `fabrix::fold_messages` 만 되돌리면 됩니다.
+- **`contents` 가 정말 턴 교대인가** — 샘플이 3턴 대화라 그렇게 읽었습니다.
+  `npm run probe -- turns` 가 이 요청(`["\"B\"라고만 답해", "B", "네가 방금 뭐라고 답했지? 한 단어로."]`)
+  을 그대로 보냅니다. `B` 라고 답하면 턴 교대가 맞습니다. 빈 답이 오면 이 모델·게이트웨이가
+  다원소 `contents` 를 받지 못하는 것이고, 그때는 `fabrix::fold_messages` 만 되돌리면 됩니다.
 - **토큰 사용량** — FabriX가 실측을 주지 않아 **문자 기반 추정치**를 채웁니다
   (ASCII 4자 ≈ 1토큰, 한글·CJK 1자 ≈ 1토큰). 추정 대상은 클라이언트의 `messages` 가 아니라
   **실제로 사내에 보낸 프롬프트**(`systemPrompt` + `contents`)와 생성된 답변이며, 도구 호출
