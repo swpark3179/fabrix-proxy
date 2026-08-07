@@ -925,24 +925,38 @@ impl FabrixClient {
             .header("x-openapi-token", &self.token)
     }
 
-    pub async fn list_models(&self) -> Result<Vec<FabrixModel>, FabrixError> {
+    /// 모델 목록과 **응답 원문**(상태 줄·헤더·본문 전문)을 함께 돌려줍니다 —
+    /// 성공이든 실패든. 아래 [`FabrixClient::messages`] 와 같은 모양인 이유도 같습니다:
+    /// 오류 메시지에는 앞부분만 들어가는데 사내가 *왜* 거절했는지는 그 뒤에 있을 수
+    /// 있고, 성공한 목록도 "우리가 어떤 JSON 을 이렇게 읽었나" 를 대조할 원문이
+    /// 있어야 합니다. 호출부가 이 문자열을 로그 원문 칸으로 넘깁니다.
+    pub async fn list_models(
+        &self,
+    ) -> Result<(Vec<FabrixModel>, String), (FabrixError, String)> {
         let res = self
             .request(reqwest::Method::GET, self.models_url())
             .header("Accept", "application/json")
             .timeout(REQUEST_TIMEOUT)
             .send()
-            .await?;
+            .await
+            // 연결 자체가 실패하면 응답이 없으므로 원문도 없습니다.
+            .map_err(|err| (FabrixError::from(err), String::new()))?;
 
         let status = res.status();
+        let head_line = response_head(&res);
         let body = res.text().await.unwrap_or_default();
+        let raw = format!("{head_line}\n{body}");
+
         if !status.is_success() {
-            return Err(classify_status(status.as_u16(), &body));
+            return Err((classify_status(status.as_u16(), &body), raw));
         }
 
+        let bad = |err: FabrixError| (err, raw.clone());
         let value: Value = serde_json::from_str(&body)
-            .map_err(|e| FabrixError::BadPayload(format!("{e} — 본문 앞부분: {}", head(&body))))?;
-        let array = extract_array(&value)
-            .ok_or_else(|| FabrixError::BadPayload(format!("모델 배열을 찾지 못했습니다: {}", head(&body))))?;
+            .map_err(|e| bad(FabrixError::BadPayload(format!("{e} — 본문 앞부분: {}", head(&body)))))?;
+        let array = extract_array(&value).ok_or_else(|| {
+            bad(FabrixError::BadPayload(format!("모델 배열을 찾지 못했습니다: {}", head(&body))))
+        })?;
 
         let mut models = Vec::new();
         for item in array {
@@ -953,9 +967,9 @@ impl FabrixClient {
             }
         }
         if models.is_empty() {
-            return Err(FabrixError::BadPayload("모델 목록이 비어 있습니다".into()));
+            return Err(bad(FabrixError::BadPayload("모델 목록이 비어 있습니다".into())));
         }
-        Ok(models)
+        Ok((models, raw))
     }
 
     /// 스트리밍이면 `timeout` 을 걸지 않습니다 — 긴 답변이 정상적으로 30초를

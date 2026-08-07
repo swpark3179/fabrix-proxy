@@ -85,33 +85,62 @@ pub fn show_log(app: &AppHandle) {
 const MODELS_W: f64 = 900.0;
 const MODELS_H: f64 = 600.0;
 
+/// 이미 있는 모델 목록 창을 앞으로 끌어올립니다. 없으면 `false`.
+fn raise_models(app: &AppHandle) -> bool {
+    let Some(window) = app.get_webview_window("models") else {
+        return false;
+    };
+    let _ = window.show();
+    let _ = window.unminimize();
+    let _ = window.set_focus();
+    true
+}
+
 /// models — 모델 목록. **처음 열 때 만듭니다.**
 ///
 /// 다른 세 창과 달리 [`create_all`] 에 넣지 않은 이유: 이 창은 푸시 이벤트를 기다릴
 /// 필요가 없고(마운트 때 스스로 조회합니다), 대부분의 실행에서 한 번도 열리지
 /// 않습니다. 시작할 때 webview 를 하나 더 띄우는 값을 내지 않습니다. 한 번 만들면
 /// 닫기(✕)가 숨김이라 두 번째부터는 `show` 만 합니다.
+///
+/// **창 만들기를 부른 쪽 스레드에서 하지 않는 이유**: `WebviewWindowBuilder::build()`
+/// 는 동기 커맨드나 이벤트 핸들러 안에서 부르면 Windows 에서 교착합니다(tauri#5306).
+/// 이 함수를 부르는 자리가 정확히 그 둘입니다 — `open_models_window` 커맨드와
+/// 트레이 메뉴 핸들러(`tray.rs`). 그래서 창이 **없을 때만** 생성을 async 런타임으로
+/// 넘깁니다. 증상은 "첫 클릭에서 앱이 멈춤" 이었고, 트레이로 창을 한 번 만든 뒤에는
+/// 위 `raise_models` 갈래로 빠져 멀쩡해 보였습니다.
 pub fn show_models(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window("models") {
-        let _ = window.show();
-        let _ = window.unminimize();
-        let _ = window.set_focus();
+    if raise_models(app) {
         return;
     }
-    match WebviewWindowBuilder::new(app, "models", WebviewUrl::App("models.html".into()))
-        .title("모델 목록")
-        .inner_size(MODELS_W, MODELS_H)
-        .min_inner_size(780.0, 420.0)
-        .resizable(true)
-        .decorations(false)
-        .center()
-        .build()
-    {
-        Ok(window) => {
-            let _ = window.set_focus();
+
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        // 연달아 누르면 작업이 둘 뜹니다. 뒤엣것은 같은 라벨로 `build()` 해서 실패하므로
+        // 여기서 한 번 더 확인해 헛수고를 막습니다.
+        if raise_models(&app) {
+            return;
         }
-        Err(err) => eprintln!("[windows] 모델 목록 창을 열지 못했습니다: {err}"),
-    }
+        match WebviewWindowBuilder::new(&app, "models", WebviewUrl::App("models.html".into()))
+            .title("모델 목록")
+            .inner_size(MODELS_W, MODELS_H)
+            .min_inner_size(780.0, 420.0)
+            .resizable(true)
+            .decorations(false)
+            .center()
+            .build()
+        {
+            Ok(window) => {
+                let _ = window.set_focus();
+            }
+            Err(err) => {
+                eprintln!("[windows] 모델 목록 창을 열지 못했습니다: {err}");
+                // 위 확인을 통과한 뒤에 다른 작업이 먼저 만들었을 수 있습니다 —
+                // 그건 실패가 아니라 이미 있는 것이라 띄워 주면 됩니다.
+                raise_models(&app);
+            }
+        }
+    });
 }
 
 /// 메인 창을 띄우면서 설정 화면을 열라고 알립니다.

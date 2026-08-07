@@ -17,16 +17,31 @@ use crate::state::{self, ModelsCache, Shared, MODELS_CACHE_TTL};
 use super::fabrix::{build_aliases, find_model, FabrixError, ResolvedModel, MODELS_PATH};
 use super::{authorize, error_response, fabrix_headers_line, inbound_auth_line};
 
-/// `(모델 목록, 캐시에서 나왔는지)`. 60초 TTL 을 지킵니다.
+/// 한 번의 목록 조회 결과.
 ///
-/// 시그니처를 그대로 두는 이유: 호출부가 둘(`chat.rs`·아래 `handle`)이고 둘 다 강제
-/// 갱신을 쓰지 않습니다.
-pub async fn ensure_models(state: &Shared) -> Result<(Vec<ResolvedModel>, bool), FabrixError> {
-    load_models(state, false).await.map(|(models, cached, _)| (models, cached))
+/// 튜플을 그만둔 이유: `raw` 가 붙어 네 칸이 됐고, 호출부마다 어느 칸이 무엇인지
+/// 세어야 하는 반환값은 곧 잘못 쓰입니다.
+pub struct Loaded {
+    pub models: Vec<ResolvedModel>,
+    /// 사내를 부르지 않고 캐시에서 돌려줬는가.
+    pub cached: bool,
+    /// 조회 시각 ISO — 화면이 "12초 전 조회" 를 계산합니다.
+    pub fetched_at: String,
+    /// 사내 응답 원문(상태 줄·헤더·본문). 캐시 히트면 캐시를 채운 조회의 원문입니다.
+    pub raw: String,
 }
 
-/// `(모델 목록, 캐시에서 나왔는지, 조회 시각 ISO)`.
+/// 실패는 오류와 **응답 원문**을 함께 넘깁니다 — 사내가 왜 거절했는지는 오류 메시지
+/// 뒤에 있을 수 있고, 그 원문이 로그 원문 칸으로 갑니다. 연결 자체가 실패했으면 빈 문자열.
+pub type LoadError = (FabrixError, String);
+
+/// 60초 TTL 을 지키는 목록 조회. 강제 갱신은 하지 않습니다.
 ///
+/// 호출부가 셋(`chat.rs`·아래 `handle`·`one`)이고 셋 다 강제 갱신을 쓰지 않습니다.
+pub async fn ensure_models(state: &Shared) -> Result<Loaded, LoadError> {
+    load_models(state, false).await
+}
+
 /// `force` 면 60초 TTL 을 무시하고 사내에서 새로 받습니다.
 ///
 /// 캐시를 **먼저 비우지 않는** 것이 중요합니다. 비우고 나서 조회가 실패하면 멀쩡했던
@@ -34,35 +49,53 @@ pub async fn ensure_models(state: &Shared) -> Result<(Vec<ResolvedModel>, bool),
 /// 채팅의 모델 해석까지 같이 깨뜨립니다. 성공한 뒤에만 덮어씁니다.
 ///
 /// 뮤텍스 가드를 `await` 너머로 들고 가지 않도록 잠금 구간을 블록으로 닫습니다.
-pub async fn load_models(
-    state: &Shared,
-    force: bool,
-) -> Result<(Vec<ResolvedModel>, bool, String), FabrixError> {
+pub async fn load_models(state: &Shared, force: bool) -> Result<Loaded, LoadError> {
     if !force {
         let cached = {
             let guard = state.models_cache.lock().unwrap();
             guard
                 .as_ref()
                 .filter(|c| c.fetched_at.elapsed() < MODELS_CACHE_TTL)
-                .map(|c| (c.models.clone(), c.fetched_at_iso.clone()))
+                .map(|c| (c.models.clone(), c.fetched_at_iso.clone(), c.raw.clone()))
         };
-        if let Some((models, fetched_at)) = cached {
-            return Ok((models, true, fetched_at));
+        if let Some((models, fetched_at, raw)) = cached {
+            return Ok(Loaded { models, cached: true, fetched_at, raw });
         }
     }
 
-    let client = state.fabrix_client().ok_or(FabrixError::NotConfigured)?;
-    let raw = client.list_models().await?;
-    let models = build_aliases(&raw);
+    let client = state
+        .fabrix_client()
+        .ok_or((FabrixError::NotConfigured, String::new()))?;
+    let (fabrix_models, raw) = client.list_models().await?;
+    let models = build_aliases(&fabrix_models);
     let fetched_at = state::now_iso();
 
     *state.models_cache.lock().unwrap() = Some(ModelsCache {
         fetched_at: Instant::now(),
         fetched_at_iso: fetched_at.clone(),
         models: models.clone(),
+        raw: raw.clone(),
     });
 
-    Ok((models, false, fetched_at))
+    Ok(Loaded { models, cached: false, fetched_at, raw })
+}
+
+/// 로그 원문 칸에 들어갈 사내 응답. 캐시에서 나온 것이면 그렇다고 먼저 적습니다 —
+/// 옛 바이트를 방금 받은 응답인 척 보여주지 않기 위한 한 줄입니다.
+fn upstream_raw(loaded: &Loaded) -> String {
+    if !loaded.cached {
+        return loaded.raw.clone();
+    }
+    format!(
+        "(60초 캐시가 유효해 사내 호출을 생략했습니다 — 아래는 {}에 캐시를 채운 조회의 원문입니다)\n\n{}",
+        loaded.fetched_at, loaded.raw
+    )
+}
+
+/// 사내가 준 쪽만 담은 원문 한 벌. `/v1/models` 는 클라이언트로 나간 쪽을 남기지
+/// 않습니다 — 그 본문은 ③ 칸이 이미 목록 그대로 보여 줍니다.
+fn models_raw_wire(upstream: String) -> RawWire {
+    RawWire { upstream_captured: true, client_captured: false, upstream, client: String::new() }
 }
 
 pub async fn handle(State(state): State<Shared>, headers: HeaderMap) -> Response {
@@ -111,14 +144,16 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap) -> Response
             fabrix_url,
             resp_body: envelope.error.message.clone(),
             resp_meta: format!("거부 · HTTP {status}"),
-            // 모델 목록에는 와이어 원문 칸을 쓰지 않습니다 — 진단이 필요한 곳은 채팅입니다.
+            // 사내를 부르지도 않았으니 원문이 없습니다.
             raw: RawWire::default(),
         });
         return error_response(status, envelope);
     }
 
     match ensure_models(&state).await {
-        Ok((models, cached)) => {
+        Ok(loaded) => {
+            let raw = upstream_raw(&loaded);
+            let Loaded { models, cached, .. } = loaded;
             let list = to_model_list(&models, state::epoch_secs());
 
             let latency = started.elapsed().as_millis() as u64;
@@ -155,12 +190,12 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap) -> Response
                     models.len(),
                     if cached { "캐시에서 반환" } else { "사내에서 새로 조회" }
                 ),
-                raw: RawWire::default(),
+                raw: models_raw_wire(raw),
             });
 
             Json(list).into_response()
         }
-        Err(err) => {
+        Err((err, raw)) => {
             let latency = started.elapsed().as_millis() as u64;
             let status = err.status();
             state.record(LogEntry {
@@ -188,7 +223,7 @@ pub async fn handle(State(state): State<Shared>, headers: HeaderMap) -> Response
                 fabrix_url,
                 resp_body: err.message(),
                 resp_meta: format!("실패 · HTTP {status}"),
-                raw: RawWire::default(),
+                raw: models_raw_wire(raw),
             });
 
             error_response(status, err.envelope())
@@ -228,7 +263,8 @@ pub async fn retrieve(
                  cached: bool,
                  req_fabrix: String,
                  resp_body: String,
-                 resp_meta: String| LogEntry {
+                 resp_meta: String,
+                 raw: RawWire| LogEntry {
         id: Uuid::new_v4().to_string(),
         ts: state::now_hm(),
         ts_full: state::now_iso(),
@@ -253,7 +289,7 @@ pub async fn retrieve(
         fabrix_url: fabrix_url.clone(),
         resp_body,
         resp_meta,
-        raw: RawWire::default(),
+        raw,
     };
 
     if let Err((status, envelope)) = authorize(&cfg, &headers) {
@@ -267,13 +303,15 @@ pub async fn retrieve(
             "(토큰 검증 실패 — 사내 호출을 하지 않았습니다)".into(),
             envelope.error.message.clone(),
             format!("거부 · HTTP {status}"),
+            // 사내를 부르지도 않았으니 원문이 없습니다.
+            RawWire::default(),
         ));
         return error_response(status, envelope);
     }
 
-    let (models, cached) = match ensure_models(&state).await {
-        Ok(pair) => pair,
-        Err(err) => {
+    let loaded = match ensure_models(&state).await {
+        Ok(loaded) => loaded,
+        Err((err, raw)) => {
             state.record(entry(
                 err.status(),
                 true,
@@ -284,10 +322,13 @@ pub async fn retrieve(
                 format!("GET {fabrix_url}"),
                 err.message(),
                 format!("실패 · HTTP {}", err.status()),
+                models_raw_wire(raw),
             ));
             return error_response(err.status(), err.envelope());
         }
     };
+    let raw = upstream_raw(&loaded);
+    let Loaded { models, cached, .. } = loaded;
 
     let req_fabrix = if cached {
         format!("GET {fabrix_url}\n\n(60초 캐시가 유효해 사내 호출을 생략했습니다)")
@@ -309,6 +350,7 @@ pub async fn retrieve(
                 req_fabrix,
                 body,
                 format!("모델 1개 · {} · 캐시 60초", if cached { "캐시에서 반환" } else { "사내에서 새로 조회" }),
+                models_raw_wire(raw),
             ));
             Json(card).into_response()
         }
@@ -324,6 +366,7 @@ pub async fn retrieve(
                 req_fabrix,
                 envelope.error.message.clone(),
                 format!("실패 · HTTP 404 · 목록에 {}개 있음", models.len()),
+                models_raw_wire(raw),
             ));
             error_response(404, envelope)
         }

@@ -26,6 +26,16 @@ export function LogDetail({ entry, baseUrl, onCopyCurl }: Props) {
     chat && !entry.isError ? ' code--prose' : ''
   }`
 
+  /**
+   * ③ 칸에서 곧장 열 사내 원문이 있는가.
+   *
+   * 비었는지까지 보는 이유: 사내에서 응답을 받기만 하면 상태 줄이라도 남습니다
+   * (`fabrix::response_head`). 그러니 **비어 있다 = 사내를 부르지 못한 호출** 입니다 —
+   * 토큰 거부·요청 검증 실패·연결 자체 실패. 그런 로그에 "사내 원문 보기" 를 달면
+   * 하지도 않은 호출의 답을 보여주는 척이 됩니다.
+   */
+  const hasUpstreamOriginal = entry.raw.upstreamCaptured && entry.raw.upstream !== ''
+
   return (
     <div className="detail">
       <div className="detail__head">
@@ -100,6 +110,7 @@ export function LogDetail({ entry, baseUrl, onCopyCurl }: Props) {
                   : '전문'
                 : (entry.summary ?? '')}
             {!entry.isError && !chat && '를 OpenAI 목록 형식으로'}
+            {hasUpstreamOriginal && ' · 가공 전 원문은 아래 버튼'}
           </span>
         </div>
         <CollapsibleCode
@@ -108,6 +119,11 @@ export function LogDetail({ entry, baseUrl, onCopyCurl }: Props) {
           title="돌려준 응답"
           modalClassName={respTone}
           footer={entry.respMeta ? <span className="meta-line">{entry.respMeta}</span> : undefined}
+          actions={
+            hasUpstreamOriginal ? (
+              <UpstreamOriginalButton text={entry.raw.upstream} onExpand={setFull} />
+            ) : undefined
+          }
           onExpand={setFull}
         />
       </section>
@@ -145,6 +161,38 @@ export function LogDetail({ entry, baseUrl, onCopyCurl }: Props) {
 }
 
 /**
+ * ③ 칸에서 곧장 여는 "사내 원문" — 사내가 준 응답 바이트 그대로입니다.
+ *
+ * ③ 본문은 봉투를 벗기고 델타를 이어붙인 **가공된** 답변입니다. 답을 의심하게 되는
+ * 자리가 바로 그 칸인데, 지금까지 원문은 ④ 칸까지 스크롤해야 나왔고 설정이 꺼져
+ * 있으면 아예 없었습니다. 그래서 사내 쪽만은 언제나 기록하고(`logstore::RawWire`),
+ * 그 버튼을 답변 바로 밑에 둡니다. 팝업·톤·본문 복사는 ④ 칸과 같은 것을 씁니다.
+ */
+function UpstreamOriginalButton({
+  text,
+  onExpand,
+}: {
+  text: string
+  onExpand: (full: FullText) => void
+}) {
+  return (
+    <button
+      className="btn-mini"
+      title="사내가 준 응답을 가공 없이 그대로 봅니다 (상태 줄 · 헤더 · 본문)"
+      onClick={() =>
+        onExpand({
+          title: '돌려준 응답 · 사내가 준 원문',
+          text,
+          className: 'code--raw',
+        })
+      }
+    >
+      사내 원문 보기 ({text.length}자)
+    </button>
+  )
+}
+
+/**
  * ④ 와이어 원문 — 사내가 준 바이트와 클라이언트로 나간 바이트를 가공 없이 보여 줍니다.
  *
  * 두 쪽을 함께 두는 이유: 답변이 비었을 때 원인이 어느 쪽에 있는지가 한눈에 갈립니다.
@@ -158,7 +206,7 @@ function RawWireStep({
   entry: LogEntry
   onExpand: (full: FullText) => void
 }) {
-  const { captured, upstream, client } = entry.raw
+  const { upstreamCaptured, clientCaptured, upstream, client } = entry.raw
 
   return (
     <section className="step">
@@ -166,36 +214,39 @@ function RawWireStep({
         <span className="step__num step__num--4">4</span>
         <span className="step__title">와이어 원문</span>
         <span className="step__hint">
-          {captured
+          {clientCaptured
             ? '가공 전 · 사내가 준 바이트와 클라이언트로 나간 바이트'
-            : '기록이 꺼져 있습니다'}
+            : '가공 전 · 사내가 준 바이트만 (나간 쪽은 기록이 꺼져 있습니다)'}
         </span>
       </div>
 
-      {captured ? (
-        <>
-          <CollapsibleCode
-            text={upstream || '(사내가 아무 바이트도 주지 않았습니다)'}
-            className="code code--raw"
-            title="사내 원문"
-            modalClassName="code--raw"
-            header={<span className="code__headers">사내 → 프록시</span>}
-            onExpand={onExpand}
-          />
-          <CollapsibleCode
-            text={client || '(클라이언트로 나간 본문이 없습니다)'}
-            className="code code--raw"
-            title="클라이언트로 나간 원문"
-            modalClassName="code--raw"
-            header={<span className="code__headers">프록시 → 클라이언트</span>}
-            onExpand={onExpand}
-          />
-        </>
+      {upstreamCaptured && (
+        <CollapsibleCode
+          text={upstream || '(사내가 아무 바이트도 주지 않았습니다)'}
+          className="code code--raw"
+          title="사내 원문"
+          modalClassName="code--raw"
+          header={<span className="code__headers">사내 → 프록시</span>}
+          onExpand={onExpand}
+        />
+      )}
+
+      {/* 아래쪽만 토글이 제어합니다. 위쪽이 있는데 아래쪽이 비면 우리가 흘린 것이고,
+          꺼져서 없는 것은 그것과 뜻이 다르므로 문구로 갈라 둡니다. */}
+      {clientCaptured ? (
+        <CollapsibleCode
+          text={client || '(클라이언트로 나간 본문이 없습니다)'}
+          className="code code--raw"
+          title="클라이언트로 나간 원문"
+          modalClassName="code--raw"
+          header={<span className="code__headers">프록시 → 클라이언트</span>}
+          onExpand={onExpand}
+        />
       ) : (
         <div className="footnote">
-          설정의 <strong>와이어 원문 기록</strong>을 켜면 이 칸에 사내가 준 응답과
-          클라이언트로 나간 응답이 가공 없이 남습니다. 답변이 비었을 때 원인이 사내에
-          있는지 프록시에 있는지 가리는 유일한 근거입니다.
+          설정의 <strong>와이어 원문 기록</strong>을 켜면 <strong>클라이언트로 나간</strong>{' '}
+          본문도 이 칸에 가공 없이 남습니다. 위쪽에 글이 보이는데 아래쪽이 비어 있으면
+          답변을 흘린 쪽은 프록시입니다 — 그 판단에는 두 쪽이 다 필요합니다.
         </div>
       )}
     </section>

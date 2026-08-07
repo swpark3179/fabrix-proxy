@@ -100,12 +100,18 @@ pub struct LogEntry {
 pub const RAW_CAP: usize = 256 * 1024;
 
 /// 로그 한 건의 와이어 원문 두 쪽. 화면 ④ 칸이 이걸 그립니다.
+///
+/// 담았는지를 **쪽마다** 따로 적는 이유: 두 쪽의 규칙이 다릅니다. 사내가 준 쪽은
+/// 언제나 담습니다 — ③ 칸의 "사내 원문 보기" 가 설정과 무관하게 동작해야 하기
+/// 때문입니다. 클라이언트로 나간 쪽만 `rawWireLog` 토글이 제어합니다. 플래그가
+/// 하나뿐이면 화면이 "꺼져서 비었다" 와 "켰는데 안 왔다" 를 한쪽 기준으로만 말하게 됩니다.
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RawWire {
-    /// 기록 스위치가 켜져 있었는가. 꺼져 있어 비어 있는 것과 켰는데 아무것도 안 온
-    /// 것은 뜻이 완전히 다릅니다 — 화면이 그 둘을 다르게 말하려면 이 값이 필요합니다.
-    pub captured: bool,
+    /// 사내가 준 쪽을 담았는가. 채팅과 모델 목록은 언제나 참입니다.
+    pub upstream_captured: bool,
+    /// 클라이언트로 나간 쪽을 담았는가 — 이쪽만 기록 스위치가 제어합니다.
+    pub client_captured: bool,
     /// 사내가 준 바이트 그대로 (SSE 는 `data:` 줄까지 포함).
     pub upstream: String,
     /// 클라이언트로 나간 본문 그대로 (SSE 는 우리가 쓴 `data:` 줄 그대로).
@@ -198,7 +204,11 @@ impl LogStore {
             .iter()
             .take(n)
             .map(|e| LogEntry {
-                raw: RawWire { captured: e.raw.captured, ..RawWire::default() },
+                raw: RawWire {
+                    upstream_captured: e.raw.upstream_captured,
+                    client_captured: e.raw.client_captured,
+                    ..RawWire::default()
+                },
                 ..e.clone()
             })
             .collect()

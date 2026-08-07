@@ -56,10 +56,20 @@ export interface LogEntry {
  * 와이어 원문 두 쪽. ③ 칸은 이미 가공된 답변(`<think>` 를 갈라내고 `<tool_call>` 을
  * 걷어낸 뒤)이라, "0자" 가 모델이 말을 안 한 것인지 우리가 프레임을 못 읽은 것인지
  * 가리려면 이 원문이 필요합니다.
+ *
+ * 담았는지를 쪽마다 따로 적는 이유: 두 쪽의 규칙이 다릅니다. Rust `logstore::RawWire` 참고.
  */
 export interface RawWire {
-  /** 기록 스위치가 켜져 있었는가. 꺼져서 빈 것과 켰는데 안 온 것은 뜻이 다릅니다. */
-  captured: boolean
+  /**
+   * 사내가 준 쪽을 담았는가. 채팅과 모델 목록은 언제나 참입니다 — ③ 칸의
+   * "사내 원문 보기" 가 설정과 무관하게 동작해야 하기 때문입니다.
+   */
+  upstreamCaptured: boolean
+  /**
+   * 클라이언트로 나간 쪽을 담았는가. 이쪽만 기록 스위치가 제어합니다.
+   * 꺼져서 빈 것과 켰는데 안 온 것은 뜻이 다릅니다.
+   */
+  clientCaptured: boolean
   /** 사내가 준 바이트 그대로 (SSE 는 `data:` 줄까지). */
   upstream: string
   /** 클라이언트로 나간 본문 그대로. */

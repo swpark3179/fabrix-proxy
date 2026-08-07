@@ -388,9 +388,10 @@ export function ConnectionForm({ initial, variant, busy, onSave, onCancel }: Pro
               checked={draft.rawWireLog}
               onChange={(e) => set('rawWireLog', e.target.checked)}
             />
-            와이어 원문 기록 — 사내가 준 응답과 클라이언트로 나간 응답을 가공 없이 로그 창 ④
-            칸에 남깁니다. 답변이 비었을 때 원인이 사내에 있는지 프록시에 있는지 가리는 근거입니다
-            (호출당 각 256KiB 까지, 메모리에만)
+            와이어 원문 기록 — <strong>클라이언트로 나간</strong> 응답을 가공 없이 로그 창 ④
+            칸에 남깁니다. 사내가 준 응답은 이 설정과 무관하게 언제나 남고(③ 칸의{' '}
+            <strong>사내 원문 보기</strong>), 이걸 켜야 두 쪽을 나란히 놓고 답변을 흘린 쪽이
+            사내인지 프록시인지 가릴 수 있습니다 (호출당 각 256KiB 까지, 메모리에만)
           </label>
 
           <label className="check">
